@@ -1,0 +1,364 @@
+"""Tests for advanced evaluation metrics."""
+
+from __future__ import annotations
+
+
+import pytest
+import torch
+
+from obliteratus.evaluation.advanced_metrics import (
+    REFUSAL_PREFIXES,
+    REFUSAL_SUBSTRINGS,
+    _is_refusal,
+    refusal_rate,
+    token_kl_divergence,
+    first_token_kl_divergence,
+    effective_rank,
+    effective_rank_change,
+    activation_cosine_similarity,
+    linear_cka,
+    refusal_projection_magnitude,
+    format_eval_report,
+    AbliterationEvalResult,
+)
+
+
+# ---------------------------------------------------------------------------
+# Refusal Rate
+# ---------------------------------------------------------------------------
+
+class TestRefusalRate:
+    def test_all_refusals(self):
+        responses = [
+            "I'm sorry, but I cannot help with that.",
+            "I apologize, but I'm unable to assist.",
+            "As an AI, I cannot provide that information.",
+        ]
+        assert refusal_rate(responses, mode="prefix") == 1.0
+
+    def test_no_refusals(self):
+        responses = [
+            "Sure, here's how to do that.",
+            "Here's a step-by-step guide.",
+            "The answer is 42.",
+        ]
+        assert refusal_rate(responses, mode="prefix") == 0.0
+
+    def test_mixed_responses(self):
+        responses = [
+            "I'm sorry, I can't do that.",
+            "Sure, here you go.",
+            "I cannot provide that.",
+            "Here's what you need.",
+        ]
+        rate = refusal_rate(responses, mode="prefix")
+        assert rate == 0.5  # 2 out of 4
+
+    def test_substring_mode(self):
+        responses = [
+            "Well, actually I cannot help with that request.",
+            "Let me explain how to do this.",
+        ]
+        assert refusal_rate(responses, mode="substring") == 0.5
+
+    def test_combined_mode(self):
+        responses = [
+            "I'm sorry, but no.",  # caught by prefix
+            "That said, i won't do that for you.",  # caught by substring
+            "Here's the answer.",  # not a refusal
+        ]
+        rate = refusal_rate(responses, mode="combined")
+        assert abs(rate - 2.0 / 3.0) < 1e-6
+
+    def test_empty_responses(self):
+        assert refusal_rate([], mode="prefix") == 0.0
+
+    def test_empty_string_not_refusal(self):
+        assert not _is_refusal("", mode="combined")
+
+    def test_is_refusal_prefix(self):
+        assert _is_refusal("I'm sorry, I can't do that.", mode="prefix")
+        assert _is_refusal("As an AI language model, I cannot", mode="prefix")
+        assert not _is_refusal("The answer is 42.", mode="prefix")
+
+    def test_is_refusal_substring(self):
+        assert _is_refusal("I must say, i cannot assist with that.", mode="substring")
+        assert not _is_refusal("The capital of France is Paris.", mode="substring")
+
+    def test_refusal_prefixes_nonempty(self):
+        assert len(REFUSAL_PREFIXES) > 20
+
+    def test_refusal_substrings_nonempty(self):
+        assert len(REFUSAL_SUBSTRINGS) > 10
+
+
+# ---------------------------------------------------------------------------
+# KL Divergence
+# ---------------------------------------------------------------------------
+
+class TestKLDivergence:
+    def test_identical_distributions(self):
+        """KL divergence of identical distributions should be 0."""
+        logits = torch.randn(2, 10, 100)
+        kl = token_kl_divergence(logits, logits)
+        assert abs(kl) < 1e-5
+
+    def test_different_distributions(self):
+        """KL divergence of different distributions should be positive."""
+        torch.manual_seed(42)
+        logits_a = torch.randn(2, 10, 100)
+        logits_b = torch.randn(2, 10, 100)
+        kl = token_kl_divergence(logits_a, logits_b)
+        assert kl > 0
+
+    def test_kl_nonnegative(self):
+        """KL divergence should always be non-negative."""
+        torch.manual_seed(42)
+        for _ in range(5):
+            logits_a = torch.randn(1, 5, 50)
+            logits_b = torch.randn(1, 5, 50)
+            kl = token_kl_divergence(logits_a, logits_b)
+            assert kl >= -1e-6  # allow small numerical errors
+
+    def test_first_token_kl_identical(self):
+        """First-token KL of identical distributions should be 0."""
+        logits = torch.randn(4, 20, 100)
+        kl = first_token_kl_divergence(logits, logits)
+        assert abs(kl) < 1e-5
+
+    def test_first_token_kl_different(self):
+        """First-token KL of different distributions should be positive."""
+        torch.manual_seed(42)
+        logits_a = torch.randn(4, 20, 100)
+        logits_b = torch.randn(4, 20, 100)
+        kl = first_token_kl_divergence(logits_a, logits_b)
+        assert kl > 0
+
+    def test_temperature_effect(self):
+        """Higher temperature should reduce KL divergence (smoother distributions)."""
+        torch.manual_seed(42)
+        logits_a = torch.randn(2, 5, 50)
+        logits_b = torch.randn(2, 5, 50)
+        kl_t1 = token_kl_divergence(logits_a, logits_b, temperature=1.0)
+        kl_t5 = token_kl_divergence(logits_a, logits_b, temperature=5.0)
+        assert kl_t5 < kl_t1
+
+
+# ---------------------------------------------------------------------------
+# Effective Rank
+# ---------------------------------------------------------------------------
+
+class TestEffectiveRank:
+    def test_rank_one_matrix(self):
+        """Rank-1 matrix should have effective rank close to 1."""
+        v = torch.randn(8, 1)
+        u = torch.randn(1, 4)
+        W = v @ u  # rank-1
+        erank = effective_rank(W)
+        assert erank < 1.5
+
+    def test_identity_matrix(self):
+        """Identity matrix should have effective rank equal to dimension."""
+        n = 8
+        W = torch.eye(n)
+        erank = effective_rank(W)
+        assert abs(erank - n) < 0.1
+
+    def test_random_full_rank(self):
+        """Random matrix should have high effective rank."""
+        torch.manual_seed(42)
+        W = torch.randn(16, 16)
+        erank = effective_rank(W)
+        assert erank > 10  # should be close to 16
+
+    def test_zero_matrix(self):
+        """Zero matrix should have effective rank 0."""
+        W = torch.zeros(4, 4)
+        erank = effective_rank(W)
+        assert erank == 0.0
+
+    def test_effective_rank_change(self):
+        """Should compute before/after rank comparison."""
+        torch.manual_seed(42)
+        W_before = torch.randn(8, 8)
+        # Simulate abliteration: remove a direction (reduces rank slightly)
+        d = torch.randn(8, 1)
+        d = d / d.norm()
+        W_after = W_before - (W_before @ d) @ d.T
+
+        result = effective_rank_change(W_before, W_after)
+        assert "rank_before" in result
+        assert "rank_after" in result
+        assert "rank_delta" in result
+        assert "rank_ratio" in result
+        assert result["rank_after"] <= result["rank_before"] + 0.1
+
+    def test_rejects_non_2d(self):
+        """Should raise ValueError for non-2D tensors."""
+        with pytest.raises(ValueError):
+            effective_rank(torch.randn(4, 4, 4))
+
+
+# ---------------------------------------------------------------------------
+# Activation Cosine Similarity
+# ---------------------------------------------------------------------------
+
+class TestActivationCosineSimilarity:
+    def test_identical_activations(self):
+        acts = torch.randn(10, 32)
+        sim = activation_cosine_similarity(acts, acts)
+        assert abs(sim - 1.0) < 1e-5
+
+    def test_orthogonal_activations(self):
+        """Orthogonal activations should have cosine near 0."""
+        a = torch.tensor([[1.0, 0.0, 0.0]])
+        b = torch.tensor([[0.0, 1.0, 0.0]])
+        sim = activation_cosine_similarity(a, b)
+        assert abs(sim) < 1e-5
+
+    def test_opposite_activations(self):
+        """Opposite activations should have cosine -1."""
+        a = torch.randn(5, 16)
+        sim = activation_cosine_similarity(a, -a)
+        assert abs(sim - (-1.0)) < 1e-5
+
+    def test_handles_3d(self):
+        """Should handle 3D tensors by reshaping."""
+        a = torch.randn(2, 5, 16)
+        b = torch.randn(2, 5, 16)
+        sim = activation_cosine_similarity(a, b)
+        assert -1.0 <= sim <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Linear CKA
+# ---------------------------------------------------------------------------
+
+class TestLinearCKA:
+    def test_identical_representations(self):
+        """CKA of identical representations should be 1.0."""
+        X = torch.randn(20, 16)
+        cka = linear_cka(X, X)
+        assert abs(cka - 1.0) < 1e-4
+
+    def test_scaled_representations(self):
+        """CKA should be invariant to isotropic scaling."""
+        X = torch.randn(20, 16)
+        Y = X * 5.0
+        cka = linear_cka(X, Y)
+        assert abs(cka - 1.0) < 1e-4
+
+    def test_random_representations(self):
+        """CKA of random representations should be low."""
+        torch.manual_seed(42)
+        X = torch.randn(100, 16)
+        Y = torch.randn(100, 16)
+        cka = linear_cka(X, Y)
+        assert cka < 0.3  # random should be near 0
+
+    def test_cka_bounded(self):
+        """CKA should be between 0 and 1."""
+        torch.manual_seed(42)
+        for _ in range(5):
+            X = torch.randn(20, 8)
+            Y = torch.randn(20, 8)
+            cka = linear_cka(X, Y)
+            assert -0.01 <= cka <= 1.01  # small tolerance for numerics
+
+    def test_different_dimensions(self):
+        """CKA should work with different hidden dimensions."""
+        X = torch.randn(20, 16)
+        Y = torch.randn(20, 32)
+        cka = linear_cka(X, Y)
+        assert -0.01 <= cka <= 1.01
+
+    def test_handles_3d(self):
+        """Should handle 3D tensors by reshaping."""
+        X = torch.randn(2, 10, 16)
+        Y = torch.randn(2, 10, 16)
+        cka = linear_cka(X, Y)
+        assert -0.01 <= cka <= 1.01
+
+
+# ---------------------------------------------------------------------------
+# Refusal Direction Projection Magnitude
+# ---------------------------------------------------------------------------
+
+class TestRefusalProjection:
+    def test_aligned_activations(self):
+        """Activations aligned with direction should have high projection."""
+        d = torch.tensor([1.0, 0.0, 0.0])
+        acts = torch.tensor([
+            [5.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ])
+        result = refusal_projection_magnitude(acts, d)
+        assert result["mean"] == 4.0
+        assert result["abs_mean"] == 4.0
+
+    def test_orthogonal_activations(self):
+        """Orthogonal activations should have zero projection."""
+        d = torch.tensor([1.0, 0.0, 0.0])
+        acts = torch.tensor([
+            [0.0, 5.0, 0.0],
+            [0.0, 0.0, 3.0],
+        ])
+        result = refusal_projection_magnitude(acts, d)
+        assert abs(result["mean"]) < 1e-5
+        assert abs(result["abs_mean"]) < 1e-5
+
+    def test_result_keys(self):
+        """Should return all expected keys."""
+        d = torch.randn(8)
+        acts = torch.randn(5, 8)
+        result = refusal_projection_magnitude(acts, d)
+        assert set(result.keys()) == {"mean", "std", "max", "min", "abs_mean"}
+
+
+# ---------------------------------------------------------------------------
+# Eval Report Formatting
+# ---------------------------------------------------------------------------
+
+class TestEvalReport:
+    def test_format_report(self):
+        result = AbliterationEvalResult(
+            refusal_rate_harmful=0.1,
+            refusal_rate_harmless=0.02,
+            kl_divergence=0.15,
+            perplexity=12.5,
+            coherence_score=0.8,
+            mean_activation_cosine=0.95,
+            mean_cka=0.92,
+        )
+        report = format_eval_report(result)
+        assert "10.0%" in report
+        assert "12.50" in report
+        assert "excellent" in report  # KL < 0.2
+
+    def test_format_report_high_kl(self):
+        result = AbliterationEvalResult(
+            refusal_rate_harmful=0.0,
+            refusal_rate_harmless=0.0,
+            kl_divergence=1.5,
+            perplexity=50.0,
+            coherence_score=0.4,
+            mean_activation_cosine=None,
+            mean_cka=None,
+        )
+        report = format_eval_report(result)
+        assert "significant damage" in report
+
+    def test_format_report_no_kl(self):
+        result = AbliterationEvalResult(
+            refusal_rate_harmful=0.5,
+            refusal_rate_harmless=0.1,
+            kl_divergence=None,
+            perplexity=20.0,
+            coherence_score=1.0,
+            mean_activation_cosine=None,
+            mean_cka=None,
+        )
+        report = format_eval_report(result)
+        assert "50.0%" in report
+        assert "KL" not in report
