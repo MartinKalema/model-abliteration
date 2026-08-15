@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
+import sys as _sys
 import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
-import sys as _sys
-
 import torch
-from obliteratus import device as dev
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -21,6 +18,19 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
+
+from obliteratus import device as dev
+from obliteratus.gguf_backend import (
+    ModelSource,
+    read_gguf_file_type,
+    resolve_model_source,
+    transformers_gguf_compatibility,
+)
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # transformers versions before image-text auto models
+    AutoModelForImageTextToText = None
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +284,92 @@ TASK_MODEL_MAP = {
 }
 
 
+# Composite vision-language configurations whose causal text decoder is nested
+# inside a conditional-generation wrapper.  Loading these through
+# AutoModelForCausalLM can either fail (for example Qwen VL and Mistral 3) or
+# silently instantiate a text-only class (for example Llama 4 and Mllama),
+# dropping the vision tower from the checkpoint.  Keep this list explicit so
+# sibling text configs such as ``llama4_text`` and ``qwen3_5_text`` continue to
+# use AutoModelForCausalLM.
+_IMAGE_TEXT_MODEL_TYPES = frozenset(
+    {
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "gemma4_unified",
+        "lfm2_vl",
+        "llama4",
+        "mistral3",
+        "mllama",
+        "qwen2_5_vl",
+        "qwen2_vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }
+)
+
+_IMAGE_TEXT_ARCHITECTURES = frozenset(
+    {
+        "gemma3forconditionalgeneration",
+        "gemma3nforconditionalgeneration",
+        "gemma4forconditionalgeneration",
+        "gemma4unifiedforconditionalgeneration",
+        "lfm2vlforconditionalgeneration",
+        "llama4forconditionalgeneration",
+        "mistral3forconditionalgeneration",
+        "mllamaforconditionalgeneration",
+        "qwen2_5_vlforconditionalgeneration",
+        "qwen2vlforconditionalgeneration",
+        "qwen3_5forconditionalgeneration",
+        "qwen3_5moeforconditionalgeneration",
+        "qwen3vlforconditionalgeneration",
+        "qwen3vlmoeforconditionalgeneration",
+    }
+)
+
+
+def _normalized_architectures(config) -> frozenset[str]:
+    """Return normalized architecture names without treating a string as a list."""
+    raw_architectures = getattr(config, "architectures", None) or ()
+    if isinstance(raw_architectures, str):
+        raw_architectures = (raw_architectures,)
+    return frozenset(str(name).strip().lower() for name in raw_architectures)
+
+
+def _select_model_class(task: str, config):
+    """Select the appropriate Transformers auto-model class for a config.
+
+    Composite image-text checkpoints expose their text stack through a
+    multimodal wrapper.  Preserve that wrapper for causal ablation while
+    keeping ordinary causal and classification models on their existing auto
+    classes.
+    """
+    if task not in TASK_MODEL_MAP:
+        raise ValueError(f"Unknown task {task!r}. Choose from {list(TASK_MODEL_MAP)}")
+
+    model_type = str(getattr(config, "model_type", "")).strip().lower()
+    architectures = _normalized_architectures(config)
+    is_image_text = (
+        task == "causal_lm"
+        and (
+            model_type in _IMAGE_TEXT_MODEL_TYPES
+            or bool(architectures & _IMAGE_TEXT_ARCHITECTURES)
+        )
+    )
+    if is_image_text:
+        if AutoModelForImageTextToText is None:
+            raise RuntimeError(
+                f"Multimodal architecture {model_type or sorted(architectures)!r} "
+                "requires transformers with "
+                "AutoModelForImageTextToText support. Upgrade transformers."
+            )
+        return AutoModelForImageTextToText
+
+    return TASK_MODEL_MAP[task]
+
+
 @dataclass
 class ModelHandle:
     """Wrapper around a HF model + tokenizer with metadata useful for ablation."""
@@ -283,6 +379,14 @@ class ModelHandle:
     config: AutoConfig
     model_name: str
     task: str
+    source_format: str = "hf"
+    source_model: str | None = None
+    source_file: str | None = None
+    canonical_model_id: str | None = None
+    tokenizer_source: str | None = None
+    source_quantization: str | None = None
+    in_memory_format: str = "dense"
+    in_memory_dtype: str | None = None
     architecture: str = ""
     num_layers: int = 0
     num_heads: int = 0
@@ -290,26 +394,49 @@ class ModelHandle:
     intermediate_size: int = 0
     _original_state: Optional[dict] = field(default=None, repr=False)
     _offload_dir: Optional[str] = field(default=None, repr=False)
+    _owns_offload_dir: bool = field(default=False, repr=False)
 
     def __post_init__(self):
         cfg = self.config
         self.architecture = cfg.model_type
+        self.source_model = self.source_model or self.model_name
+        self.tokenizer_source = self.tokenizer_source or self.canonical_model_id or self.model_name
         # For composite configs (e.g. VL models like Qwen3.5), the text model
         # attributes live under a nested text_config.  Fall through to it when
         # the top-level config doesn't have the standard attributes.
         text_cfg = getattr(cfg, "text_config", None)
-        self.num_layers = getattr(cfg, "num_hidden_layers", 0) or (
-            getattr(text_cfg, "num_hidden_layers", 0) if text_cfg else 0
+
+        def config_value(source, name):
+            if source is None:
+                return 0
+            if isinstance(source, dict):
+                return source.get(name, 0)
+            return getattr(source, name, 0)
+
+        def standard_then_fallback(standard_name, fallback_name):
+            # Resolve both standard locations before considering a legacy
+            # top-level alias.  Otherwise a composite wrapper's unrelated
+            # d_model/n_layers fields could override its text_config.
+            return (
+                config_value(cfg, standard_name)
+                or config_value(text_cfg, standard_name)
+                or config_value(cfg, fallback_name)
+                or config_value(text_cfg, fallback_name)
+            )
+
+        self.num_layers = standard_then_fallback("num_hidden_layers", "n_layers")
+        self.num_heads = standard_then_fallback("num_attention_heads", "n_heads")
+        self.hidden_size = standard_then_fallback("hidden_size", "d_model")
+        self.intermediate_size = (
+            config_value(cfg, "intermediate_size")
+            or config_value(text_cfg, "intermediate_size")
         )
-        self.num_heads = getattr(cfg, "num_attention_heads", 0) or (
-            getattr(text_cfg, "num_attention_heads", 0) if text_cfg else 0
-        )
-        self.hidden_size = getattr(cfg, "hidden_size", 0) or (
-            getattr(text_cfg, "hidden_size", 0) if text_cfg else 0
-        )
-        self.intermediate_size = getattr(cfg, "intermediate_size", 0) or (
-            getattr(text_cfg, "intermediate_size", 0) if text_cfg else 0
-        )
+        if not self.intermediate_size:
+            for owner in (cfg, text_cfg):
+                ffn_cfg = config_value(owner, "ffn_config")
+                self.intermediate_size = config_value(ffn_cfg, "ffn_hidden_size")
+                if self.intermediate_size:
+                    break
 
     def snapshot(self):
         """Save a copy of the model state dict so we can restore after ablation.
@@ -336,13 +463,11 @@ class ModelHandle:
 
     def cleanup(self):
         """Remove temporary offload directory if one was auto-created."""
-        if self._offload_dir is not None:
+        if self._offload_dir is not None and self._owns_offload_dir:
             import shutil
-            try:
-                shutil.rmtree(self._offload_dir, ignore_errors=True)
-            except Exception:
-                pass
-            self._offload_dir = None
+            shutil.rmtree(self._offload_dir, ignore_errors=True)
+        self._offload_dir = None
+        self._owns_offload_dir = False
 
     def __del__(self):
         self.cleanup()
@@ -357,6 +482,21 @@ class ModelHandle:
             "hidden_size": self.hidden_size,
             "intermediate_size": self.intermediate_size,
             "total_params": sum(p.numel() for p in self.model.parameters()),
+            "source_format": self.source_format,
+            "source": self.source_summary(),
+        }
+
+    def source_summary(self) -> dict[str, object]:
+        """Return checkpoint and in-memory provenance for reports/metadata."""
+        return {
+            "format": self.source_format,
+            "model": self.source_model,
+            "file": self.source_file,
+            "canonical_model_id": self.canonical_model_id,
+            "tokenizer_source": self.tokenizer_source,
+            "source_quantization": self.source_quantization,
+            "in_memory_format": self.in_memory_format,
+            "in_memory_dtype": self.in_memory_dtype,
         }
 
 
@@ -404,6 +544,193 @@ def _hf_token() -> str | None:
     return os.environ.get("HF_TOKEN") or None
 
 
+def _from_pretrained_with_source_compatibility(source: ModelSource, factory, *args, **kwargs):
+    """Call a Transformers factory with scoped GGUF metadata repairs."""
+
+    if not source.is_gguf:
+        return factory(*args, **kwargs)
+    with transformers_gguf_compatibility():
+        return factory(*args, **kwargs)
+
+
+def _prepare_gguf_canonical_config(config):
+    """Select the editable text config and remove storage quantization hints."""
+
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if model_type == "gemma4":
+        text_config = getattr(config, "text_config", None)
+        if text_config is None or getattr(text_config, "model_type", None) != "gemma4_text":
+            raise RuntimeError(
+                "Canonical Gemma 4 config does not expose the text backbone required "
+                "by its GGUF checkpoint"
+            )
+        config = text_config
+
+    # Canonical GPT-OSS config advertises its original MXFP4 storage. A GGUF
+    # import is instead dequantized by Transformers and must instantiate dense
+    # editable parameters, so carrying that storage directive is incorrect.
+    for attribute in ("quantization_config", "_pre_quantization_dtype"):
+        if hasattr(config, attribute):
+            try:
+                delattr(config, attribute)
+            except AttributeError:
+                setattr(config, attribute, None)
+    return config
+
+
+_GGUF_NON_CORE_STATE_SUFFIXES = (
+    "rotary_emb.inv_freq",
+    "rotary_emb.original_inv_freq",
+    "position_ids",
+    "masked_bias",
+    "causal_mask",
+)
+
+
+def _loading_info_keys(value) -> list[str]:
+    """Normalize Transformers loading-report fields across supported versions."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return sorted(str(key) for key in value)
+    keys: list[str] = []
+    for entry in value:
+        if isinstance(entry, (tuple, list)) and entry:
+            keys.append(str(entry[0]))
+        else:
+            keys.append(str(entry))
+    return sorted(keys)
+
+
+def _is_known_non_core_state_key(key: str) -> bool:
+    return any(
+        key == suffix or key.endswith(f".{suffix}")
+        for suffix in _GGUF_NON_CORE_STATE_SUFFIXES
+    )
+
+
+def _shares_storage(left, right) -> bool:
+    if left is right:
+        return True
+    try:
+        return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _is_allowed_tied_embedding_key(key: str, model, config) -> bool:
+    if not getattr(config, "tie_word_embeddings", False):
+        return False
+    if not any(
+        key == suffix or key.endswith(f".{suffix}")
+        for suffix in ("lm_head.weight", "embed_out.weight", "output.weight")
+    ):
+        return False
+    try:
+        input_embeddings = model.get_input_embeddings()
+        output_embeddings = model.get_output_embeddings()
+        return (
+            input_embeddings is not None
+            and output_embeddings is not None
+            and _shares_storage(input_embeddings.weight, output_embeddings.weight)
+        )
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _validate_gguf_loading_info(model, config, loading_info: dict) -> None:
+    """Fail closed when GGUF conversion did not populate the complete model.
+
+    Only deterministic/non-persistent position and rotary buffers are ignored.
+    A missing tied output embedding is accepted only after verifying that the
+    instantiated output and input embeddings actually share storage.
+    """
+    if not isinstance(loading_info, dict):
+        raise TypeError(
+            "GGUF import did not return a Transformers loading report; refusing an "
+            "unverified checkpoint"
+        )
+
+    missing = _loading_info_keys(loading_info.get("missing_keys"))
+    unexpected = _loading_info_keys(loading_info.get("unexpected_keys"))
+    mismatched = _loading_info_keys(loading_info.get("mismatched_keys"))
+    error_messages = _loading_info_keys(
+        loading_info.get("error_msgs") or loading_info.get("error_messages")
+    )
+
+    bad_missing = [
+        key
+        for key in missing
+        if not _is_known_non_core_state_key(key)
+        and not _is_allowed_tied_embedding_key(key, model, config)
+    ]
+    bad_unexpected = [
+        key for key in unexpected if not _is_known_non_core_state_key(key)
+    ]
+
+    if bad_missing or bad_unexpected or mismatched or error_messages:
+        details = []
+        if bad_missing:
+            details.append(f"missing core keys={bad_missing}")
+        if bad_unexpected:
+            details.append(f"unexpected core keys={bad_unexpected}")
+        if mismatched:
+            details.append(f"mismatched keys={mismatched}")
+        if error_messages:
+            details.append(f"loader errors={error_messages}")
+        raise RuntimeError(
+            "GGUF checkpoint did not map completely into the Transformers model; "
+            + "; ".join(details)
+        )
+
+    ignored = sorted(set(missing + unexpected))
+    if ignored:
+        logger.info("Ignored deterministic GGUF buffer keys: %s", ignored)
+
+
+def _validate_dense_gguf_model(model) -> str:
+    """Verify GGUF tensors were dequantized into editable dense parameters."""
+    if getattr(model, "is_quantized", False):
+        raise RuntimeError(
+            "GGUF import remained quantized in memory; dense floating-point weights are required"
+        )
+
+    allowed_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+    bad_parameters: list[str] = []
+    observed_dtypes: set[str] = set()
+    for name, parameter in model.named_parameters():
+        if parameter.device.type == "meta":
+            bad_parameters.append(f"{name}=meta")
+            continue
+        if parameter.dtype not in allowed_dtypes:
+            bad_parameters.append(f"{name}={parameter.dtype}")
+            continue
+        observed_dtypes.add(str(parameter.dtype).removeprefix("torch."))
+
+    if bad_parameters:
+        preview = bad_parameters[:12]
+        suffix = " ..." if len(bad_parameters) > len(preview) else ""
+        raise RuntimeError(
+            "GGUF import contains non-editable or non-dense parameters: "
+            f"{preview}{suffix}"
+        )
+    if not observed_dtypes:
+        raise RuntimeError("GGUF import produced a model with no editable parameters")
+    return ",".join(sorted(observed_dtypes))
+
+
+def _unpack_gguf_load_result(load_result) -> tuple[PreTrainedModel, dict]:
+    if not isinstance(load_result, tuple) or len(load_result) != 2:
+        raise RuntimeError(
+            "Transformers ignored output_loading_info for GGUF import; refusing an "
+            "unverified checkpoint"
+        )
+    model, loading_info = load_result
+    return model, loading_info
+
+
 def load_model(
     model_name: str,
     task: str = "causal_lm",
@@ -414,11 +741,14 @@ def load_model(
     quantization: str | None = None,
     offload_folder: str | None = None,
     skip_snapshot: bool | None = None,
+    gguf_file: str | None = None,
+    canonical_model_id: str | None = None,
+    tokenizer_source: str | None = None,
 ) -> ModelHandle:
     """Load a HuggingFace model and tokenizer, returning a ModelHandle.
 
     Args:
-        model_name: HuggingFace model identifier (e.g. "gpt2", "meta-llama/Llama-2-7b-hf").
+        model_name: HuggingFace model identifier, local HF directory, or local GGUF file.
         task: One of "causal_lm", "classification".
         device: Torch device string. "auto" uses accelerate's device_map.
         dtype: Weight dtype — "float32", "float16", "bfloat16".
@@ -431,6 +761,14 @@ def load_model(
             None (default): auto-decide based on GPU memory headroom.
             True: always skip (saves memory).
             False: always snapshot (force even for large models).
+            GGUF imports default to skipping because the source artifact is an
+            immutable recovery point; pass False to explicitly force a snapshot.
+        gguf_file: Optional GGUF filename within the Hub repository in model_name.
+            Local GGUF paths are detected automatically and do not use this option.
+        canonical_model_id: Canonical HF model id used for tokenizer provenance.
+        tokenizer_source: Explicit tokenizer directory or HF id. Takes precedence
+            over canonical_model_id and is required for GGUF when no canonical id
+            is supplied.
     """
     _apply_deferred_shims()
 
@@ -442,27 +780,54 @@ def load_model(
         raise ValueError(f"Unknown dtype {dtype!r}. Choose from {list(dtype_map)}")
     torch_dtype = dtype_map[dtype]
 
+    source: ModelSource = resolve_model_source(
+        model_name,
+        gguf_file=gguf_file,
+        canonical_model_id=canonical_model_id,
+        tokenizer_source=tokenizer_source,
+    )
+    if source.is_gguf:
+        if quantization is not None:
+            raise ValueError(
+                "GGUF input is dequantized to dense weights and cannot be combined "
+                "with BitsAndBytes quantization"
+            )
+        if torch_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "GGUF import requires dtype='float16' or dtype='bfloat16' for direct "
+                "half-precision dequantization"
+            )
+
     token = _hf_token()
+    source_quantization = None
+    if source.is_gguf and source.is_local and source.source_file is not None:
+        source_quantization = read_gguf_file_type(source.source_file)
+
+    config_source = (
+        source.canonical_model_id or source.tokenizer_source
+        if source.is_gguf
+        else source.model_root
+    )
+    config_kwargs = {
+        "trust_remote_code": trust_remote_code,
+        "token": token,
+    }
 
     try:
-        config = AutoConfig.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code, token=token,
-        )
+        config = AutoConfig.from_pretrained(config_source, **config_kwargs)
     except PermissionError:
         fallback_cache = os.path.join(tempfile.gettempdir(), "hf_home", "hub")
         os.makedirs(fallback_cache, exist_ok=True)
-        config = AutoConfig.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code, cache_dir=fallback_cache,
-            token=token,
-        )
+        config_kwargs["cache_dir"] = fallback_cache
+        config = AutoConfig.from_pretrained(config_source, **config_kwargs)
     except OSError as e:
         # Gated repo access denied — provide a clear, actionable error.
         err_msg = str(e)
         if "gated repo" in err_msg.lower() or "access to model" in err_msg.lower():
             raise RuntimeError(
-                f"Access denied for gated model '{model_name}'.\n\n"
+                f"Access denied for gated model '{config_source}'.\n\n"
                 f"This model requires you to:\n"
-                f"  1. Accept the license at https://huggingface.co/{model_name}\n"
+                f"  1. Accept the license at https://huggingface.co/{config_source}\n"
                 f"  2. Set your HF_TOKEN: export HF_TOKEN=hf_...\n"
                 f"     (or add it to your HF Space secrets)\n\n"
                 f"Token {'is' if token else 'is NOT'} currently set."
@@ -472,14 +837,19 @@ def load_model(
         # Unrecognized model_type — don't silently escalate trust_remote_code.
         # Provide a clear error with guidance instead.
         raise RuntimeError(
-            f"Architecture '{model_name}' is not recognized by transformers "
+            f"Architecture '{config_source}' is not recognized by transformers "
             f"{__import__('transformers').__version__}. "
             f"Try: pip install --upgrade transformers\n"
             f"If this model requires custom code, pass trust_remote_code=True explicitly."
         ) from e
 
+    if source.is_gguf:
+        config = _prepare_gguf_canonical_config(config)
+
     # Memory estimation and warnings (skip for natively quantized models — estimate is wrong)
-    native_quant = getattr(config, "quantization_config", None)
+    # GGUF storage quantization has already been removed by Transformers.  It
+    # must never enter the native-quantized/BitsAndBytes branches below.
+    native_quant = None if source.is_gguf else getattr(config, "quantization_config", None)
     est_gb = _estimate_model_memory_gb(config, torch_dtype) if native_quant is None else 0.0
     gpu_gb = _available_gpu_memory_gb()
     if est_gb > 0 and gpu_gb > 0:
@@ -490,14 +860,24 @@ def load_model(
                 f"Consider using quantization='4bit' or quantization='8bit'."
             )
 
-    model_cls = TASK_MODEL_MAP[task]
+    model_cls = _select_model_class(task, config)
     load_kwargs: dict = {
-        "pretrained_model_name_or_path": model_name,
+        "pretrained_model_name_or_path": source.model_root,
         "config": config,
-        "torch_dtype": torch_dtype,
         "trust_remote_code": trust_remote_code,
         "token": token,
     }
+    if source.is_gguf:
+        load_kwargs.update(
+            {
+                "gguf_file": source.gguf_file,
+                "dtype": torch_dtype,
+                "low_cpu_mem_usage": True,
+                "output_loading_info": True,
+            }
+        )
+    else:
+        load_kwargs["torch_dtype"] = torch_dtype
     if task == "classification":
         config.num_labels = num_labels
         load_kwargs["config"] = config
@@ -564,6 +944,7 @@ def load_model(
 
     # Offload support: provide a folder for disk offloading when GPU memory is insufficient
     _offload_dir = None
+    _owns_offload_dir = False
     if load_kwargs.get("device_map") == "auto":
         if offload_folder:
             _offload_dir = offload_folder
@@ -572,6 +953,7 @@ def load_model(
             # Auto-create a temp offload dir so from_pretrained never crashes
             # when Accelerate needs disk offloading
             _offload_dir = tempfile.mkdtemp(prefix="obliteratus_offload_")
+            _owns_offload_dir = True
             load_kwargs["offload_folder"] = _offload_dir
             logger.info(f"Auto-created offload folder: {_offload_dir}")
 
@@ -597,14 +979,16 @@ def load_model(
             )
 
     try:
-        model = model_cls.from_pretrained(**load_kwargs)
+        load_result = _from_pretrained_with_source_compatibility(
+            source, model_cls.from_pretrained, **load_kwargs
+        )
     except OSError as e:
         err_msg = str(e)
         if "gated repo" in err_msg.lower() or "access to model" in err_msg.lower():
             raise RuntimeError(
-                f"Access denied for gated model '{model_name}'.\n\n"
+                f"Access denied for gated model '{source.model_root}'.\n\n"
                 f"This model requires you to:\n"
-                f"  1. Accept the license at https://huggingface.co/{model_name}\n"
+                f"  1. Accept the license at https://huggingface.co/{source.model_root}\n"
                 f"  2. Set your HF_TOKEN: export HF_TOKEN=hf_...\n"
                 f"     (or add it to your HF Space secrets)\n\n"
                 f"Token {'is' if token else 'is NOT'} currently set."
@@ -619,7 +1003,9 @@ def load_model(
         fallback_cache = os.path.join(tempfile.gettempdir(), "hf_home", "hub")
         os.makedirs(fallback_cache, exist_ok=True)
         load_kwargs["cache_dir"] = fallback_cache
-        model = model_cls.from_pretrained(**load_kwargs)
+        load_result = _from_pretrained_with_source_compatibility(
+            source, model_cls.from_pretrained, **load_kwargs
+        )
     except (ValueError, KeyError) as e:
         err_msg = str(e)
         if "does not recognize this architecture" in err_msg or "model type" in err_msg:
@@ -632,6 +1018,21 @@ def load_model(
                 f"pip install git+https://github.com/huggingface/transformers.git"
             ) from e
         raise
+
+    if source.is_gguf:
+        model, loading_info = _unpack_gguf_load_result(load_result)
+        try:
+            _validate_gguf_loading_info(model, config, loading_info)
+            dense_dtype = _validate_dense_gguf_model(model)
+        except (RuntimeError, TypeError):
+            if _offload_dir is not None and _owns_offload_dir:
+                import shutil
+
+                shutil.rmtree(_offload_dir, ignore_errors=True)
+            raise
+    else:
+        model = load_result
+        dense_dtype = None
 
     if device not in ("auto",) and quantization is None and native_quant is None:
         model = model.to(device)
@@ -647,12 +1048,12 @@ def load_model(
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code, token=token,
+            source.tokenizer_source, trust_remote_code=trust_remote_code, token=token,
         )
     except PermissionError:
         fallback_cache = os.path.join(tempfile.gettempdir(), "hf_home", "hub")
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code, cache_dir=fallback_cache,
+            source.tokenizer_source, trust_remote_code=trust_remote_code, cache_dir=fallback_cache,
             token=token,
         )
     if tokenizer.pad_token is None:
@@ -664,11 +1065,27 @@ def load_model(
         config=config,
         model_name=model_name,
         task=task,
+        source_format=source.source_format,
+        source_model=source.model_root,
+        source_file=source.source_file,
+        canonical_model_id=source.canonical_model_id,
+        tokenizer_source=source.tokenizer_source,
+        source_quantization=source_quantization,
+        in_memory_format="dense" if source.is_gguf else (
+            "native_quantized" if native_quant is not None else "dense"
+        ),
+        in_memory_dtype=dense_dtype or dtype,
         _offload_dir=_offload_dir,
+        _owns_offload_dir=_owns_offload_dir,
     )
 
     # Skip snapshot for large models to avoid doubling memory usage
-    if skip_snapshot is True:
+    if source.is_gguf and skip_snapshot is not False:
+        logger.info(
+            "Skipping initial snapshot for GGUF import; pass skip_snapshot=False "
+            "to force a dense recovery copy"
+        )
+    elif skip_snapshot is True:
         pass  # user explicitly opted out
     elif skip_snapshot is False:
         handle.snapshot()  # user explicitly forced snapshot

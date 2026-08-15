@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 
-from safetensors.torch import save_file
 import torch
+from safetensors.torch import save_file
 
-from obliteratus.model_profile import default_self_improve_params, estimate_total_params, profile_model
+from obliteratus.model_profile import (
+    default_self_improve_params,
+    estimate_total_params,
+    profile_model,
+)
 
 
 def test_estimate_total_params_uses_nested_text_config():

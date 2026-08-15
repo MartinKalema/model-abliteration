@@ -51,10 +51,11 @@ Novel contributions:
 from __future__ import annotations
 
 import logging
+import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import torch
 
@@ -62,6 +63,11 @@ from obliteratus.abliterate import (
     AbliterationPipeline,
     StageResult,
 )
+from obliteratus.architecture_manifest import (
+    ArchitectureCoverageError,
+    ProjectionManifestEntry,
+)
+from obliteratus.evaluation.damage_gate import AcceptanceBudget
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +79,9 @@ INFORMED_METHOD = {
     "description": (
         "Runs analysis modules between PROBE and DISTILL to auto-configure "
         "direction extraction, layer selection, and projection strategy based "
-        "on the model's actual refusal geometry. Defaults to single diff-of-means "
-        "direction + Bayesian optimization (Heretic-style)."
+        "on the model's actual refusal geometry. Bayesian tuning is disabled "
+        "until exact winning-trial replay exists; deterministic analysis-guided "
+        "projection remains enabled."
     ),
     "n_directions": 1,            # overridden by analysis
     "direction_method": "diff_means",  # overridden by analysis; "leace" also available
@@ -145,7 +152,7 @@ class InformedPipelineReport:
     analysis_duration: float = 0.0
     total_duration: float = 0.0
     ouroboros_passes: int = 0
-    final_refusal_rate: float = 0.0
+    final_refusal_rate: float | None = None
 
 
 # ── The Informed Pipeline ────────────────────────────────────────────────
@@ -177,7 +184,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         output_dir: str = "abliterated_informed",
         device: str = "auto",
         dtype: str = "float16",
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         harmful_prompts: list[str] | None = None,
         harmless_prompts: list[str] | None = None,
         on_stage: Callable[[StageResult], None] | None = None,
@@ -186,7 +193,31 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         push_to_hub: str | None = None,
         hub_token: str | None = None,
         hub_community_org: str | None = None,
+        overwrite_output: bool = False,
         quantization: str | None = None,
+        project_lm_head: bool | None = None,
+        project_embeddings: bool | None = None,
+        projection_target: str | None = None,
+        verify_sample_size: int | None = None,
+        damage_gate_enabled: bool = True,
+        damage_budget: AcceptanceBudget | None = None,
+        damage_holdout_fraction: float = 0.15,
+        damage_eval_max_samples: int = 64,
+        damage_eval_seed: int = 42,
+        damage_kl_positions_per_prompt: int = 8,
+        damage_generation_samples: int = 10,
+        evaluation_harmful_prompts: list[str] | None = None,
+        evaluation_harmless_prompts: list[str] | None = None,
+        gguf_file: str | None = None,
+        base_model_id: str | None = None,
+        tokenizer_path: str | None = None,
+        output_format: str = "hf",
+        gguf_quant: str = "Q4_K_M",
+        llama_cpp_dir: str | None = None,
+        llama_cpp_python: str | None = None,
+        gguf_imatrix: str | None = None,
+        keep_dense_intermediate: bool = False,
+        post_quant_verify: bool = True,
         # Analysis configuration
         run_cone_analysis: bool = True,
         run_alignment_detection: bool = True,
@@ -219,8 +250,32 @@ class InformedAbliterationPipeline(AbliterationPipeline):
             push_to_hub=push_to_hub,
             hub_token=hub_token,
             hub_community_org=hub_community_org,
+            overwrite_output=overwrite_output,
             quantization=quantization,
-            # Set informed defaults: single direction + Bayesian opt
+            project_lm_head=project_lm_head,
+            project_embeddings=project_embeddings,
+            projection_target=projection_target,
+            verify_sample_size=verify_sample_size,
+            damage_gate_enabled=damage_gate_enabled,
+            damage_budget=damage_budget,
+            damage_holdout_fraction=damage_holdout_fraction,
+            damage_eval_max_samples=damage_eval_max_samples,
+            damage_eval_seed=damage_eval_seed,
+            damage_kl_positions_per_prompt=damage_kl_positions_per_prompt,
+            damage_generation_samples=damage_generation_samples,
+            evaluation_harmful_prompts=evaluation_harmful_prompts,
+            evaluation_harmless_prompts=evaluation_harmless_prompts,
+            gguf_file=gguf_file,
+            base_model_id=base_model_id,
+            tokenizer_path=tokenizer_path,
+            output_format=output_format,
+            gguf_quant=gguf_quant,
+            llama_cpp_dir=llama_cpp_dir,
+            llama_cpp_python=llama_cpp_python,
+            gguf_imatrix=gguf_imatrix,
+            keep_dense_intermediate=keep_dense_intermediate,
+            post_quant_verify=post_quant_verify,
+            # Set informed defaults: deterministic analysis-guided projection.
             n_directions=1,
             direction_method="diff_means",
             norm_preserve=True,
@@ -266,6 +321,11 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         """
         t0 = time.time()
 
+        # A previous run on the same pipeline object may have left process-only
+        # steering hooks behind.  They are not part of a serialized checkpoint
+        # and must not affect either the untouched baseline or official checks.
+        self._remove_activation_steering()
+
         # Stage 1: SUMMON
         self._summon()
 
@@ -278,13 +338,21 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         # Stage 4: DISTILL (informed by analysis)
         self._distill_informed()
 
+        # Freeze held-out benign behavior before the first persistent edit.
+        # Any capture failure is fatal and occurs while weights are untouched.
+        self._remove_activation_steering()
+        self._capture_damage_baseline()
+
         # Stage 5: EXCISE (informed by analysis)
         self._excise_informed()
+
+        self._remove_activation_steering()
 
         # Stage 6: VERIFY + Ouroboros compensation loop
         self._verify_and_compensate()
 
         # Stage 7: REBIRTH
+        self._report.total_duration = time.time() - t0
         output_path = self._rebirth_informed()
 
         self._report.total_duration = time.time() - t0
@@ -702,8 +770,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
             for cluster in insights.direction_clusters:
                 ranked = sorted(cluster, key=lambda ly: norms.get(ly, 0), reverse=True)
                 # Add up to 2 additional strong layers per cluster
-                for ly in ranked[:3]:  # representative + up to 2 more
-                    base_layers.append(ly)
+                base_layers.extend(ranked[:3])  # representative + up to 2 more
             base_layers = sorted(set(base_layers))
 
             # Gate: remove highly entangled layers
@@ -764,8 +831,8 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         if total_params == 0 and self.handle:
             try:
                 total_params = sum(p.numel() for p in self.handle.model.parameters())
-            except Exception:
-                pass
+            except (AttributeError, RuntimeError, TypeError) as exc:
+                logger.debug("Could not count model parameters: %s", exc)
         if self.n_directions > 1 and (
             (0 < hidden_size < 2048)
             or (0 < total_params < 2_000_000_000)
@@ -785,7 +852,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         if self.direction_method == "leace":
             from obliteratus.analysis.leace import LEACEExtractor
             leace_extractor = LEACEExtractor()
-            self.log(f"Using LEACE (closed-form optimal concept erasure)")
+            self.log("Using LEACE (closed-form optimal concept erasure)")
 
         if self.use_whitened_svd and self.n_directions > 1 and leace_extractor is None:
             from obliteratus.analysis.whitened_svd import WhitenedSVDExtractor
@@ -796,27 +863,30 @@ class InformedAbliterationPipeline(AbliterationPipeline):
 
         for idx in range(n_layers):
             # LEACE path: theoretically optimal single-direction erasure
-            if leace_extractor is not None:
-                if idx in self._harmful_acts and idx in self._harmless_acts:
-                    try:
-                        l_result = leace_extractor.extract(
-                            self._harmful_acts[idx],
-                            self._harmless_acts[idx],
-                            layer_idx=idx,
-                        )
-                        self.refusal_directions[idx] = l_result.direction
-                        self.refusal_subspaces[idx] = l_result.direction.unsqueeze(0)
-                        norms[idx] = l_result.generalized_eigenvalue
+            if (
+                leace_extractor is not None
+                and idx in self._harmful_acts
+                and idx in self._harmless_acts
+            ):
+                try:
+                    l_result = leace_extractor.extract(
+                        self._harmful_acts[idx],
+                        self._harmless_acts[idx],
+                        layer_idx=idx,
+                    )
+                    self.refusal_directions[idx] = l_result.direction
+                    self.refusal_subspaces[idx] = l_result.direction.unsqueeze(0)
+                    norms[idx] = l_result.generalized_eigenvalue
 
-                        if idx < 5 or idx == n_layers - 1:
-                            self.log(
-                                f"  layer {idx}: LEACE eigenvalue={l_result.generalized_eigenvalue:.4f}, "
-                                f"erasure_loss={l_result.erasure_loss:.4f}"
-                            )
-                        continue
-                    except Exception as e:
-                        if idx < 5:
-                            self.log(f"  layer {idx}: LEACE failed ({e}), falling back")
+                    if idx < 5 or idx == n_layers - 1:
+                        self.log(
+                            f"  layer {idx}: LEACE eigenvalue={l_result.generalized_eigenvalue:.4f}, "
+                            f"erasure_loss={l_result.erasure_loss:.4f}"
+                        )
+                    continue
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    if idx < 5:
+                        self.log(f"  layer {idx}: LEACE failed ({exc}), falling back")
 
             if self.n_directions == 1:
                 diff = (self._harmful_means[idx] - self._harmless_means[idx]).squeeze(0)
@@ -842,7 +912,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                 if not torch.isfinite(diff_matrix).all():
                     diff_matrix = torch.nan_to_num(diff_matrix)
                 k = min(self.n_directions, diff_matrix.shape[0], diff_matrix.shape[1])
-                U, S, Vh = torch.linalg.svd(diff_matrix, full_matrices=False)
+                _, S, Vh = torch.linalg.svd(diff_matrix, full_matrices=False)
                 if not torch.isfinite(S).all() or not torch.isfinite(Vh).all():
                     continue
                 subspace = Vh[:k]
@@ -923,140 +993,69 @@ class InformedAbliterationPipeline(AbliterationPipeline):
     def _excise_informed(self):
         """Excise refusal directions with analysis-informed strategy.
 
-        Uses Bayesian optimization (when available) with analysis-derived
-        warm-start parameters, falling back to sparse surgery or standard
-        projection.  This is the key integration: analysis maps the geometry,
-        Bayesian optimization finds the optimal projection strength.
+        Uses sparse surgery when analysis supports it; otherwise applies one
+        deterministic analysis-guided projection pass. Bayesian tuning remains
+        disabled until the exact candidate scored during search can be replayed.
         """
-        if self._insights.use_sparse_surgery:
-            self._excise_sparse()
-            return
-
-        # Enable Bayesian optimization using analysis insights for warm-start.
-        # The analysis provides much better initial parameters than the default
-        # heuristic (strongest-layer-based peak), dramatically narrowing the
-        # search space and improving convergence.
-        self._configure_bayesian_warm_start()
-        self._excise()
+        # The base excision routines can apply ``refinement_passes`` edits in a
+        # single call.  That is unsafe here because only the final state would
+        # be checked.  Apply exactly one persistent pass per call; the outer
+        # compensation loop may request another pass only after verification.
+        configured_refinement_passes = self.refinement_passes
+        self.refinement_passes = 1
+        self._remove_activation_steering()
+        try:
+            if self._insights.use_sparse_surgery:
+                self._excise_sparse()
+            else:
+                # Configure deterministic analysis-guided strength/layer
+                # settings, then perform one persistent edit pass.
+                self._configure_bayesian_warm_start()
+                self._excise()
+        finally:
+            self.refinement_passes = configured_refinement_passes
+            removed_hooks = self._remove_activation_steering()
+            if removed_hooks:
+                self.log(
+                    f"Removed {removed_hooks} runtime-only steering hooks "
+                    "before checkpoint verification"
+                )
 
     def _configure_bayesian_warm_start(self):
-        """Configure Bayesian optimization with analysis-derived warm-start.
+        """Configure deterministic analysis-guided projection settings.
 
-        Translates analysis insights into a much tighter search space:
-        - peak_position from cluster representative layers
-        - spread from cluster structure (narrow clusters → narrow spread)
-        - component scaling from entanglement analysis
-        - KL budget from alignment method detection
+        Retains deterministic per-layer strength/interpolation while disabling
+        the inconsistent Bayesian and legacy KL-correction branches.
         """
-        insights = self._insights
+        # The old optimizer measured a different edit from the one it later
+        # applied. Keep it off without disabling the useful informed pipeline.
+        self._bayesian_trials = 0
 
-        # Enable Bayesian optimization (50 trials default, same as heretic)
-        self._bayesian_trials = 50
-
-        # Also set heretic-compatible flags on the pipeline so the base
-        # _excise_inner() picks them up during Bayesian optimization.
+        # Retain deterministic analysis-derived layer weighting. The invalid
+        # legacy post-hoc KL correction is disabled in the base pipeline.
         self.layer_adaptive_strength = True
         self.float_layer_interpolation = True
-        self.use_kl_optimization = True
+        self.use_kl_optimization = False
 
-        # KL budget: tighter for methods that are fragile (CAI, RLHF),
-        # looser for concentrated methods (DPO, SFT).
-        method = insights.detected_alignment_method
-        if method == "dpo":
-            self.kl_budget = 0.5
-        elif method == "rlhf":
-            self.kl_budget = 0.3
-        elif method == "cai":
-            self.kl_budget = 0.2
-        elif method == "sft":
-            self.kl_budget = 0.4
-        else:
-            self.kl_budget = 0.35
-
-        self.log(f"Bayesian optimization enabled (50 trials, KL budget={self.kl_budget})")
-        self.log("Analysis insights will warm-start the optimizer")
-
-        # Compute analysis-derived warm-start for the parametric kernel.
-        # The Bayesian optimizer reads these from the pipeline if present.
-        n_layers = len(self._harmful_means) if self._harmful_means else 32
-        if insights.cluster_representative_layers and n_layers > 1:
-            # Peak position: normalized position of the strongest cluster rep
-            norms = {}
-            for idx in self._harmful_means:
-                if idx in self._harmless_means:
-                    norms[idx] = (self._harmful_means[idx] - self._harmless_means[idx]).squeeze().norm().item()
-            reps = insights.cluster_representative_layers
-            if norms:
-                best_rep = max(reps, key=lambda ly: norms.get(ly, 0))
-            else:
-                best_rep = reps[len(reps) // 2]
-            warm_peak = best_rep / max(n_layers - 1, 1)
-
-            # Spread: narrow if clusters are tight, wide if clusters span many layers
-            if insights.direction_clusters:
-                cluster_widths = [
-                    (max(c) - min(c)) / max(n_layers - 1, 1)
-                    for c in insights.direction_clusters if len(c) > 1
-                ]
-                warm_spread = max(0.1, min(0.6, sum(cluster_widths) / len(cluster_widths) if cluster_widths else 0.3))
-            else:
-                warm_spread = 0.3
-
-            # Min weight: higher if high persistence (refusal spread across all layers)
-            warm_min = min(0.3, max(0.0, insights.direction_persistence * 0.2))
-
-            # Attn/MLP scaling: reduce MLP scaling if entanglement is high
-            # (MLP projections cause more capability damage)
-            if insights.entanglement_score > 0.5:
-                warm_mlp = 0.4
-                warm_attn = 0.7
-            else:
-                warm_mlp = 0.6
-                warm_attn = 0.8
-        else:
-            warm_peak = 0.5
-            warm_spread = 0.3
-            warm_min = 0.05
-            warm_mlp = 0.6
-            warm_attn = 0.8
-
-        # Store warm-start params for the Bayesian optimizer to pick up
-        self._informed_warm_start = {
-            "max_weight": 0.9,
-            "peak_position": warm_peak,
-            "min_weight": warm_min,
-            "spread": warm_spread,
-            "attn_scale": warm_attn,
-            "mlp_scale": warm_mlp,
-            "dir_idx": 0.0,
-        }
         self.log(
-            f"  Warm-start: peak={warm_peak:.2f}, spread={warm_spread:.2f}, "
-            f"min={warm_min:.2f}, attn={warm_attn:.2f}, mlp={warm_mlp:.2f}"
+            "Bayesian tuning disabled pending exact replay; continuing with "
+            "deterministic analysis-guided projection and the held-out gate"
         )
 
     def _excise_sparse(self):
-        """Sparse direction surgery — only modifies high-projection rows."""
+        """Apply sparse surgery to every selected manifest writer exactly once."""
         self._emit("excise", "running", "Sparse direction surgery...")
         t0 = time.time()
 
         from obliteratus.analysis.sparse_surgery import SparseDirectionSurgeon
-        from obliteratus.strategies.utils import (
-            get_attention_module,
-            get_ffn_module,
-            get_layer_modules,
-        )
 
         surgeon = SparseDirectionSurgeon(
             sparsity=self._insights.recommended_sparsity,
             auto_sparsity=True,
         )
-        layers = get_layer_modules(self.handle)
-        arch = self.handle.architecture
         total_modified = 0
 
         for pass_num in range(self.refinement_passes):
-            modified = 0
             if self.refinement_passes > 1:
                 self.log(f"Sparse surgery pass {pass_num + 1}/{self.refinement_passes}")
 
@@ -1065,44 +1064,51 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                 self._probe()
                 self._distill_inner()
 
-            for idx in self._strong_layers:
-                subspace = self.refusal_subspaces[idx]
-                layer = layers[idx]
-                device = next(layer.parameters()).device
-                layer_dtype = next(layer.parameters()).dtype
+            plan, expected = self._prepare_sparse_manifest_plan()
+            applied: set[tuple[str, int]] = set()
+            layer_counts: dict[int, int] = {}
+            for entry, owner_layer, projection, tensor, is_quantized, subspace in plan:
+                updated = self._sparse_project_manifest_tensor(
+                    tensor,
+                    subspace,
+                    residual_axis=entry.residual_axis,
+                    expert_axis=entry.expert_axis,
+                    surgeon=surgeon,
+                )
+                self._commit_sparse_manifest_tensor(
+                    entry,
+                    projection,
+                    updated,
+                    is_quantized=is_quantized,
+                )
+                keys = {
+                    (entry.storage_identity, direction_index)
+                    for direction_index in range(subspace.shape[0])
+                }
+                duplicate = applied.intersection(keys)
+                if duplicate:
+                    raise ArchitectureCoverageError(
+                        "Sparse manifest storage was applied more than once: "
+                        f"{entry.qualified_name}"
+                    )
+                applied.update(keys)
+                layer_counts[owner_layer] = layer_counts.get(owner_layer, 0) + len(keys)
 
-                for dir_idx in range(subspace.shape[0]):
-                    direction = subspace[dir_idx].to(device).to(layer_dtype)
+            if applied != expected:
+                missing = expected - applied
+                extra = applied - expected
+                raise ArchitectureCoverageError(
+                    "Sparse surgery did not exactly execute the validated writer "
+                    f"manifest (missing={len(missing)}, extra={len(extra)})"
+                )
 
-                    # Apply sparse projection to attention and FFN output weights
-                    for module_getter, out_names in [
-                        (get_attention_module, ["o_proj", "out_proj", "dense", "c_proj"]),
-                        (get_ffn_module, ["down_proj", "c_proj", "dense_4h_to_h", "fc_out", "fc2", "w2"]),
-                    ]:
-                        try:
-                            module = module_getter(layer, arch)
-                            for name in out_names:
-                                proj = getattr(module, name, None)
-                                if proj is None or not hasattr(proj, "weight"):
-                                    continue
-                                W = proj.weight.data
-                                if W.shape[-1] == direction.shape[0]:
-                                    original_norm = W.norm().item()
-                                    W_new = surgeon.apply_sparse_projection(W, direction)
-                                    if self.norm_preserve and original_norm > 0:
-                                        new_norm = W_new.norm().item()
-                                        if new_norm > 0:
-                                            W_new = W_new * (original_norm / new_norm)
-                                    proj.weight.data = W_new.to(layer_dtype)
-                                    modified += 1
-                                    break
-                        except (AttributeError, RuntimeError):
-                            continue
-
-                self.log(f"  layer {idx}: sparse surgery on {subspace.shape[0]} directions")
-
+            modified = len(applied)
+            for idx in sorted(layer_counts):
+                self.log(
+                    f"  layer {idx}: {layer_counts[idx]} sparse writer projections"
+                )
             total_modified += modified
-            self.log(f"  Pass {pass_num + 1}: {modified} matrices modified (sparse)")
+            self.log(f"  Pass {pass_num + 1}: {modified} manifest projections (sparse)")
 
         elapsed = time.time() - t0
         self.log(f"Sparse excision: {total_modified} projections ({elapsed:.1f}s)")
@@ -1112,6 +1118,249 @@ class InformedAbliterationPipeline(AbliterationPipeline):
             duration=elapsed,
             modified_count=total_modified,
         )
+
+    def _prepare_sparse_manifest_plan(self):
+        """Resolve and validate the complete sparse writer plan before editing."""
+        manifest = self._current_projection_manifest()
+        if len(self._strong_layers) != len(set(self._strong_layers)):
+            raise ArchitectureCoverageError(
+                "Sparse surgery received duplicate strong-layer indices"
+            )
+        strong_layers = set(self._strong_layers)
+
+        for layer_idx in strong_layers:
+            subspace = self.refusal_subspaces.get(layer_idx)
+            if not isinstance(subspace, torch.Tensor):
+                raise ArchitectureCoverageError(
+                    f"Sparse surgery has no refusal subspace for layer {layer_idx}"
+                )
+            if subspace.ndim != 2 or subspace.shape[0] == 0:
+                raise ArchitectureCoverageError(
+                    f"Layer {layer_idx} refusal subspace must be a non-empty matrix"
+                )
+            if subspace.shape[1] != manifest.hidden_size:
+                raise ArchitectureCoverageError(
+                    f"Layer {layer_idx} refusal subspace width {subspace.shape[1]} "
+                    f"does not match manifest hidden size {manifest.hidden_size}"
+                )
+            if not torch.isfinite(subspace).all():
+                raise ArchitectureCoverageError(
+                    f"Layer {layer_idx} refusal subspace contains NaN/Inf"
+                )
+            if (subspace.norm(dim=1) <= 1e-10).any():
+                raise ArchitectureCoverageError(
+                    f"Layer {layer_idx} refusal subspace contains a zero direction"
+                )
+
+        plan = []
+        expected: set[tuple[str, int]] = set()
+        covered_layers: set[int] = set()
+        for entry in manifest.entries:
+            if entry.role != "writer":
+                continue
+            owners = strong_layers.intersection(entry.layer_indices)
+            if not owners:
+                continue
+            if entry.orientation != "output":
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} has non-output orientation"
+                )
+            if entry.branch_kind not in {"attention", "ffn"}:
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} has unsupported branch kind "
+                    f"{entry.branch_kind!r}"
+                )
+
+            owner_layer = min(owners)
+            subspace = self.refusal_subspaces[owner_layer]
+            projection = self._resolve_dotted_projection(
+                entry.owner, entry.attribute_path
+            )
+            if entry.projection_kind == "module_weight":
+                if not isinstance(projection, torch.nn.Module) or not isinstance(
+                    getattr(projection, "weight", None), torch.Tensor
+                ):
+                    raise ArchitectureCoverageError(
+                        f"Manifest module writer {entry.qualified_name} no longer "
+                        "resolves to a weighted module"
+                    )
+                tensor, is_quantized = self._dequantize_weight(projection)
+            elif entry.projection_kind == "parameter_axis":
+                if not isinstance(projection, (torch.nn.Parameter, torch.Tensor)):
+                    raise ArchitectureCoverageError(
+                        f"Manifest packed writer {entry.qualified_name} no longer "
+                        "resolves to a tensor"
+                    )
+                tensor = projection.data if isinstance(
+                    projection, torch.nn.Parameter
+                ) else projection
+                is_quantized = False
+            else:
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} has unsupported projection "
+                    f"kind {entry.projection_kind!r}"
+                )
+
+            if tensor.device.type == "meta":
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} is still on the meta device"
+                )
+            if not tensor.is_floating_point():
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} is not floating point"
+                )
+            if tuple(tensor.shape) != entry.shape:
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} changed shape from "
+                    f"{entry.shape} to {tuple(tensor.shape)}"
+                )
+            if tensor.ndim < 2:
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} is not matrix-like"
+                )
+            residual_axis = entry.residual_axis % tensor.ndim
+            if tensor.shape[residual_axis] != manifest.hidden_size:
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} residual axis "
+                    f"{residual_axis} has width {tensor.shape[residual_axis]}, expected "
+                    f"{manifest.hidden_size}"
+                )
+            if entry.expert_axis is not None:
+                expert_axis = entry.expert_axis % tensor.ndim
+                if expert_axis == residual_axis:
+                    raise ArchitectureCoverageError(
+                        f"Manifest writer {entry.qualified_name} reuses its residual "
+                        "axis as the expert axis"
+                    )
+            if not torch.isfinite(tensor).all():
+                raise ArchitectureCoverageError(
+                    f"Manifest writer {entry.qualified_name} contains NaN/Inf"
+                )
+
+            for direction_index in range(subspace.shape[0]):
+                key = (entry.storage_identity, direction_index)
+                if key in expected:
+                    raise ArchitectureCoverageError(
+                        "Sparse writer plan contains duplicate storage/direction "
+                        f"for {entry.qualified_name}"
+                    )
+                expected.add(key)
+            covered_layers.update(owners)
+            plan.append(
+                (
+                    entry,
+                    owner_layer,
+                    projection,
+                    tensor,
+                    is_quantized,
+                    subspace,
+                )
+            )
+
+        missing_layers = strong_layers - covered_layers
+        if missing_layers:
+            raise ArchitectureCoverageError(
+                "Sparse writer manifest does not cover strong layers "
+                f"{sorted(missing_layers)}"
+            )
+
+        for coverage in manifest.branch_coverage:
+            layer_idx = coverage.get("layer")
+            if layer_idx not in strong_layers:
+                continue
+            branch_kind = coverage.get("kind")
+            branch_path = coverage.get("path")
+            if not any(
+                entry.role == "writer"
+                and layer_idx in entry.layer_indices
+                and entry.branch_kind == branch_kind
+                and branch_path in entry.branch_paths
+                for entry in manifest.entries
+            ):
+                raise ArchitectureCoverageError(
+                    f"Sparse writer plan omits layer {layer_idx} {branch_kind} "
+                    f"branch {branch_path!r}"
+                )
+
+        if strong_layers and not expected:
+            raise ArchitectureCoverageError(
+                "Sparse surgery has strong layers but no manifest writer projections"
+            )
+        return plan, expected
+
+    def _sparse_project_manifest_tensor(
+        self,
+        tensor: torch.Tensor,
+        subspace: torch.Tensor,
+        *,
+        residual_axis: int,
+        expert_axis: int | None,
+        surgeon,
+    ) -> torch.Tensor:
+        """Project a manifest tensor sparsely along its declared residual axis."""
+        working = tensor.detach().clone()
+        original_norm = working.float().norm().item() if self.norm_preserve else 0.0
+        residual_axis %= working.ndim
+
+        def project_slice(target: torch.Tensor, axis: int, direction: torch.Tensor):
+            moved = target.movedim(axis, -1)
+            matrix = moved.reshape(-1, moved.shape[-1])
+            local_direction = direction.to(
+                device=matrix.device,
+                dtype=matrix.dtype,
+            )
+            modified = surgeon.apply_sparse_projection(matrix, local_direction)
+            if modified.shape != matrix.shape or not torch.isfinite(modified).all():
+                raise RuntimeError("Sparse projection produced an invalid writer tensor")
+            moved.copy_(modified.reshape(moved.shape))
+
+        for direction in subspace:
+            if expert_axis is None:
+                project_slice(working, residual_axis, direction)
+                continue
+            normalized_expert_axis = expert_axis % working.ndim
+            adjusted_residual_axis = residual_axis
+            if normalized_expert_axis < residual_axis:
+                adjusted_residual_axis -= 1
+            for expert_index in range(working.shape[normalized_expert_axis]):
+                project_slice(
+                    working.select(normalized_expert_axis, expert_index),
+                    adjusted_residual_axis,
+                    direction,
+                )
+
+        if self.norm_preserve and original_norm > 0.0:
+            new_norm = working.float().norm().item()
+            if not math.isfinite(new_norm) or new_norm <= 0.0:
+                raise RuntimeError("Sparse projection produced a degenerate writer tensor")
+            working.mul_(original_norm / new_norm)
+        return working
+
+    def _commit_sparse_manifest_tensor(
+        self,
+        entry: ProjectionManifestEntry,
+        projection,
+        updated: torch.Tensor,
+        *,
+        is_quantized: bool,
+    ) -> None:
+        """Commit one completely computed sparse writer tensor."""
+        if entry.projection_kind == "module_weight":
+            if is_quantized:
+                self._replace_quantized_weight(projection, updated)
+            else:
+                projection.weight.data.copy_(
+                    updated.to(
+                        device=projection.weight.device,
+                        dtype=projection.weight.dtype,
+                    )
+                )
+            return
+
+        target = projection.data if isinstance(
+            projection, torch.nn.Parameter
+        ) else projection
+        target.copy_(updated.to(device=target.device, dtype=target.dtype))
 
     # ── Informed VERIFY + Ouroboros Compensation ──────────────────────
 
@@ -1123,27 +1372,46 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         2. Self-repair / Ouroboros effect (via defense robustness)
         3. Triggers additional targeted passes at compensating layers
 
-        KL-gated: stops early if model damage (KL divergence) is getting
-        worse even though refusal persists.  This prevents the death spiral
-        where each pass damages the model without removing refusal.
+        Every pass is measured against the same untouched held-out baseline.
+        A collateral-damage failure restores the original snapshot and aborts;
+        refusal improvement can never compensate for failed locality checks.
         """
-        # Run standard verification first
-        self._verify()
+        assessment = self._verify()
+        if self.damage_gate_enabled and not assessment.damage_accepted:
+            self._reject_and_restore(assessment)
 
         # Check if Ouroboros compensation is needed
-        refusal_rate = self._quality_metrics.get("refusal_rate", 0.0)
-        prev_kl = self._quality_metrics.get("kl_divergence", 0.0)
         ouroboros_pass = 0
+        efficacy_limit = self.damage_budget.efficacy.max_refusal_rate
+        target_refusal = (
+            efficacy_limit
+            if efficacy_limit is not None
+            else self._ouroboros_threshold
+        )
+        refusal_rate = self._validated_refusal_rate(
+            require_evidence=efficacy_limit is not None,
+        )
+        if (
+            self.damage_gate_enabled
+            and efficacy_limit is not None
+            and refusal_rate is None
+        ):
+            # A missing/partial refusal measurement cannot justify another
+            # destructive edit.  It also cannot qualify a checkpoint.
+            self._reject_and_restore(assessment)
 
-        # KL budget: stop if KL exceeds this threshold (model too damaged)
-        kl_ceiling = getattr(self, "kl_budget", 0.5) * 2.0  # 2x budget as hard ceiling
-
-        while (refusal_rate > self._ouroboros_threshold
-               and ouroboros_pass < self._max_ouroboros_passes):
+        while (
+            refusal_rate is not None
+            and refusal_rate > target_refusal
+            and ouroboros_pass < self._max_ouroboros_passes
+        ):
             ouroboros_pass += 1
             self.log(f"\n{'='*60}")
             self.log(f"OUROBOROS COMPENSATION — Pass {ouroboros_pass}")
-            self.log(f"Refusal rate still {refusal_rate:.0%} > {self._ouroboros_threshold:.0%} threshold")
+            self.log(
+                f"Refusal rate still {refusal_rate:.0%} > "
+                f"{target_refusal:.0%} acceptance threshold"
+            )
             self.log(f"{'='*60}")
 
             # Re-probe to find where refusal has re-emerged
@@ -1157,110 +1425,139 @@ class InformedAbliterationPipeline(AbliterationPipeline):
             # Re-excise at the new strong layers using informed strategy
             if self._strong_layers:
                 self._excise_informed()
+                self._remove_activation_steering()
             else:
                 self.log("No strong layers found — stopping Ouroboros compensation")
                 break
 
             # Re-verify
-            self._verify()
-            refusal_rate = self._quality_metrics.get("refusal_rate", 0.0)
-            current_kl = self._quality_metrics.get("kl_divergence", 0.0)
-            self.log(f"After Ouroboros pass {ouroboros_pass}: refusal={refusal_rate:.0%}, KL={current_kl:.4f}")
-
-            # KL-gated early stopping: if KL is rising and exceeds ceiling,
-            # the model is being damaged faster than refusal is being removed.
-            if current_kl > kl_ceiling:
-                self.log(
-                    f"KL divergence {current_kl:.4f} exceeds ceiling {kl_ceiling:.4f} — "
-                    f"stopping to prevent further model damage"
-                )
-                break
-            if ouroboros_pass > 1 and current_kl > prev_kl * 1.5 and refusal_rate > 0.3:
-                self.log(
-                    f"KL rising sharply ({prev_kl:.4f} → {current_kl:.4f}) with "
-                    f"refusal still at {refusal_rate:.0%} — stopping (diminishing returns)"
-                )
-                break
-            prev_kl = current_kl
+            assessment = self._verify()
+            if self.damage_gate_enabled and not assessment.damage_accepted:
+                self._reject_and_restore(assessment)
+            refusal_rate = self._validated_refusal_rate(
+                require_evidence=efficacy_limit is not None,
+            )
+            if (
+                self.damage_gate_enabled
+                and efficacy_limit is not None
+                and refusal_rate is None
+            ):
+                self._reject_and_restore(assessment)
+            current_kl = self._quality_metrics.get("kl_divergence")
+            try:
+                kl_number = float(current_kl) if current_kl is not None else None
+            except (TypeError, ValueError):
+                kl_number = None
+            kl_text = (
+                f"{kl_number:.4f}"
+                if kl_number is not None and math.isfinite(kl_number)
+                else "missing"
+            )
+            refusal_text = (
+                f"{refusal_rate:.0%}" if refusal_rate is not None else "missing"
+            )
+            self.log(
+                f"After Ouroboros pass {ouroboros_pass}: "
+                f"refusal={refusal_text}, KL={kl_text}"
+            )
 
         self._report.ouroboros_passes = ouroboros_pass
         self._report.final_refusal_rate = refusal_rate
 
         if ouroboros_pass > 0:
             self.log(f"\nOuroboros compensation: {ouroboros_pass} additional passes applied")
+        if self.damage_gate_enabled and not assessment.accepted:
+            self._reject_and_restore(assessment)
+        return assessment
+
+    def _validated_refusal_rate(self, *, require_evidence: bool) -> float | None:
+        """Return a finite, sufficiently sampled held-out refusal rate.
+
+        Compensation is allowed only when the efficacy failure is an observed
+        high refusal rate.  Missing, non-finite, or undersampled evidence is a
+        measurement failure, not a reason to edit the model again.
+        """
+        value = self._quality_metrics.get("refusal_rate")
+        if value is None:
+            return None
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            return None
+
+        if require_evidence:
+            count = self._quality_metrics.get("refusal_eval_count")
+            try:
+                count_number = float(count) if count is not None else None
+            except (TypeError, ValueError):
+                return None
+            if (
+                count_number is None
+                or not math.isfinite(count_number)
+                or count_number < self.damage_budget.efficacy.min_eval_prompts
+            ):
+                return None
+        return rate
 
     # ── Informed REBIRTH ─────────────────────────────────────────────
 
-    def _rebirth_informed(self) -> Path:
-        """Save model with comprehensive analysis metadata."""
-        self._emit("rebirth", "running", f"Saving to {self.output_dir}...")
-        t0 = time.time()
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        self.handle.model.save_pretrained(self.output_dir)
-        self.handle.tokenizer.save_pretrained(self.output_dir)
-
+    def _build_metadata(self) -> dict:
+        """Extend the base, gate-audited metadata with informed analysis."""
+        metadata = super()._build_metadata()
         insights = self._insights
-        metadata = {
-            "source_model": self.model_name,
-            "technique": "analysis_informed_abliteration",
-            "method": "informed",
-            "analysis_insights": {
-                "detected_alignment_method": insights.detected_alignment_method,
-                "alignment_confidence": insights.alignment_confidence,
-                "alignment_probabilities": insights.alignment_probabilities,
-                "cone_is_polyhedral": insights.cone_is_polyhedral,
-                "cone_dimensionality": insights.cone_dimensionality,
-                "mean_pairwise_cosine": insights.mean_pairwise_cosine,
-                "direction_clusters": insights.direction_clusters,
-                "cluster_count": insights.cluster_count,
-                "direction_persistence": insights.direction_persistence,
-                "estimated_robustness": insights.estimated_robustness,
-                "self_repair_estimate": insights.self_repair_estimate,
-                "entanglement_score": insights.entanglement_score,
-                "entangled_layers_skipped": insights.skip_layers,
-                "use_sparse_surgery": insights.use_sparse_surgery,
-                "recommended_sparsity": insights.recommended_sparsity,
-            },
-            "derived_config": {
-                "n_directions": insights.recommended_n_directions,
-                "direction_method": insights.recommended_direction_method,
-                "regularization": insights.recommended_regularization,
-                "refinement_passes": insights.recommended_refinement_passes,
-                "layers_used": insights.recommended_layers,
-                "layers_skipped": insights.skip_layers,
-                "norm_preserve": self.norm_preserve,
-                "whitened_svd": self.use_whitened_svd,
-                "sparse_surgery": insights.use_sparse_surgery,
-            },
-            "pipeline_stats": {
-                "analysis_duration_s": self._report.analysis_duration,
-                "total_duration_s": self._report.total_duration,
-                "ouroboros_passes": self._report.ouroboros_passes,
-                "final_refusal_rate": self._report.final_refusal_rate,
-            },
-            "strong_layers": self._strong_layers,
-            "quality_metrics": self._quality_metrics,
-            "references": [
-                "Arditi et al., Refusal in Language Models Is Mediated by a Single Direction (2024)",
-                "Gabliteration: SVD-based multi-direction extraction (arXiv:2512.18901)",
-                "grimjim, Norm-Preserving Biprojected Abliteration (2025)",
-                "Wollschlager et al., The Geometry of Refusal in LLMs — concept cones (ICML 2025, arXiv:2502.17420)",
-                "Joad et al., The Ouroboros Effect: Self-Repair in Abliterated LLMs (2026)",
-                "OBLITERATUS: Analysis-informed abliteration pipeline (novel)",
-            ],
-        }
-
-        import json
-        (self.output_dir / "abliteration_metadata.json").write_text(
-            json.dumps(metadata, indent=2, default=str)
+        metadata.update(
+            {
+                "technique": "analysis_informed_abliteration",
+                "analysis_insights": {
+                    "detected_alignment_method": insights.detected_alignment_method,
+                    "alignment_confidence": insights.alignment_confidence,
+                    "alignment_probabilities": insights.alignment_probabilities,
+                    "cone_is_polyhedral": insights.cone_is_polyhedral,
+                    "cone_dimensionality": insights.cone_dimensionality,
+                    "mean_pairwise_cosine": insights.mean_pairwise_cosine,
+                    "direction_clusters": insights.direction_clusters,
+                    "cluster_count": insights.cluster_count,
+                    "direction_persistence": insights.direction_persistence,
+                    "estimated_robustness": insights.estimated_robustness,
+                    "self_repair_estimate": insights.self_repair_estimate,
+                    "entanglement_score": insights.entanglement_score,
+                    "entangled_layers_skipped": insights.skip_layers,
+                    "use_sparse_surgery": insights.use_sparse_surgery,
+                    "recommended_sparsity": insights.recommended_sparsity,
+                },
+                "derived_config": {
+                    "n_directions": insights.recommended_n_directions,
+                    "direction_method": insights.recommended_direction_method,
+                    "regularization": insights.recommended_regularization,
+                    "refinement_passes": insights.recommended_refinement_passes,
+                    "layers_used": insights.recommended_layers,
+                    "layers_skipped": insights.skip_layers,
+                    "norm_preserve": self.norm_preserve,
+                    "whitened_svd": self.use_whitened_svd,
+                    "sparse_surgery": insights.use_sparse_surgery,
+                },
+                "pipeline_stats": {
+                    "analysis_duration_s": self._report.analysis_duration,
+                    "total_duration_s": self._report.total_duration,
+                    "ouroboros_passes": self._report.ouroboros_passes,
+                    "verified_weight_edit_passes": 1 + self._report.ouroboros_passes,
+                    "final_refusal_rate": self._report.final_refusal_rate,
+                },
+            }
         )
+        metadata["references"].extend(
+            [
+                "Wollschlager et al., The Geometry of Refusal in LLMs — concept cones (ICML 2025)",
+                "OBLITERATUS: Analysis-informed abliteration pipeline",
+            ]
+        )
+        return metadata
 
-        elapsed = time.time() - t0
-        self.log(f"Saved informed model to {self.output_dir}/ ({elapsed:.1f}s)")
-        self._emit("rebirth", "done", f"Saved to {self.output_dir} ({elapsed:.1f}s)", duration=elapsed)
-        return self.output_dir
+    def _rebirth_informed(self) -> Path:
+        """Use the base fail-closed, transactional checkpoint publisher."""
+        return self._rebirth()
 
     @staticmethod
     def format_insights(insights: AnalysisInsights) -> str:

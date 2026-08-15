@@ -7,8 +7,8 @@ for a given model architecture.
 Architecture bucketing:
   Records are grouped by (arch_class, reasoning_class, param_bucket) where
   param_bucket is a coarse size tier (tiny/small/medium/large/frontier).
-  Within each bucket, methods are ranked by composite score and the
-  best-performing hyperparameter ranges are extracted.
+  Within each bucket, accepted methods are ranked by refusal removal, with
+  paired damage used only to break efficacy ties.
 
 The ``get_adaptive_recommendation()`` function returns an
 ``AdaptiveRecommendation`` that the pipeline/UI can apply on top of
@@ -39,6 +39,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from obliteratus.evaluation.candidate_selection import (
+    CandidateEvidenceError,
+    damage_severity,
+    validate_acceptance_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,26 +127,29 @@ def _extract_arch_key(record: dict) -> tuple[str, str, str] | None:
     return (arch_class, reasoning_class, _param_bucket(params_b))
 
 
-# ── Composite scoring (same as tourney.py) ────────────────────────────────
+# ── Damage-gated composite scoring ───────────────────────────────────────
 
 def _composite_score(qm: dict[str, Any]) -> float:
-    """Score a run on [0, 1].  Higher is better."""
-    rr = qm.get("refusal_rate")
-    co = qm.get("coherence")
-    kl = qm.get("kl_divergence")
-    pp = qm.get("perplexity")
+    """Score an accepted run; return ``-1`` when evidence is ineligible."""
 
-    refusal_score = (1.0 - rr) if rr is not None else 0.0
-    coherence_score = co if co is not None else 0.0
-    kl_score = 1.0 / (1.0 + kl) if kl is not None else 0.5
-    ppl_score = 1.0 / (1.0 + pp / 100.0) if pp is not None else 0.5
+    score, _ = _score_with_exclusion_reason(qm)
+    return score if score is not None else -1.0
 
-    return (
-        refusal_score * 0.4
-        + coherence_score * 0.3
-        + kl_score * 0.2
-        + ppl_score * 0.1
-    )
+
+def _score_with_exclusion_reason(
+    qm: dict[str, Any],
+) -> tuple[float | None, str | None]:
+    """Return a score or an explicit reason the telemetry cannot be used."""
+
+    if "acceptance" not in qm:
+        return None, "legacy telemetry lacks accepted damage-gate evidence"
+    try:
+        payload = validate_acceptance_payload(qm["acceptance"])
+    except (CandidateEvidenceError, TypeError, ValueError) as exc:
+        return None, str(exc)
+
+    refusal_rate = float(payload["metrics"]["refusal_rate"])
+    return 1.0 - min(1.0, max(0.0, refusal_rate)), None
 
 
 # ── Data structures ──────────────────────────────────────────────────────
@@ -157,6 +166,7 @@ class MethodStats:
     coherences: list[float] = field(default_factory=list)
     kl_divergences: list[float] = field(default_factory=list)
     perplexities: list[float] = field(default_factory=list)
+    damage_severities: list[float] = field(default_factory=list)
     configs: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -171,19 +181,44 @@ class MethodStats:
     def median_score(self) -> float:
         return statistics.median(self.scores) if self.scores else 0.0
 
+    @property
+    def mean_refusal_rate(self) -> float:
+        return statistics.mean(self.refusal_rates) if self.refusal_rates else float("inf")
+
+    @property
+    def mean_damage_severity(self) -> float:
+        return (
+            statistics.mean(self.damage_severities)
+            if self.damage_severities
+            else float("inf")
+        )
+
+    @property
+    def selection_key(self) -> tuple[float, float, str]:
+        """Efficacy first; paired damage breaks equal-refusal ties."""
+
+        return (self.mean_refusal_rate, self.mean_damage_severity, self.method)
+
     def best_config_ranges(self) -> dict[str, Any]:
         """Extract the hyperparameter ranges from top-performing runs.
 
-        Takes the top 25% of runs by composite score and returns the median
-        value for each numeric config key, or the mode for booleans.
+        Takes the top 25% of accepted runs by efficacy, then damage, and
+        returns the median numeric value or boolean mode.
         """
         if not self.configs or not self.scores:
             return {}
 
-        # Pair scores with configs and take top 25%
-        paired = sorted(zip(self.scores, self.configs), key=lambda x: x[0], reverse=True)
+        # Rank accepted runs by efficacy first, then paired damage.
+        paired = sorted(
+            zip(
+                self.refusal_rates,
+                self.damage_severities,
+                self.configs,
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
         top_n = max(1, len(paired) // 4)
-        top_configs = [c for _, c in paired[:top_n]]
+        top_configs = [config for _, _, config in paired[:top_n]]
 
         ranges: dict[str, Any] = {}
         all_keys = set()
@@ -217,10 +252,18 @@ class BucketKnowledge:
     arch_key: tuple[str, str, str]  # (arch_class, reasoning_class, param_bucket)
     methods: dict[str, MethodStats] = field(default_factory=dict)
     total_runs: int = 0
+    excluded_runs: int = 0
+    exclusion_reasons: dict[str, int] = field(default_factory=dict)
+
+    def exclude(self, reason: str) -> None:
+        """Record why a legacy, rejected, or inconclusive run was ignored."""
+
+        self.excluded_runs += 1
+        self.exclusion_reasons[reason] = self.exclusion_reasons.get(reason, 0) + 1
 
     @property
     def best_method(self) -> str | None:
-        """Method with highest mean composite score (min 3 runs)."""
+        """Lowest mean refusal, then lowest mean damage (min 3 runs preferred)."""
         candidates = [
             (name, ms) for name, ms in self.methods.items()
             if ms.n_runs >= 3
@@ -230,16 +273,12 @@ class BucketKnowledge:
             candidates = [(name, ms) for name, ms in self.methods.items() if ms.n_runs > 0]
         if not candidates:
             return None
-        return max(candidates, key=lambda x: x[1].mean_score)[0]
+        return min(candidates, key=lambda x: x[1].selection_key)[0]
 
     @property
     def ranked_methods(self) -> list[tuple[str, MethodStats]]:
-        """All methods ranked by mean score, descending."""
-        return sorted(
-            self.methods.items(),
-            key=lambda x: x[1].mean_score,
-            reverse=True,
-        )
+        """All methods ranked by efficacy first and damage second."""
+        return sorted(self.methods.items(), key=lambda item: item[1].selection_key)
 
 
 @dataclass
@@ -258,7 +297,7 @@ class AdaptiveRecommendation:
     # Context
     arch_key: tuple[str, str, str]
     bucket_label: str         # human-readable e.g. "Dense Standard Medium"
-    method_ranking: list[tuple[str, float]]  # [(method, mean_score), ...]
+    method_ranking: list[tuple[str, float]]  # [(method, mean efficacy), ...]
 
     # Best metrics seen in this bucket
     best_refusal_rate: float | None = None
@@ -266,6 +305,8 @@ class AdaptiveRecommendation:
 
     # Explanation
     reason: str = ""
+    n_excluded_records: int = 0
+    exclusion_reasons: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -280,6 +321,8 @@ class AdaptiveRecommendation:
             "best_refusal_rate": self.best_refusal_rate,
             "best_coherence": self.best_coherence,
             "reason": self.reason,
+            "n_excluded_records": self.n_excluded_records,
+            "exclusion_reasons": dict(self.exclusion_reasons),
         }
 
 
@@ -299,10 +342,6 @@ def build_knowledge_base(
     buckets: dict[tuple[str, str, str], BucketKnowledge] = {}
 
     for record in records:
-        # Skip errored runs
-        if record.get("error"):
-            continue
-
         arch_key = _extract_arch_key(record)
         if arch_key is None:
             continue
@@ -311,16 +350,37 @@ def build_knowledge_base(
         if not method:
             continue
 
-        qm = record.get("quality_metrics", {})
-        if not qm:
-            continue
-
-        score = _composite_score(qm)
-
         if arch_key not in buckets:
             buckets[arch_key] = BucketKnowledge(arch_key=arch_key)
-
         bucket = buckets[arch_key]
+
+        if record.get("error"):
+            bucket.exclude("run reported an error")
+            continue
+
+        qm = record.get("quality_metrics", {})
+        if not qm:
+            bucket.exclude("quality metrics are missing")
+            continue
+
+        # Schema-compatible lookup: new telemetry may place the serialized
+        # assessment in quality_metrics, at record.acceptance, or beneath
+        # record.damage_gate.assessment.  Historical point estimates without
+        # any of these are retained in the exclusion audit but never scored.
+        score_metrics = dict(qm)
+        if "acceptance" not in score_metrics:
+            assessment = record.get("acceptance")
+            damage_gate = record.get("damage_gate")
+            if assessment is None and isinstance(damage_gate, dict):
+                assessment = damage_gate.get("assessment")
+            if assessment is not None:
+                score_metrics["acceptance"] = assessment
+
+        score, exclusion_reason = _score_with_exclusion_reason(score_metrics)
+        if score is None:
+            bucket.exclude(exclusion_reason or "damage-gate evidence is ineligible")
+            continue
+
         bucket.total_runs += 1
 
         if method not in bucket.methods:
@@ -329,8 +389,12 @@ def build_knowledge_base(
         ms = bucket.methods[method]
         ms.n_runs += 1
         ms.scores.append(score)
+        ms.damage_severities.append(
+            damage_severity(score_metrics["acceptance"])
+        )
 
-        rr = qm.get("refusal_rate")
+        accepted_metrics = score_metrics["acceptance"]["metrics"]
+        rr = accepted_metrics.get("refusal_rate")
         if rr is not None:
             ms.refusal_rates.append(rr)
         co = qm.get("coherence")
@@ -343,9 +407,7 @@ def build_knowledge_base(
         if pp is not None:
             ms.perplexities.append(pp)
 
-        mc = record.get("method_config", {})
-        if mc:
-            ms.configs.append(mc)
+        ms.configs.append(record.get("method_config", {}) or {})
 
     return buckets
 
@@ -431,6 +493,17 @@ def get_adaptive_recommendation(
     # This is for the future when we have enough data per-model
     model_short = model_name.split("/")[-1].lower() if model_name else ""
 
+    relevant_excluded = 0
+    relevant_exclusion_reasons: dict[str, int] = {}
+    for key, known_bucket in knowledge.items():
+        if key[0] != arch_class:
+            continue
+        relevant_excluded += known_bucket.excluded_runs
+        for reason, count in known_bucket.exclusion_reasons.items():
+            relevant_exclusion_reasons[reason] = (
+                relevant_exclusion_reasons.get(reason, 0) + count
+            )
+
     bucket = None
     used_key = None
     for key in candidates:
@@ -454,8 +527,14 @@ def get_adaptive_recommendation(
                     target.coherences.extend(ms.coherences)
                     target.kl_divergences.extend(ms.kl_divergences)
                     target.perplexities.extend(ms.perplexities)
+                    target.damage_severities.extend(ms.damage_severities)
                     target.configs.extend(ms.configs)
                 merged.total_runs += bkt.total_runs
+                merged.excluded_runs += bkt.excluded_runs
+                for reason, count in bkt.exclusion_reasons.items():
+                    merged.exclusion_reasons[reason] = (
+                        merged.exclusion_reasons.get(reason, 0) + count
+                    )
         if merged.total_runs >= _MIN_RECORDS_FOR_CONFIDENCE:
             bucket = merged
             used_key = merged.arch_key
@@ -476,8 +555,14 @@ def get_adaptive_recommendation(
                     target.coherences.extend(ms.coherences)
                     target.kl_divergences.extend(ms.kl_divergences)
                     target.perplexities.extend(ms.perplexities)
+                    target.damage_severities.extend(ms.damage_severities)
                     target.configs.extend(ms.configs)
                 merged.total_runs += bkt.total_runs
+                merged.excluded_runs += bkt.excluded_runs
+                for reason, count in bkt.exclusion_reasons.items():
+                    merged.exclusion_reasons[reason] = (
+                        merged.exclusion_reasons.get(reason, 0) + count
+                    )
         if merged.total_runs > 0:
             bucket = merged
             used_key = merged.arch_key
@@ -485,6 +570,14 @@ def get_adaptive_recommendation(
 
     # No data at all
     if bucket is None or not bucket.methods:
+        if relevant_excluded:
+            no_data_reason = (
+                "No accepted damage-gated telemetry is available for this "
+                f"architecture; excluded {relevant_excluded} legacy, rejected, "
+                "inconclusive, or errored record(s)."
+            )
+        else:
+            no_data_reason = "No telemetry data available for this architecture."
         return AdaptiveRecommendation(
             recommended_method="",
             method_overrides={},
@@ -494,7 +587,9 @@ def get_adaptive_recommendation(
             arch_key=(arch_class, reasoning_class, param_bucket),
             bucket_label=bucket_label,
             method_ranking=[],
-            reason="No telemetry data available for this architecture.",
+            reason=no_data_reason,
+            n_excluded_records=relevant_excluded,
+            exclusion_reasons=relevant_exclusion_reasons,
         )
 
     # Get best method
@@ -510,6 +605,8 @@ def get_adaptive_recommendation(
             bucket_label=bucket_label,
             method_ranking=[],
             reason="Telemetry records found but no method has enough runs.",
+            n_excluded_records=bucket.excluded_runs,
+            exclusion_reasons=bucket.exclusion_reasons,
         )
 
     ms = bucket.methods[best_method]
@@ -538,13 +635,19 @@ def get_adaptive_recommendation(
     # Build explanation
     runner_up = ranking[1] if len(ranking) > 1 else None
     reason_parts = [
-        f"Based on {bucket.total_runs} community runs for {bucket_label}.",
-        f"`{best_method}` achieves a mean composite score of {ms.mean_score:.4f} "
-        f"across {ms.n_runs} runs.",
+        f"Based on {bucket.total_runs} accepted damage-gated community runs "
+        f"for {bucket_label}.",
+        f"`{best_method}` has mean held-out refusal {ms.mean_refusal_rate:.1%} "
+        f"across {ms.n_runs} runs; damage is used only to break efficacy ties.",
     ]
+    if bucket.excluded_runs:
+        reason_parts.append(
+            f"Excluded {bucket.excluded_runs} legacy, rejected, inconclusive, "
+            "or errored run(s) from scoring."
+        )
     if runner_up:
         reason_parts.append(
-            f"Runner-up: `{runner_up[0]}` ({runner_up[1]:.4f})."
+            f"Runner-up: `{runner_up[0]}` (efficacy {runner_up[1]:.4f})."
         )
     if best_rr is not None:
         reason_parts.append(f"Best refusal rate seen: {best_rr:.1%}.")
@@ -564,6 +667,8 @@ def get_adaptive_recommendation(
         best_refusal_rate=best_rr,
         best_coherence=best_co,
         reason=" ".join(reason_parts),
+        n_excluded_records=bucket.excluded_runs,
+        exclusion_reasons=bucket.exclusion_reasons,
     )
 
 
@@ -585,23 +690,35 @@ def get_global_insights(
         knowledge = build_knowledge_base()
 
     total_records = sum(b.total_runs for b in knowledge.values())
+    total_excluded_records = sum(b.excluded_runs for b in knowledge.values())
+    exclusion_reasons: dict[str, int] = {}
+    for bucket in knowledge.values():
+        for reason, count in bucket.exclusion_reasons.items():
+            exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + count
 
     # Global method scores (weighted by bucket size)
     global_method_scores: dict[str, list[float]] = {}
+    global_method_damage: dict[str, list[float]] = {}
     for bucket in knowledge.values():
         for name, ms in bucket.methods.items():
             if name not in global_method_scores:
                 global_method_scores[name] = []
+                global_method_damage[name] = []
             global_method_scores[name].extend(ms.scores)
+            global_method_damage[name].extend(ms.damage_severities)
 
     overall_ranking = sorted(
         [
-            (name, statistics.mean(scores), len(scores))
+            (
+                name,
+                statistics.mean(scores),
+                statistics.mean(global_method_damage[name]),
+                len(scores),
+            )
             for name, scores in global_method_scores.items()
-            if scores
+            if scores and global_method_damage[name]
         ],
-        key=lambda x: x[1],
-        reverse=True,
+        key=lambda item: (-item[1], item[2], item[0]),
     )
 
     # Per-bucket summaries
@@ -611,6 +728,8 @@ def get_global_insights(
         best = bucket.best_method
         arch_breakdown[label] = {
             "total_runs": bucket.total_runs,
+            "excluded_runs": bucket.excluded_runs,
+            "exclusion_reasons": dict(bucket.exclusion_reasons),
             "best_method": best,
             "best_score": bucket.methods[best].mean_score if best and best in bucket.methods else 0,
             "n_methods_tested": len(bucket.methods),
@@ -620,10 +739,13 @@ def get_global_insights(
     all_top_configs: list[dict] = []
     for bucket in knowledge.values():
         for ms in bucket.methods.values():
-            if ms.configs and ms.scores:
-                paired = sorted(zip(ms.scores, ms.configs), key=lambda x: x[0], reverse=True)
+            if ms.configs and ms.refusal_rates and ms.damage_severities:
+                paired = sorted(
+                    zip(ms.refusal_rates, ms.damage_severities, ms.configs),
+                    key=lambda item: (item[0], item[1]),
+                )
                 top_n = max(1, len(paired) // 4)
-                all_top_configs.extend(c for _, c in paired[:top_n])
+                all_top_configs.extend(config for _, _, config in paired[:top_n])
 
     hp_trends: dict[str, Any] = {}
     if all_top_configs:
@@ -649,9 +771,17 @@ def get_global_insights(
 
     return {
         "total_records": total_records,
+        "total_excluded_records": total_excluded_records,
+        "exclusion_reasons": exclusion_reasons,
         "overall_best_methods": [
-            {"method": name, "mean_score": round(score, 4), "n_runs": n}
-            for name, score, n in overall_ranking
+            {
+                "method": name,
+                "mean_score": round(score, 4),
+                "mean_efficacy": round(score, 4),
+                "mean_damage_severity": round(severity, 4),
+                "n_runs": n,
+            }
+            for name, score, severity, n in overall_ranking
         ],
         "architecture_breakdown": arch_breakdown,
         "hyperparameter_trends": hp_trends,
@@ -665,9 +795,10 @@ def format_recommendation(rec: AdaptiveRecommendation) -> str:
     """Format a recommendation as a human-readable markdown string."""
     if rec.confidence == "none":
         return (
-            f"**No telemetry data** for {rec.bucket_label}.\n\n"
+            f"**No eligible telemetry data** for {rec.bucket_label}.\n\n"
+            f"{rec.reason}\n\n"
             "Using research-grounded defaults from `architecture_profiles.py`.\n"
-            "Run some abliterations and the adaptive system will learn!"
+            "Accepted damage-gated runs will become eligible for future recommendations."
         )
 
     confidence_emoji = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
@@ -679,13 +810,13 @@ def format_recommendation(rec: AdaptiveRecommendation) -> str:
         f"**Based on:** {rec.n_records} community runs",
         "",
         f"**Recommended method:** `{rec.recommended_method}` "
-        f"(score: {rec.method_ranking[0][1]:.4f}, {rec.n_method_records} runs)",
+        f"(efficacy: {rec.method_ranking[0][1]:.4f}, {rec.n_method_records} runs)",
         "",
     ]
 
     if len(rec.method_ranking) > 1:
         lines.append("**Method ranking:**")
-        lines.append("| Rank | Method | Mean Score | Runs |")
+        lines.append("| Rank | Method | Mean Efficacy | Runs |")
         lines.append("|------|--------|------------|------|")
         for i, (name, score) in enumerate(rec.method_ranking[:8], 1):
             ms_runs = 0

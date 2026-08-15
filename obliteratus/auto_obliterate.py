@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import json
 import gc
+import hashlib
 import logging
+import math
 import os
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -50,6 +53,12 @@ class IterationResult:
     output_dir: str = ""
     error: str | None = None
     categories_targeted: list[str] = field(default_factory=list)
+    accepted: bool = False
+    damage_accepted: bool | None = None
+    efficacy_accepted: bool | None = None
+    damage_severity: float | None = None
+    acceptance: dict[str, Any] = field(default_factory=dict)
+    evaluation_fingerprint: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -71,6 +80,9 @@ class AutoObliterateResult:
     final_output_dir: str = ""
     started_at: str = ""
     completed_at: str = ""
+    evaluation_harmful_prompts: list[str] = field(default_factory=list)
+    evaluation_harmless_prompts: list[str] = field(default_factory=list)
+    evaluation_fingerprint: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -118,7 +130,7 @@ class AutoObliterator:
         max_iterations: int = 3,
         target_refusal_rate: float = 0.05,
         output_base: str | None = None,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
     ):
         self.model_id = model_id
         self.max_iterations = min(max_iterations, 5)
@@ -187,7 +199,12 @@ class AutoObliterator:
         }
 
     @staticmethod
-    def _quick_benchmark_claude(output_dir: str, model_id: str) -> dict[str, Any]:
+    def _quick_benchmark_claude(
+        output_dir: str,
+        model_id: str,
+        *,
+        trust_remote_code: bool = False,
+    ) -> dict[str, Any]:
         """Quick Claude-judged eval using OpenRouter API.
 
         Sends 15 challenging prompts to the obliterated model and asks
@@ -228,12 +245,15 @@ class AutoObliterator:
             if not Path(model_path).exists():
                 return {"method": "skipped", "reason": "output_dir not found"}
 
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+            )
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.float16,
                 device_map="auto",
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
             )
 
             responses = []
@@ -373,7 +393,163 @@ class AutoObliterator:
 
         return harmful, harmless
 
+    @staticmethod
+    def _normalize_prompt(text: str) -> str:
+        """Match the pipeline's duplicate-group normalization."""
+
+        return re.sub(r"\s+", " ", text).strip().casefold()
+
+    @classmethod
+    def _prompt_pair_key(cls, harmful: str, harmless: str) -> str:
+        return f"{cls._normalize_prompt(harmful)}\0{cls._normalize_prompt(harmless)}"
+
+    @classmethod
+    def _evaluation_fingerprint(
+        cls,
+        harmful: list[str],
+        harmless: list[str],
+    ) -> str:
+        if not harmful or len(harmful) != len(harmless):
+            raise ValueError("locked evaluation prompts must be non-empty and paired")
+        digest = hashlib.sha256()
+        digest.update(b"seed=42\n")
+        keys = {
+            cls._prompt_pair_key(harm, benign)
+            for harm, benign in zip(harmful, harmless, strict=True)
+        }
+        for key in sorted(keys):
+            digest.update(key.encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _ensure_locked_evaluation_prompts(self) -> tuple[list[str], list[str]]:
+        """Create once and persist the immutable evaluation set for the search."""
+
+        existing_harmful = self._result.evaluation_harmful_prompts
+        existing_harmless = self._result.evaluation_harmless_prompts
+        if existing_harmful or existing_harmless:
+            fingerprint = self._evaluation_fingerprint(
+                existing_harmful,
+                existing_harmless,
+            )
+            if fingerprint != self._result.evaluation_fingerprint:
+                raise RuntimeError("persisted locked evaluation fingerprint does not match")
+            return list(existing_harmful), list(existing_harmless)
+
+        from obliteratus.evaluation.prompt_split import split_prompt_pairs
+
+        harmful, harmless = self._get_expanded_prompts(0)
+        split = split_prompt_pairs(
+            harmful,
+            harmless,
+            holdout_fraction=0.15,
+            seed=42,
+            min_holdout=32,
+        )
+        if len(split.holdout_harmful) < 32:
+            raise RuntimeError(
+                "automatic search requires at least 32 locked evaluation prompt pairs"
+            )
+        self._result.evaluation_harmful_prompts = list(split.holdout_harmful)
+        self._result.evaluation_harmless_prompts = list(split.holdout_harmless)
+        self._result.evaluation_fingerprint = split.fingerprint
+        self._save_state()
+        return (
+            list(self._result.evaluation_harmful_prompts),
+            list(self._result.evaluation_harmless_prompts),
+        )
+
+    def _exclude_locked_evaluation_pairs(
+        self,
+        harmful: list[str],
+        harmless: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Prevent locked evaluation pairs from entering direction discovery."""
+
+        if len(harmful) != len(harmless):
+            raise ValueError("harmful and harmless prompt lists must be paired")
+        locked_harmful = {
+            self._normalize_prompt(prompt)
+            for prompt in self._result.evaluation_harmful_prompts
+        }
+        locked_harmless = {
+            self._normalize_prompt(prompt)
+            for prompt in self._result.evaluation_harmless_prompts
+        }
+        discovery_pairs = [
+            (harm, benign)
+            for harm, benign in zip(harmful, harmless, strict=True)
+            if self._normalize_prompt(harm) not in locked_harmful
+            and self._normalize_prompt(benign) not in locked_harmless
+        ]
+        if not discovery_pairs:
+            raise RuntimeError("no discovery prompts remain after locking evaluation data")
+        return (
+            [harm for harm, _ in discovery_pairs],
+            [benign for _, benign in discovery_pairs],
+        )
+
     # ── Main loop ─────────────────────────────────────────────────────
+
+    def _best_acceptable_iteration(self) -> IterationResult | None:
+        """Select the most effective candidate inside the hard damage budget.
+
+        Lower held-out refusal wins among accepted candidates; normalized
+        damage breaks exact efficacy ties.  Missing gate evidence is never
+        eligible.
+        """
+
+        from obliteratus.evaluation.candidate_selection import (
+            CandidateEvidenceError,
+            damage_severity,
+            validate_acceptance_payload,
+        )
+
+        eligible: list[tuple[IterationResult, float, float]] = []
+        for result in self._result.iterations:
+            if (
+                result.accepted is not True
+                or result.damage_accepted is not True
+                or result.efficacy_accepted is not True
+                or result.refusal_rate is None
+                or result.error is not None
+                or not result.output_dir
+                or not Path(result.output_dir).exists()
+                or (
+                    self._result.evaluation_fingerprint
+                    and result.evaluation_fingerprint
+                    != self._result.evaluation_fingerprint
+                )
+            ):
+                continue
+            try:
+                payload = validate_acceptance_payload(result.acceptance)
+                severity = damage_severity(payload)
+                assessed_refusal = float(payload["metrics"]["refusal_rate"])
+            except (CandidateEvidenceError, TypeError, ValueError):
+                continue
+            if not math.isclose(
+                float(result.refusal_rate),
+                assessed_refusal,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                continue
+            eligible.append((result, severity, assessed_refusal))
+        if not eligible:
+            return None
+
+        def rank(
+            candidate: tuple[IterationResult, float, float],
+        ) -> tuple[float, float, int]:
+            result, severity, assessed_refusal = candidate
+            return (
+                assessed_refusal,
+                severity,
+                result.iteration,
+            )
+
+        return min(eligible, key=rank)[0]
 
     def run(
         self,
@@ -401,6 +577,16 @@ class AutoObliterator:
         _log(f"╚══════════════════════════════════════════════════╝")
         _log("")
 
+        evaluation_harmful, evaluation_harmless = (
+            self._ensure_locked_evaluation_prompts()
+        )
+        _log(
+            "Locked evaluation: "
+            f"{len(evaluation_harmful)} pairs "
+            f"({self._result.evaluation_fingerprint[:12]}…)"
+        )
+        _log("")
+
         yield "Initializing...", "\n".join(log_lines), ""
 
         for i in range(self._resume_from, self.max_iterations):
@@ -418,23 +604,22 @@ class AutoObliterator:
                 self._format_metrics(),
             )
 
-            # Determine source model: first iteration uses original,
-            # subsequent iterations use the output from the previous iteration
-            if i == 0:
-                source_model = self.model_id
-            else:
-                prev = self._result.iterations[-1] if self._result.iterations else None
-                if prev and prev.output_dir and Path(prev.output_dir).exists():
-                    source_model = prev.output_dir
-                else:
-                    source_model = self.model_id
+            # Every search candidate starts from the immutable original model.
+            # Chaining even accepted edits would reset the next gate's baseline
+            # and hide cumulative drift, making candidates incomparable.
+            source_model = self.model_id
 
             # Output dir for this iteration
             iter_dir = os.path.join(self.output_base, f"iter_{i + 1}")
 
             # Get prompts (expanded for later iterations)
             harmful, harmless = self._get_expanded_prompts(i)
-            n = len(harmful) if volume == -1 else min(volume, len(harmful))
+            harmful, harmless = self._exclude_locked_evaluation_pairs(
+                harmful,
+                harmless,
+            )
+            available = min(len(harmful), len(harmless))
+            n = available if volume == -1 else min(volume, available)
 
             _log(f"Using {n} prompt pairs")
             _log(f"Source: {source_model}")
@@ -453,6 +638,7 @@ class AutoObliterator:
                 method=method,
                 prompt_volume=n,
                 output_dir=iter_dir,
+                evaluation_fingerprint=self._result.evaluation_fingerprint,
             )
 
             try:
@@ -467,16 +653,40 @@ class AutoObliterator:
                     trust_remote_code=self.trust_remote_code,
                     harmful_prompts=harmful[:n],
                     harmless_prompts=harmless[:n],
+                    evaluation_harmful_prompts=evaluation_harmful,
+                    evaluation_harmless_prompts=evaluation_harmless,
+                    damage_gate_enabled=True,
                     on_log=_log,
                 )
                 pipeline.run()
 
-                # Extract metrics from pipeline
-                metrics = getattr(pipeline, "_quality_metrics", {}) or {}
+                pipeline_split = getattr(pipeline, "_prompt_split", None)
+                pipeline_fingerprint = getattr(pipeline_split, "fingerprint", "")
+                if pipeline_fingerprint != self._result.evaluation_fingerprint:
+                    raise RuntimeError(
+                        "candidate did not use the locked evaluation prompt set"
+                    )
+
+                # A successful return is not acceptance evidence.  Require the
+                # complete, conclusive gate record before this checkpoint can
+                # be chained from or selected as the final artifact.
+                from obliteratus.evaluation.candidate_selection import (
+                    add_acceptance_evidence,
+                )
+
+                metrics = add_acceptance_evidence(
+                    getattr(pipeline, "_quality_metrics", {}) or {},
+                    getattr(pipeline, "_damage_assessment", None),
+                )
                 iter_result.perplexity = metrics.get("perplexity")
                 iter_result.coherence = metrics.get("coherence")
                 iter_result.refusal_rate = metrics.get("refusal_rate")
                 iter_result.kl_divergence = metrics.get("kl_divergence")
+                iter_result.accepted = metrics["acceptance_passed"] is True
+                iter_result.damage_accepted = metrics["damage_accepted"] is True
+                iter_result.efficacy_accepted = metrics["efficacy_accepted"] is True
+                iter_result.damage_severity = metrics["damage_severity"]
+                iter_result.acceptance = metrics["acceptance"]
                 iter_result.strong_layers = len(getattr(pipeline, "_strong_layers", []))
                 iter_result.ega_expert_dirs = sum(
                     len(d) for d in getattr(pipeline, "_expert_directions", {}).values()
@@ -523,18 +733,28 @@ class AutoObliterator:
 
             # Check if we've achieved target
             if (
-                iter_result.refusal_rate is not None
+                iter_result.accepted
+                and iter_result.damage_accepted
+                and iter_result.efficacy_accepted
+                and iter_result.refusal_rate is not None
                 and iter_result.refusal_rate <= self.target_refusal_rate
             ):
                 _log(f"✅ TARGET ACHIEVED! Refusal rate {iter_result.refusal_rate:.1%} "
                      f"<= {self.target_refusal_rate:.0%}")
-                _log(f"Stopping after {i + 1} iteration(s).")
-                break
+                _log("Continuing search for a lower-refusal passing candidate.")
 
-            # Check if refusal rate is 0 — perfect score, stop early
-            if iter_result.refusal_rate is not None and iter_result.refusal_rate == 0:
-                _log("🎯 PERFECT SCORE! 0% refusal rate achieved.")
-                break
+            # Zero refusal is the best possible efficacy, but another accepted
+            # zero-refusal candidate may cause less damage. Finish the declared
+            # search so the exact-efficacy tie-break remains meaningful.
+            if (
+                iter_result.accepted
+                and iter_result.refusal_rate is not None
+                and iter_result.refusal_rate == 0
+            ):
+                _log(
+                    "🎯 0% refusal achieved; continuing to compare damage "
+                    "among equally effective candidates."
+                )
 
             if iter_result.error:
                 _log(f"⚠️  Iteration failed, {'retrying' if i < self.max_iterations - 1 else 'stopping'}...")
@@ -544,20 +764,20 @@ class AutoObliterator:
         self._result.total_time_seconds = round(total_time, 1)
         self._result.completed_at = datetime.now(timezone.utc).isoformat()
 
-        # Final metrics from last successful iteration
-        last_ok = None
-        for ir in reversed(self._result.iterations):
-            if ir.error is None:
-                last_ok = ir
-                break
-
-        if last_ok:
-            self._result.final_refusal_rate = last_ok.refusal_rate
-            self._result.final_output_dir = last_ok.output_dir
+        # Among candidates inside the hard damage budget, choose the lowest
+        # refusal rate and use normalized damage only as an efficacy tie-break.
+        selected = self._best_acceptable_iteration()
+        if selected:
+            self._result.final_refusal_rate = selected.refusal_rate
+            self._result.final_output_dir = selected.output_dir
             self._result.success = (
-                last_ok.refusal_rate is not None
-                and last_ok.refusal_rate <= self.target_refusal_rate
+                selected.refusal_rate is not None
+                and selected.refusal_rate <= self.target_refusal_rate
             )
+        else:
+            self._result.final_refusal_rate = None
+            self._result.final_output_dir = ""
+            self._result.success = False
 
         _log("")
         _log(f"╔══════════════════════════════════════════════════╗")
@@ -585,17 +805,20 @@ class AutoObliterator:
             return "*No iterations completed yet.*"
 
         lines = [
-            "| Iter | Method | Prompts | Perplexity | Coherence | Refusal | Time |",
-            "|------|--------|---------|------------|-----------|---------|------|",
+            "| Iter | Method | Prompts | Perplexity | Coherence | Refusal | Damage | Gate | Time |",
+            "|------|--------|---------|------------|-----------|---------|--------|------|------|",
         ]
         for ir in self._result.iterations:
             ppl = f"{ir.perplexity:.2f}" if ir.perplexity is not None else "—"
             coh = f"{ir.coherence:.3f}" if ir.coherence is not None else "—"
             ref = f"{ir.refusal_rate:.0%}" if ir.refusal_rate is not None else "—"
+            damage = f"{ir.damage_severity:.3f}" if ir.damage_severity is not None else "—"
+            gate = "PASS" if ir.accepted else "REJECT"
             err = f" ⚠️{ir.error[:20]}" if ir.error else ""
             lines.append(
                 f"| {ir.iteration} | {ir.method} | {ir.prompt_volume} | "
-                f"{ppl} | {coh} | {ref} | {ir.time_seconds}s{err} |"
+                f"{ppl} | {coh} | {ref} | {damage} | {gate} | "
+                f"{ir.time_seconds}s{err} |"
             )
 
         return "\n".join(lines)

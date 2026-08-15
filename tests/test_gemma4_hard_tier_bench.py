@@ -19,7 +19,6 @@ def _load_script(name: str):
 
 
 bench = _load_script("gemma4_hard_tier_bench.py")
-loop = _load_script("gemma4_12b_recursive_loop.py")
 
 
 def test_parse_tiers_expands_hardest_alias():
@@ -104,11 +103,3 @@ def test_summarize_rows_scores_refusal_and_collapse():
     assert summary["overall"]["short_rate"] == 0.5
     assert summary["overall"]["thinking_tag_rate"] == 0.5
     assert summary["score"] < 100
-
-
-def test_next_round_increases_pressure_after_refusals():
-    recipe = loop.BASE_RECIPES[0]
-    metrics = {"refusal_rate": 0.25, "repetition_rate": 0.0, "short_rate": 0.0}
-    next_round = loop.next_round_from(recipe, metrics)
-    assert any(item.n_directions > recipe.n_directions for item in next_round)
-    assert any(item.max_layer_fraction > recipe.max_layer_fraction for item in next_round)

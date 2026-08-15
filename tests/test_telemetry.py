@@ -388,6 +388,11 @@ def _make_mock_pipeline():
     p.quantization = None
 
     p._quality_metrics = {"perplexity": 5.2, "coherence": 0.8, "refusal_rate": 0.05}
+    p._damage_assessment.to_dict.return_value = {
+        "accepted": True,
+        "damage_accepted": True,
+        "efficacy_accepted": True,
+    }
     p._strong_layers = [10, 11, 12, 13]
     p._stage_durations = {"summon": 3.0, "probe": 12.5, "distill": 4.1, "excise": 2.0, "verify": 8.3, "rebirth": 5.0}
     p._excise_modified_count = 128
@@ -448,6 +453,7 @@ class TestPipelineIntegration:
             # Quality metrics
             assert report["quality_metrics"]["perplexity"] == 5.2
             assert report["quality_metrics"]["refusal_rate"] == 0.05
+            assert report["quality_metrics"]["acceptance"]["accepted"] is True
 
             # Stage durations
             assert "stage_durations" in report
@@ -539,6 +545,7 @@ class TestInformedPipelineIntegration:
             assert report["model"]["architecture"] == "LlamaForCausalLM"
             assert "direction_stats" in report
             assert "excise_details" in report
+            assert report["quality_metrics"]["acceptance"]["accepted"] is True
 
             # Analysis insights
             ai = report["analysis_insights"]

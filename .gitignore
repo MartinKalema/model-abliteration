@@ -15,6 +15,9 @@ env/
 *.pt
 *.bin
 *.safetensors
+*.gguf
+models/
+abliterated/
 wandb/
 outputs/
 results/
