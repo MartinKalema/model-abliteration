@@ -17,9 +17,6 @@ class ModelConfig:
     device: str = "auto"
     trust_remote_code: bool = False
     num_labels: int = 2
-    gguf_file: str | None = None
-    canonical_model_id: str | None = None
-    tokenizer_source: str | None = None
 
 
 @dataclass
@@ -123,9 +120,6 @@ class StudyConfig:
                 "dtype": self.model.dtype,
                 "device": self.model.device,
                 "trust_remote_code": self.model.trust_remote_code,
-                "gguf_file": self.model.gguf_file,
-                "canonical_model_id": self.model.canonical_model_id,
-                "tokenizer_source": self.model.tokenizer_source,
             },
             "dataset": {
                 "name": self.dataset.name,

@@ -9,10 +9,9 @@ downloading real models or running any pipeline.  They use
 from __future__ import annotations
 
 import math
-import sys
 from io import StringIO
-from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -31,31 +30,6 @@ def _capture_exit(argv: list[str] | None, *, expect_code: int | None = None):
     if expect_code is not None:
         assert exc_info.value.code == expect_code
     return buf.getvalue()
-
-
-def _fake_pipeline_modules():
-    """Build lightweight pipeline modules for offline CLI constructor tests."""
-    pipeline_cls = MagicMock(name="AbliterationPipeline")
-    informed_cls = MagicMock(name="InformedAbliterationPipeline")
-
-    pipeline_module = ModuleType("obliteratus.abliterate")
-    pipeline_module.AbliterationPipeline = pipeline_cls
-    pipeline_module.METHODS = {
-        "advanced": {"label": "Advanced"},
-        "informed": {"label": "Informed"},
-    }
-    pipeline_module.STAGES = [SimpleNamespace(key="rebirth", name="Rebirth")]
-
-    informed_module = ModuleType("obliteratus.informed_pipeline")
-    informed_module.InformedAbliterationPipeline = informed_cls
-
-    telemetry_module = ModuleType("obliteratus.telemetry")
-    telemetry_module.maybe_send_pipeline_report = MagicMock()
-    return pipeline_cls, informed_cls, {
-        "obliteratus.abliterate": pipeline_module,
-        "obliteratus.informed_pipeline": informed_module,
-        "obliteratus.telemetry": telemetry_module,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -110,190 +84,6 @@ class TestCLIDispatch:
             expect_code=2,
         )
         assert "invalid choice" in stderr_text.lower()
-
-    @pytest.mark.parametrize("command", ["obliterate", "abliterate"])
-    def test_gguf_flags_parse_on_primary_command_and_alias(self, command):
-        """Both public spellings expose the complete GGUF import/export surface."""
-        with patch("obliteratus.cli._cmd_abliterate") as mock_cmd:
-            main([
-                command,
-                "openai/gpt-oss-20b",
-                "--gguf-file", "gpt-oss-20b-Q4_K_M.gguf",
-                "--base-model-id", "openai/gpt-oss-20b",
-                "--tokenizer-path", "/models/tokenizer",
-                "--output-format", "both",
-                "--gguf-quant", "Q5_K_M",
-                "--llama-cpp-dir", "/opt/llama.cpp",
-                "--llama-cpp-python", "/opt/venv/bin/python",
-                "--gguf-imatrix", "/models/calibration.imatrix",
-                "--keep-dense-intermediate",
-                "--no-post-quant-verify",
-            ])
-
-        args_passed = mock_cmd.call_args.args[0]
-        assert args_passed.gguf_file == "gpt-oss-20b-Q4_K_M.gguf"
-        assert args_passed.base_model_id == "openai/gpt-oss-20b"
-        assert args_passed.tokenizer_path == "/models/tokenizer"
-        assert args_passed.output_format == "both"
-        assert args_passed.gguf_quant == "Q5_K_M"
-        assert args_passed.llama_cpp_dir == "/opt/llama.cpp"
-        assert args_passed.llama_cpp_python == "/opt/venv/bin/python"
-        assert args_passed.gguf_imatrix == "/models/calibration.imatrix"
-        assert args_passed.keep_dense_intermediate is True
-        assert args_passed.post_quant_verify is False
-
-    def test_gguf_defaults_are_backward_compatible(self):
-        """HF remains the default output and post-quant verification is fail-closed."""
-        with patch("obliteratus.cli._cmd_abliterate") as mock_cmd:
-            main(["obliterate", "fake/model"])
-
-        args_passed = mock_cmd.call_args.args[0]
-        assert args_passed.gguf_file is None
-        assert args_passed.output_format == "hf"
-        assert args_passed.gguf_quant == "Q4_K_M"
-        assert args_passed.keep_dense_intermediate is False
-        assert args_passed.post_quant_verify is True
-
-    def test_info_profiles_local_gguf_without_loading_weights(self):
-        """Architecture inspection must not dequantize a multi-gigabyte GGUF."""
-        profile = MagicMock()
-        profile.to_json.return_value = {
-            "model_type": "gpt-oss",
-            "total_params": 20_914_757_184,
-        }
-        with (
-            patch("obliteratus.model_profile.profile_model", return_value=profile) as profiler,
-            patch("obliteratus.models.loader.load_model") as loader,
-            patch("obliteratus.cli.console"),
-        ):
-            main(["info", "/models/gpt-oss-20b-Q4_K_M.gguf"])
-
-        profiler.assert_called_once_with("/models/gpt-oss-20b-Q4_K_M.gguf")
-        loader.assert_not_called()
-
-    def test_remote_gguf_fails_before_starting_ssh_runner(self):
-        """Large local GGUF artifacts are never silently assumed to exist remotely."""
-        with (
-            patch("obliteratus.cli._make_remote_runner") as make_runner,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            main([
-                "obliterate",
-                "/models/gpt-oss-20b-Q4_K_M.gguf",
-                "--base-model-id", "openai/gpt-oss-20b",
-                "--remote", "gpu.example.test",
-            ])
-
-        assert exc_info.value.code == 2
-        make_runner.assert_not_called()
-
-    def test_positional_gguf_is_inferred_and_forwarded_to_pipeline(self):
-        """A local GGUF positional path needs no duplicate --gguf-file flag."""
-        gguf_path = "/models/gpt-oss-20b/gpt-oss-20b-Q4_K_M.gguf"
-        pipeline_cls, _, fake_modules = _fake_pipeline_modules()
-        with (
-            patch.dict(sys.modules, fake_modules),
-            patch("obliteratus.cli._damage_pipeline_kwargs", return_value={}),
-            patch("rich.live.Live"),
-            patch("obliteratus.cli.console"),
-        ):
-            pipeline_cls.return_value.run.return_value = "/tmp/output-bundle"
-            main([
-                "obliterate",
-                gguf_path,
-                "--base-model-id", "openai/gpt-oss-20b",
-                "--tokenizer-path", "/models/gpt-oss-tokenizer",
-                "--output-format", "both",
-                "--gguf-quant", "Q5_K_M",
-                "--llama-cpp-dir", "/opt/llama.cpp",
-                "--llama-cpp-python", "/opt/venv/bin/python",
-                "--gguf-imatrix", "/models/calibration.imatrix",
-                "--keep-dense-intermediate",
-                "--no-post-quant-verify",
-            ])
-
-        forwarded = pipeline_cls.call_args.kwargs
-        assert forwarded["model_name"] == gguf_path
-        assert forwarded["output_dir"] == "abliterated/gpt-oss-20b-Q4_K_M"
-        assert forwarded["gguf_file"] == gguf_path
-        assert forwarded["base_model_id"] == "openai/gpt-oss-20b"
-        assert forwarded["tokenizer_path"] == "/models/gpt-oss-tokenizer"
-        assert forwarded["output_format"] == "both"
-        assert forwarded["gguf_quant"] == "Q5_K_M"
-        assert forwarded["llama_cpp_dir"] == "/opt/llama.cpp"
-        assert forwarded["llama_cpp_python"] == "/opt/venv/bin/python"
-        assert forwarded["gguf_imatrix"] == "/models/calibration.imatrix"
-        assert forwarded["keep_dense_intermediate"] is True
-        assert forwarded["post_quant_verify"] is False
-
-    def test_informed_pipeline_receives_gguf_constructor_options(self):
-        """The informed analysis pipeline supports the same GGUF lifecycle."""
-        base_cls, informed_cls, fake_modules = _fake_pipeline_modules()
-        with (
-            patch.dict(sys.modules, fake_modules),
-            patch("obliteratus.cli._damage_pipeline_kwargs", return_value={}),
-            patch("rich.live.Live"),
-            patch("obliteratus.cli.console"),
-        ):
-            informed_cls.return_value.run_informed.return_value = (
-                "/tmp/output-bundle",
-                object(),
-            )
-            main([
-                "obliterate",
-                "google/gemma-4-26B-A4B-it",
-                "--method", "informed",
-                "--gguf-file", "gemma-4-26B-A4B-it-Q4_K_M.gguf",
-                "--base-model-id", "google/gemma-4-26B-A4B-it",
-                "--output-format", "gguf",
-                "--llama-cpp-dir", "/opt/llama.cpp",
-            ])
-
-        base_cls.assert_not_called()
-        forwarded = informed_cls.call_args.kwargs
-        assert forwarded["gguf_file"] == "gemma-4-26B-A4B-it-Q4_K_M.gguf"
-        assert forwarded["base_model_id"] == "google/gemma-4-26B-A4B-it"
-        assert forwarded["output_format"] == "gguf"
-        assert forwarded["gguf_quant"] == "Q4_K_M"
-        assert forwarded["llama_cpp_dir"] == "/opt/llama.cpp"
-        assert forwarded["post_quant_verify"] is True
-
-    def test_residue_metadata_stays_inside_gguf_bundle_directory(self, tmp_path):
-        """Ancillary metadata is written beside, not beneath, the GGUF artifact."""
-        result_bundle = tmp_path / "bundle.gguf"
-        result_bundle.mkdir()
-        pipeline_cls, _, fake_modules = _fake_pipeline_modules()
-        pipeline_cls.return_value.run.return_value = str(result_bundle)
-
-        hard_negative_module = ModuleType("obliteratus.hard_negative")
-        hard_negative_module.build_weighted_prompt_pairs = MagicMock(
-            return_value=(
-                ["harmful"],
-                ["harmless"],
-                {
-                    "residue_examples": 1,
-                    "residue_added_pairs": 5,
-                    "total_pairs": 6,
-                },
-            )
-        )
-        fake_modules["obliteratus.hard_negative"] = hard_negative_module
-
-        with (
-            patch.dict(sys.modules, fake_modules),
-            patch("obliteratus.cli._damage_pipeline_kwargs", return_value={}),
-            patch("rich.live.Live"),
-            patch("obliteratus.cli.console"),
-        ):
-            main([
-                "obliterate",
-                "/models/input.gguf",
-                "--output-dir", str(result_bundle),
-                "--output-format", "gguf",
-                "--residue-file", "/tmp/residue.json",
-            ])
-
-        assert (result_bundle / "hard_negative_residue.json").is_file()
 
     def test_self_improve_som_keeps_preset_direction_method(self):
         """An omitted low-level override must not replace the SOM preset."""

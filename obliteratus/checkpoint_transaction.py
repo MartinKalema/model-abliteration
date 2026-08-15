@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import struct
 import tempfile
 import warnings
 from collections.abc import Callable
@@ -42,10 +41,6 @@ class CheckpointCommitError(CheckpointTransactionError):
 
 Serializer = Callable[[Path], None]
 Validator = Callable[[Path], None]
-
-_GGUF_MAGIC = b"GGUF"
-_SUPPORTED_GGUF_VERSIONS = frozenset({1, 2, 3})
-
 
 def _tensor_is_finite_in_chunks(
     tensor: torch.Tensor,
@@ -264,120 +259,6 @@ def validate_hf_checkpoint(checkpoint_dir: str | os.PathLike[str]) -> None:
     _validate_safetensors([path for path in weight_paths if path.suffix == ".safetensors"])
 
 
-def validate_gguf_bundle(
-    bundle_dir: str | os.PathLike[str],
-    *,
-    strict: bool = False,
-) -> None:
-    """Validate a staged directory containing one GGUF and JSON metadata.
-
-    The inexpensive checks (real files, size, magic, and supported version) do
-    not require optional dependencies.  When ``gguf`` is installed, opening the
-    model with :class:`gguf.GGUFReader` additionally validates its structure.
-    Set ``strict=True`` to require that reader; this fails with an actionable
-    error instead of silently falling back to the header-only check.
-
-    A bundle must contain exactly one top-level ``.gguf`` file and at least one
-    top-level JSON metadata document.  Additional non-GGUF files are allowed so
-    callers can include tokenizer assets, manifests, or verification reports.
-    """
-
-    if not isinstance(strict, bool):
-        raise TypeError("strict must be a boolean")
-
-    root = Path(bundle_dir)
-    if not root.is_dir() or root.is_symlink():
-        raise CheckpointValidationError("Staged GGUF bundle must be a real directory")
-
-    try:
-        entries = list(root.iterdir())
-    except OSError as exc:
-        raise CheckpointValidationError(f"Could not inspect staged GGUF bundle: {exc}") from exc
-
-    gguf_paths = sorted(
-        (path for path in entries if path.suffix.lower() == ".gguf"),
-        key=lambda path: path.name,
-    )
-    if not gguf_paths:
-        raise CheckpointValidationError("Staged GGUF bundle is missing a .gguf file")
-    if len(gguf_paths) != 1:
-        names = ", ".join(path.name for path in gguf_paths)
-        raise CheckpointValidationError(
-            f"Staged GGUF bundle must contain exactly one .gguf file; found {len(gguf_paths)} "
-            f"({names})"
-        )
-
-    gguf_path = gguf_paths[0]
-    _resolved_inside(root, gguf_path)
-    if gguf_path.is_symlink() or not gguf_path.is_file():
-        raise CheckpointValidationError(
-            f"GGUF artifact must be a real regular file: {gguf_path.name}"
-        )
-    try:
-        size = gguf_path.stat().st_size
-        with gguf_path.open("rb") as handle:
-            header = handle.read(8)
-    except OSError as exc:
-        raise CheckpointValidationError(
-            f"Could not inspect GGUF file {gguf_path.name}: {exc}"
-        ) from exc
-    if size == 0:
-        raise CheckpointValidationError(f"GGUF file is empty: {gguf_path.name}")
-    if len(header) < 8:
-        raise CheckpointValidationError(
-            f"GGUF file has a truncated header: {gguf_path.name}"
-        )
-    if header[:4] != _GGUF_MAGIC:
-        raise CheckpointValidationError(
-            f"GGUF file has invalid magic bytes: {gguf_path.name}"
-        )
-    version = struct.unpack("<I", header[4:8])[0]
-    if version not in _SUPPORTED_GGUF_VERSIONS:
-        supported = ", ".join(str(item) for item in sorted(_SUPPORTED_GGUF_VERSIONS))
-        raise CheckpointValidationError(
-            f"GGUF file uses unsupported version {version}; supported versions: {supported}"
-        )
-
-    metadata_paths = sorted(
-        (path for path in entries if path.suffix.lower() == ".json"),
-        key=lambda path: path.name,
-    )
-    if not metadata_paths:
-        raise CheckpointValidationError(
-            "Staged GGUF bundle is missing a top-level JSON metadata document"
-        )
-    for metadata_path in metadata_paths:
-        _resolved_inside(root, metadata_path)
-        if metadata_path.is_symlink() or not metadata_path.is_file():
-            raise CheckpointValidationError(
-                f"GGUF metadata must be a real regular file: {metadata_path.name}"
-            )
-        _read_json_object(metadata_path, metadata_path.name)
-
-    try:
-        from gguf import GGUFReader
-    except ImportError as exc:
-        if strict:
-            raise CheckpointValidationError(
-                "Strict GGUF validation requires the optional 'gguf' package; "
-                "install gguf (or llama.cpp's gguf-py package) and retry"
-            ) from exc
-        return
-
-    try:
-        # GGUFReader memory-maps tensor data and validates structure without
-        # materializing the model's tensors.
-        reader = GGUFReader(str(gguf_path), "r")
-        close = getattr(reader, "close", None)
-        if callable(close):
-            close()
-        del reader
-    except Exception as exc:
-        raise CheckpointValidationError(
-            f"GGUF file is not readable: {gguf_path.name}: {exc}"
-        ) from exc
-
-
 def _reserve_backup_path(parent: Path, destination_name: str) -> Path:
     reserved = Path(tempfile.mkdtemp(prefix=f".{destination_name}.backup-", dir=str(parent)))
     reserved.rmdir()
@@ -412,8 +293,8 @@ def _assert_distinct_local_source(source: str | os.PathLike[str] | None, destina
             "Local source checkpoint and output directory resolve to the same path"
         )
 
-    # A GGUF input may be a file inside an existing output directory. Replacing
-    # that directory would delete the source before the operation is complete.
+    # A local source may be a file inside an existing output directory.
+    # Replacing that directory would delete the source before serialization.
     try:
         resolved_source.relative_to(resolved_destination)
     except ValueError:
@@ -524,31 +405,4 @@ def save_hf_checkpoint_transactionally(
         overwrite=overwrite,
         validator=validator,
         artifact_name="checkpoint",
-    )
-
-
-def save_gguf_bundle_transactionally(
-    output_dir: str | os.PathLike[str],
-    serializer: Serializer,
-    *,
-    source: str | os.PathLike[str] | None = None,
-    overwrite: bool = False,
-    validator: Validator = validate_gguf_bundle,
-) -> Path:
-    """Serialize, validate, and atomically publish a GGUF artifact bundle.
-
-    ``serializer`` receives an empty same-parent staging directory and must put
-    the final GGUF plus its metadata there.  For strict structural validation,
-    pass ``functools.partial(validate_gguf_bundle, strict=True)`` as
-    ``validator``.  Existing outputs use the same backup-and-restore guarantees
-    as :func:`save_hf_checkpoint_transactionally`.
-    """
-
-    return _save_directory_transactionally(
-        output_dir,
-        serializer,
-        source=source,
-        overwrite=overwrite,
-        validator=validator,
-        artifact_name="GGUF bundle",
     )

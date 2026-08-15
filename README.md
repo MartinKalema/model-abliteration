@@ -225,60 +225,6 @@ obliteratus aggregate --format summary
 obliteratus aggregate --format latex --metric refusal_rate --min-runs 3
 ```
 
-#### GGUF input and output
-
-OBLITERATUS accepts a local GGUF or a GGUF file in a Hugging Face repository.
-It dequantizes the checkpoint into editable FP16/BF16 PyTorch weights, performs
-the intervention, saves a dense Hugging Face staging checkpoint, converts that
-checkpoint with a pinned `llama.cpp` checkout, and quantizes the result exactly
-once. Packed Q4 tensors are never edited or requantized in place.
-
-GGUF imports require a canonical configuration source (`--base-model-id`, or
-an offline `--tokenizer-path` directory that also contains `config.json`). The
-pinned Transformers release has incomplete GPT-OSS and Gemma 4 GGUF mappings;
-OBLITERATUS applies a scoped compatibility layer and audits every source tensor
-against the canonical meta-model before any expensive dequantization begins.
-
-```bash
-# GPT-OSS 20B
-obliteratus obliterate models/gpt-oss-20b/gpt-oss-20b-Q4_K_M.gguf \
-    --base-model-id openai/gpt-oss-20b \
-    --tokenizer-path openai/gpt-oss-20b \
-    --dtype bfloat16 \
-    --output-format gguf \
-    --gguf-quant Q4_K_M \
-    --llama-cpp-dir /path/to/llama.cpp \
-    --output-dir abliterated/gpt-oss-20b
-
-# Gemma 4 26B A4B (GGUF contains the text backbone)
-obliteratus obliterate models/gemma-4-26b-a4b-it/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
-    --base-model-id google/gemma-4-26B-A4B-it \
-    --tokenizer-path google/gemma-4-26B-A4B-it \
-    --dtype bfloat16 \
-    --output-format both \
-    --gguf-quant Q4_K_M \
-    --llama-cpp-dir /path/to/llama.cpp \
-    --output-dir abliterated/gemma-4-26b-a4b-it
-```
-
-`--output-format gguf` publishes a bundle directory containing one top-level
-GGUF, the exact tokenizer/chat template, and abliteration metadata. `both` also
-keeps the validated dense Hugging Face checkpoint under `hf/`. The default
-post-quantization gate reloads the final GGUF, checks tensor coverage and the
-tokenizer contract, runs a one-token `llama.cpp` smoke test, and rejects excess
-quality drift before the bundle is atomically published.
-
-GGUF storage size is not editing memory. A Q4 file is expanded to every dense
-parameter: budget roughly 40–50 GB just for GPT-OSS weights and 50–60 GB for
-Gemma 4 weights, plus activations, state-dict gathering, conversion workspace,
-and output. Use a high-memory host and ample temporary disk. `--quantization`
-still means BitsAndBytes in-memory loading and is intentionally incompatible
-with GGUF input. The SSH remote runner does not upload GGUF artifacts; invoke
-the local CLI on a host where the files and pinned `llama.cpp` checkout exist.
-The supported toolchain is pinned to `llama.cpp` commit
-`8e7f22b67ef4667b4ddd50230771287f328cfb3f`; every export records the checkout's
-actual Git revision in `abliteration_metadata.json` for reproducibility.
-
 ### 5. Python API (full programmatic control)
 
 For researchers who want to integrate OBLITERATUS into their own pipelines:

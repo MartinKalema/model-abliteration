@@ -47,6 +47,30 @@ def test_rejects_equal_local_source_and_output(tmp_path):
     assert called is False
 
 
+def test_rejects_source_file_inside_destination_before_serializing(tmp_path):
+    output = tmp_path / "published"
+    output.mkdir()
+    source = output / "source-checkpoint.bin"
+    source.write_bytes(b"source")
+    called = False
+
+    def serializer(_staging: Path) -> None:
+        nonlocal called
+        called = True
+
+    with pytest.raises(SourceDestinationCollisionError, match="inside the output"):
+        save_hf_checkpoint_transactionally(
+            output,
+            serializer,
+            source=source,
+            overwrite=True,
+            validator=lambda _path: None,
+        )
+
+    assert called is False
+    assert source.read_bytes() == b"source"
+
+
 def test_rejects_symlink_equivalent_source_and_output(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

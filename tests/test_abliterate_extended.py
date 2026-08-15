@@ -200,12 +200,11 @@ class TestBiasProjection:
 # ---------------------------------------------------------------------------
 
 class TestChatTemplate:
-    def test_reasoning_protocol_ignores_non_string_canonical_model_id(self):
+    def test_reasoning_protocol_ignores_non_string_handle_model_name(self):
         """Dynamic mock attributes must not replace the real model identifier."""
         pipeline = AbliterationPipeline(model_name="pipeline-fallback")
         handle = MagicMock()
-        handle.canonical_model_id = MagicMock()
-        handle.model_name = "openai/gpt-oss-20b"
+        handle.model_name = MagicMock()
         pipeline.handle = handle
         expected = MagicMock()
 
@@ -219,7 +218,7 @@ class TestChatTemplate:
         detect.assert_called_once_with(
             handle.tokenizer,
             handle.config,
-            "openai/gpt-oss-20b",
+            "pipeline-fallback",
         )
 
     def test_no_wrap_when_disabled(self):

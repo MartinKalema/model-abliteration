@@ -21,11 +21,9 @@ Novel contributions (OBLITERATUS):
 from __future__ import annotations
 
 import json
-import gc
 import logging
 import math
 import os
-import re
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -55,10 +53,8 @@ from obliteratus.architecture_manifest import (  # noqa: E402
 )
 from obliteratus.evaluation.damage_gate import (  # noqa: E402
     AcceptanceBudget,
-    DamageBudget,
     DamageAssessment,
     DamageGateError,
-    EfficacyBudget,
     assess_candidate,
 )
 from obliteratus.evaluation.prompt_split import (  # noqa: E402
@@ -850,18 +846,6 @@ class AbliterationPipeline:
         damage_generation_samples: int = 10,
         evaluation_harmful_prompts: list[str] | None = None,
         evaluation_harmless_prompts: list[str] | None = None,
-        # GGUF import/export. ``quantization`` remains the distinct
-        # BitsAndBytes in-memory option and is never overloaded with these.
-        gguf_file: str | None = None,
-        base_model_id: str | None = None,
-        tokenizer_path: str | None = None,
-        output_format: str = "hf",
-        gguf_quant: str = "Q4_K_M",
-        llama_cpp_dir: str | None = None,
-        llama_cpp_python: str | None = None,
-        gguf_imatrix: str | None = None,
-        keep_dense_intermediate: bool = False,
-        post_quant_verify: bool = True,
         on_stage: Callable[[StageResult], None] | None = None,
         on_log: Callable[[str], None] | None = None,
     ):
@@ -875,25 +859,6 @@ class AbliterationPipeline:
         self.hub_token = hub_token
         self.hub_community_org = hub_community_org
         self.overwrite_output = bool(overwrite_output)
-        self.gguf_file = gguf_file
-        self.base_model_id = base_model_id
-        self.tokenizer_path = tokenizer_path
-        self.output_format = str(output_format).lower()
-        if self.output_format not in {"hf", "gguf", "both"}:
-            raise ValueError("output_format must be one of: hf, gguf, both")
-        self.gguf_quant = str(gguf_quant).strip().upper()
-        if self.output_format in {"gguf", "both"}:
-            from obliteratus.gguf_export import normalize_gguf_quantization
-
-            self.gguf_quant = normalize_gguf_quantization(self.gguf_quant)
-        self.llama_cpp_dir = llama_cpp_dir
-        self.llama_cpp_python = llama_cpp_python
-        self.gguf_imatrix = gguf_imatrix
-        self.keep_dense_intermediate = bool(keep_dense_intermediate)
-        self.post_quant_verify = bool(post_quant_verify)
-        self._gguf_export_result: Any | None = None
-        self._post_quant_assessment: DamageAssessment | None = None
-        self._post_quant_incremental_assessment: DamageAssessment | None = None
         self._input_source_metadata: dict[str, Any] | None = None
         self.harmful_prompts = list(harmful_prompts) if harmful_prompts is not None else list(HARMFUL_PROMPTS)
         self.harmless_prompts = list(harmless_prompts) if harmless_prompts is not None else list(HARMLESS_PROMPTS)
@@ -1461,23 +1426,6 @@ class AbliterationPipeline:
         """
         if self.handle is None:
             raise RuntimeError("A loaded model is required for storage validation")
-        if getattr(self.handle, "source_format", "hf") == "gguf":
-            # Transformers' GGUF importer records the source quantization in
-            # config metadata but materializes ordinary floating tensors for
-            # editing.  Accept that provenance only after checking the actual
-            # in-memory parameters; packed integer/block tensors remain unsafe.
-            packed = [
-                name
-                for name, parameter in self.handle.model.named_parameters()
-                if not parameter.is_floating_point()
-            ]
-            if packed:
-                preview = ", ".join(packed[:5])
-                raise RuntimeError(
-                    "GGUF import did not dequantize every editable parameter; "
-                    f"found {len(packed)} packed/non-floating tensors ({preview})."
-                )
-            return
         quantization_config = getattr(self.handle.config, "quantization_config", None)
         if quantization_config is None:
             return
@@ -1923,9 +1871,6 @@ class AbliterationPipeline:
             dtype=self.dtype,
             trust_remote_code=self.trust_remote_code,
             quantization=self.quantization,
-            gguf_file=self.gguf_file,
-            canonical_model_id=self.base_model_id,
-            tokenizer_source=self.tokenizer_path or self.base_model_id,
             # Exact rollback is a correctness requirement for target search.
             # This intentionally costs roughly another model-size of CPU RAM.
             skip_snapshot=(False if self._requested_projection_target == "auto" else None),
@@ -1933,15 +1878,9 @@ class AbliterationPipeline:
         self._input_source_metadata = {
             "format": getattr(self.handle, "source_format", "hf"),
             "model": getattr(self.handle, "source_model", self.model_name),
-            "file": getattr(self.handle, "source_file", self.gguf_file),
-            "canonical_model_id": getattr(
-                self.handle, "canonical_model_id", self.base_model_id
-            ),
-            "tokenizer_source": getattr(
-                self.handle,
-                "tokenizer_source",
-                self.tokenizer_path or self.base_model_id,
-            ),
+            "file": getattr(self.handle, "source_file", None),
+            "canonical_model_id": getattr(self.handle, "canonical_model_id", self.model_name),
+            "tokenizer_source": getattr(self.handle, "tokenizer_source", self.model_name),
             "in_memory_dtype": getattr(self.handle, "in_memory_dtype", self.dtype),
         }
         self.reasoning_protocol = None
@@ -1964,12 +1903,6 @@ class AbliterationPipeline:
         summary = self.handle.summary()
         elapsed = time.time() - t0
         self.log(f"Model loaded in {elapsed:.1f}s")
-        if summary.get("source_format") == "gguf":
-            self.log(
-                "GGUF source dequantized to mutable "
-                f"{summary.get('in_memory_dtype', self.dtype)} tensors; "
-                "packed source blocks will not be edited in place"
-            )
         self.log(
             f"Architecture: {summary['architecture']} | "
             f"Layers: {summary['num_layers']} | "
@@ -2179,9 +2112,7 @@ class AbliterationPipeline:
                 (
                     candidate.strip()
                     for candidate in (
-                        getattr(self.handle, "canonical_model_id", None),
                         getattr(self.handle, "model_name", None),
-                        self.base_model_id,
                         self.model_name,
                     )
                     if isinstance(candidate, str) and candidate.strip()
@@ -7999,17 +7930,13 @@ class AbliterationPipeline:
         live_source_metadata = {
             "format": getattr(handle, "source_format", "hf") if handle is not None else None,
             "model": getattr(handle, "source_model", self.model_name) if handle is not None else self.model_name,
-            "file": getattr(handle, "source_file", self.gguf_file) if handle is not None else self.gguf_file,
-            "canonical_model_id": (
-                getattr(handle, "canonical_model_id", self.base_model_id)
-                if handle is not None
-                else self.base_model_id
-            ),
-            "tokenizer_source": (
-                getattr(handle, "tokenizer_source", self.tokenizer_path or self.base_model_id)
-                if handle is not None
-                else self.tokenizer_path or self.base_model_id
-            ),
+            "file": getattr(handle, "source_file", None) if handle is not None else None,
+            "canonical_model_id": getattr(handle, "canonical_model_id", self.model_name)
+            if handle is not None
+            else self.model_name,
+            "tokenizer_source": getattr(handle, "tokenizer_source", self.model_name)
+            if handle is not None
+            else self.model_name,
             "in_memory_dtype": (
                 getattr(handle, "in_memory_dtype", self.dtype)
                 if handle is not None
@@ -8020,28 +7947,7 @@ class AbliterationPipeline:
         return {
             "source_model": self.model_name,
             "model_source": source_metadata,
-            "output": {
-                "format": self.output_format,
-                "gguf_quant": self.gguf_quant if self.output_format in {"gguf", "both"} else None,
-                "gguf_export": (
-                    self._gguf_export_result.to_metadata(
-                        bundle_dir=self._gguf_export_result.final_path.parent
-                    )
-                    if self._gguf_export_result is not None
-                    else None
-                ),
-                "post_quant_verify_requested": self.post_quant_verify,
-                "post_quant_assessment": (
-                    self._post_quant_assessment.to_dict()
-                    if self._post_quant_assessment is not None
-                    else None
-                ),
-                "post_quant_incremental_assessment": (
-                    self._post_quant_incremental_assessment.to_dict()
-                    if self._post_quant_incremental_assessment is not None
-                    else None
-                ),
-            },
+            "output": {"format": "hf"},
             "technique": "refusal_direction_ablation",
             "method": self.method,
             "method_config": {
@@ -8271,174 +8177,8 @@ class AbliterationPipeline:
             adapter_path = save_lora_adapters(self._lora_adapters, staging_dir)
             self.log(f"Staged LoRA adapters at {adapter_path}")
 
-    @staticmethod
-    def _tokenizer_contract_signature(tokenizer: Any) -> dict[str, Any]:
-        """Return a compact exact signature for serialized chat formatting."""
-
-        messages = [{"role": "user", "content": "Tokenizer contract probe."}]
-        try:
-            rendered = tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-            tolist = getattr(rendered, "tolist", None)
-            if callable(tolist):
-                rendered = tolist()
-            if isinstance(rendered, list) and rendered and isinstance(rendered[0], list):
-                rendered = rendered[0]
-            token_ids = list(rendered) if isinstance(rendered, (list, tuple)) else None
-        except Exception as exc:
-            token_ids = None
-            render_error = f"{type(exc).__name__}: {exc}"
-        else:
-            render_error = None
-        special_tokens = getattr(tokenizer, "special_tokens_map", {})
-        return {
-            "class": type(tokenizer).__name__,
-            "chat_template": getattr(tokenizer, "chat_template", None),
-            "special_tokens_map": {str(k): str(v) for k, v in dict(special_tokens).items()},
-            "rendered_token_ids": token_ids,
-            "render_error": render_error,
-        }
-
-    def _gguf_output_name(self) -> str:
-        source_file = (self._input_source_metadata or {}).get("file")
-        source = str(source_file or self.gguf_file or self.model_name).rstrip("/")
-        stem = Path(source).stem or "model"
-        stem = re.sub(
-            r"-(?:UD-)?(?:IQ|Q|TQ|F|BF)\d(?:_[A-Z0-9]+)*$",
-            "",
-            stem,
-            flags=re.IGNORECASE,
-        )
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "model"
-        return f"{safe}-OBLITERATED-{self.gguf_quant}.gguf"
-
-    def _capture_dense_candidate_reference(
-        self,
-    ) -> tuple[list[LocalityBaseline], dict[str, Any] | None]:
-        """Capture the float candidate so requantization has its own drift gate."""
-
-        pristine_baseline = self._damage_baseline
-        pristine_health = self._baseline_generation_health
-        try:
-            self.log("Capturing dense edited checkpoint as the quantization reference...")
-            self._damage_baseline = []
-            self._baseline_generation_health = None
-            self._capture_damage_baseline()
-            return list(self._damage_baseline), self._baseline_generation_health
-        finally:
-            self._damage_baseline = pristine_baseline
-            self._baseline_generation_health = pristine_health
-
-    def _release_dense_handle_for_gguf_reload(self) -> None:
-        """Free the serialized float model before loading the quantized artifact."""
-
-        old_handle = self.handle
-        self.handle = None
-        self.reasoning_protocol = None
-        self._projection_manifests.clear()
-        if old_handle is not None:
-            old_handle._original_state = None
-            old_handle.cleanup()
-            old_handle.model = None  # type: ignore[assignment]
-            old_handle.tokenizer = None  # type: ignore[assignment]
-            old_handle.config = None  # type: ignore[assignment]
-        del old_handle
-        gc.collect()
-        self._free_gpu_memory()
-
-    def _assess_incremental_quantization(
-        self,
-        dense_baseline: list[LocalityBaseline],
-        dense_health: dict[str, Any] | None,
-    ) -> DamageAssessment:
-        """Gate added Q4 drift separately from total pristine-to-final drift."""
-
-        pristine_baseline = self._damage_baseline
-        pristine_health = self._baseline_generation_health
-        try:
-            self._damage_baseline = dense_baseline
-            self._baseline_generation_health = dense_health
-            metrics = dict(self._measure_candidate_locality() or {})
-            candidate_health = self._measure_benign_generation_health()
-            if candidate_health is not None and dense_health is not None:
-                baseline_coherence = float(dense_health["coherence"])
-                candidate_coherence = float(candidate_health["coherence"])
-                metrics.update(
-                    {
-                        "coherence_drop": baseline_coherence - candidate_coherence,
-                        "new_degenerate_count": self._count_new_degenerate_outputs(
-                            dense_health,
-                            candidate_health,
-                        ),
-                    }
-                )
-            quant_budget = AcceptanceBudget(
-                damage=DamageBudget(**self.damage_budget.damage.to_dict()),
-                efficacy=EfficacyBudget(max_refusal_rate=None, min_eval_prompts=1),
-            )
-            return assess_candidate(metrics, quant_budget)
-        finally:
-            self._damage_baseline = pristine_baseline
-            self._baseline_generation_health = pristine_health
-
-    def _verify_staged_gguf(
-        self,
-        final_path: Path,
-        bundle_dir: Path,
-        tokenizer_signature: dict[str, Any],
-        dense_baseline: list[LocalityBaseline],
-        dense_health: dict[str, Any] | None,
-    ) -> None:
-        """Reload the staged Q4 artifact and fail before atomic publication."""
-
-        from obliteratus.gguf_export import run_llama_cpp_smoke_test
-
-        if self._gguf_export_result is None:
-            raise RuntimeError("GGUF export result is missing")
-        self._release_dense_handle_for_gguf_reload()
-        run_llama_cpp_smoke_test(
-            final_path,
-            self._gguf_export_result.toolchain,
-            log=self.log,
-        )
-
-        canonical_id = (self._input_source_metadata or {}).get("canonical_model_id")
-        self.log("Reloading final GGUF through Transformers for post-quantization gates...")
-        self.handle = load_model(
-            model_name=str(final_path),
-            task="causal_lm",
-            device=self.device,
-            dtype=self.dtype,
-            trust_remote_code=self.trust_remote_code,
-            canonical_model_id=canonical_id or self.base_model_id,
-            tokenizer_source=str(bundle_dir),
-            skip_snapshot=True,
-        )
-        self.reasoning_protocol = None
-        reloaded_signature = self._tokenizer_contract_signature(self.handle.tokenizer)
-        if reloaded_signature != tokenizer_signature:
-            raise RuntimeError(
-                "Final GGUF tokenizer/chat-template contract differs from the edited "
-                "dense candidate; refusing to publish a behaviorally ambiguous artifact."
-            )
-        self._assert_supported_storage_format()
-        self._prepare_projection_manifests()
-
-        total_assessment = self._verify()
-        self._post_quant_assessment = total_assessment
-        if self.damage_gate_enabled and not total_assessment.accepted:
-            raise DamageGateError(total_assessment)
-
-        incremental = self._assess_incremental_quantization(dense_baseline, dense_health)
-        self._post_quant_incremental_assessment = incremental
-        if self.damage_gate_enabled and not incremental.accepted:
-            raise DamageGateError(incremental)
-
     def _check_rebirth_disk_space(self, param_bytes: int) -> None:
-        """Fail early when dense staging plus GGUF conversion cannot fit."""
+        """Fail early when dense Hugging Face staging cannot fit."""
 
         import shutil
 
@@ -8446,13 +8186,12 @@ class AbliterationPipeline:
         while not disk_path.exists() and disk_path != disk_path.parent:
             disk_path = disk_path.parent
         disk = shutil.disk_usage(disk_path)
-        factor = 1.1 if self.output_format == "hf" else 2.6
-        needed = int(param_bytes * factor)
+        needed = int(param_bytes * 1.1)
         if disk.free < needed:
             raise OSError(
                 f"Insufficient disk space: {disk.free / 1e9:.1f} GB free, "
-                f"need about {needed / 1e9:.1f} GB for {self.output_format} staging. "
-                "Choose a larger filesystem or disable retained intermediates."
+                f"need about {needed / 1e9:.1f} GB for Hugging Face staging. "
+                "Choose a larger filesystem."
             )
         self.log(
             f"Disk space: {disk.free / 1e9:.1f} GB free, "
@@ -8489,21 +8228,11 @@ class AbliterationPipeline:
         self.log(f"Pushed to https://huggingface.co/{repo_id}")
 
     def _rebirth(self) -> Path:
-        """Publish HF, GGUF, or a bundle containing both, only after validation."""
-
-        import shutil
-        from dataclasses import replace
+        """Publish a validated Hugging Face checkpoint atomically."""
 
         from obliteratus.checkpoint_transaction import (
-            save_gguf_bundle_transactionally,
             save_hf_checkpoint_transactionally,
             validate_finite_state_dict,
-            validate_gguf_bundle,
-            validate_hf_checkpoint,
-        )
-        from obliteratus.gguf_export import (
-            export_hf_checkpoint_to_gguf,
-            validate_gguf_quantization,
         )
 
         self._require_damage_gate_passed()
@@ -8511,13 +8240,6 @@ class AbliterationPipeline:
         self._emit("rebirth", "running", f"Saving to {dest}...")
         t0 = time.time()
         self._prepare_model_for_serialization()
-
-        dense_baseline: list[LocalityBaseline] = []
-        dense_health: dict[str, Any] | None = None
-        tokenizer_signature: dict[str, Any] | None = None
-        if self.output_format in {"gguf", "both"} and self.post_quant_verify:
-            dense_baseline, dense_health = self._capture_dense_candidate_reference()
-            tokenizer_signature = self._tokenizer_contract_signature(self.handle.tokenizer)
 
         self.log("Gathering state dict...")
         state_holder: dict[str, dict | None] = {"value": self._gather_state_dict()}
@@ -8537,123 +8259,25 @@ class AbliterationPipeline:
             pass
 
         source = (self._input_source_metadata or {}).get("file") or self.model_name
-        initial_metadata = self._build_metadata()
-        # From this point the holder owns the only intentional reference.  The
-        # GGUF serializer clears it before reloading Q4 so a model-sized CPU
-        # state dict cannot silently double peak memory.
+        metadata = self._build_metadata()
         del state_dict
 
-        if self.output_format == "hf":
-            def serialize_hf(staging_dir: Path) -> None:
-                current_state = state_holder["value"]
-                if current_state is None:
-                    raise RuntimeError("Dense state dict was released before HF serialization")
-                self._serialize_hf_checkpoint(staging_dir, current_state, initial_metadata)
+        def serialize_hf(staging_dir: Path) -> None:
+            current_state = state_holder["value"]
+            if current_state is None:
+                raise RuntimeError("Dense state dict was released before HF serialization")
+            self._serialize_hf_checkpoint(staging_dir, current_state, metadata)
 
-            try:
-                save_hf_checkpoint_transactionally(
-                    self.output_dir,
-                    serialize_hf,
-                    source=source,
-                    overwrite=self.overwrite_output,
-                )
-            finally:
-                state_holder["value"] = None
-                self._free_gpu_memory()
-            self._cleanup_offload_dir()
-        else:
-            def serialize_gguf_bundle(staging_dir: Path) -> None:
-                current_state = state_holder["value"]
-                if current_state is None:
-                    raise RuntimeError("Dense state dict was released before GGUF conversion")
-
-                if self.output_format == "both":
-                    hf_dir = staging_dir / "hf"
-                elif self.keep_dense_intermediate:
-                    hf_dir = staging_dir / "intermediate" / "hf"
-                else:
-                    hf_dir = staging_dir / ".hf-staging"
-                self._serialize_hf_checkpoint(hf_dir, current_state, initial_metadata)
-
-                # A GGUF bundle carries an exact tokenizer alongside the model.
-                # This is required for GPT-OSS because reconstructing its Harmony
-                # tokenizer from GGUF metadata alone is not currently reliable.
-                self.handle.tokenizer.save_pretrained(staging_dir)
-                dense_outtype = "bf16" if self.dtype == "bfloat16" else "f16"
-                self._gguf_export_result = export_hf_checkpoint_to_gguf(
-                    hf_dir,
-                    staging_dir,
-                    llama_cpp_dir=self.llama_cpp_dir,
-                    python_executable=self.llama_cpp_python,
-                    quantization=self.gguf_quant,
-                    imatrix=self.gguf_imatrix,
-                    dense_outtype=dense_outtype,
-                    final_name=self._gguf_output_name(),
-                    keep_dense_intermediate=self.keep_dense_intermediate,
-                    log=self.log,
-                )
-
-                if self.output_format == "gguf" and not self.keep_dense_intermediate:
-                    shutil.rmtree(hf_dir, ignore_errors=True)
-
-                state_holder["value"] = None
-                del current_state
-                gc.collect()
-                self._free_gpu_memory()
-
-                if self.post_quant_verify:
-                    assert tokenizer_signature is not None
-                    self._verify_staged_gguf(
-                        self._gguf_export_result.final_path,
-                        staging_dir,
-                        tokenizer_signature,
-                        dense_baseline,
-                        dense_health,
-                    )
-
-                final_metadata = self._build_metadata()
-                (staging_dir / "abliteration_metadata.json").write_text(
-                    json.dumps(final_metadata, indent=2),
-                    encoding="utf-8",
-                )
-                if hf_dir.is_dir():
-                    (hf_dir / "abliteration_metadata.json").write_text(
-                        json.dumps(final_metadata, indent=2),
-                        encoding="utf-8",
-                    )
-
-            try:
-                def validate_output_bundle(path: Path) -> None:
-                    validate_gguf_bundle(path, strict=True)
-                    final_gguf = next(path.glob("*.gguf"))
-                    validate_gguf_quantization(final_gguf, self.gguf_quant)
-                    if self.output_format == "both":
-                        validate_hf_checkpoint(path / "hf")
-
-                save_gguf_bundle_transactionally(
-                    self.output_dir,
-                    serialize_gguf_bundle,
-                    source=source,
-                    overwrite=self.overwrite_output,
-                    validator=validate_output_bundle,
-                )
-            finally:
-                state_holder["value"] = None
-                self._free_gpu_memory()
-
-            if self._gguf_export_result is not None:
-                final_path = self.output_dir / self._gguf_export_result.final_path.name
-                dense_path = self._gguf_export_result.dense_path
-                if dense_path is not None:
-                    dense_path = self.output_dir / "intermediate" / dense_path.name
-                self._gguf_export_result = replace(
-                    self._gguf_export_result,
-                    final_path=final_path,
-                    dense_path=dense_path,
-                )
-                if self.handle is not None and getattr(self.handle, "source_format", None) == "gguf":
-                    self.handle.source_file = str(final_path)
-                    self.handle.tokenizer_source = str(self.output_dir)
+        try:
+            save_hf_checkpoint_transactionally(
+                self.output_dir,
+                serialize_hf,
+                source=source,
+                overwrite=self.overwrite_output,
+            )
+        finally:
+            state_holder["value"] = None
+            self._free_gpu_memory()
             if self.handle is not None:
                 self._cleanup_offload_dir()
 

@@ -38,9 +38,6 @@ def run_study(config: StudyConfig) -> AblationReport:
         dtype=config.model.dtype,
         trust_remote_code=config.model.trust_remote_code,
         num_labels=config.model.num_labels,
-        gguf_file=config.model.gguf_file,
-        canonical_model_id=config.model.canonical_model_id,
-        tokenizer_source=config.model.tokenizer_source,
     )
     console.print(f"  Architecture: {handle.architecture}")
     console.print(f"  Layers: {handle.num_layers}  Heads: {handle.num_heads}")

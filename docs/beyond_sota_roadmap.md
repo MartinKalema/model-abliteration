@@ -79,7 +79,7 @@ refusal-critical components use a larger gamma.
 2. **KL as a first-class objective:** not just a report after the fact, but a
    constraint or penalty during candidate selection.
 3. **Quantization-native validation:** edit-then-quantize and quantize-then-edit
-   behavior across MLX/GGUF/JANG-style deployment formats.
+   behavior across quantized deployment formats.
 4. **MoE/router-aware editing:** expert-local edits, router drift checks, and
    per-expert preservation metrics.
 5. **Standard public benchmarks:** the local community gate now covers compact
@@ -141,7 +141,7 @@ subspaces are causal for refusal and which are merely correlated collateral.
 Every leader must survive deployment:
 
 1. BF16 source/candidate metrics.
-2. MLX or GGUF quantized metrics.
+2. Quantized deployment metrics.
 3. Quantization drift report:
 
 ```text

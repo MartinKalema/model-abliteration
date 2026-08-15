@@ -254,34 +254,9 @@ def _damage_pipeline_kwargs(args) -> dict:
     }
 
 
-def _gguf_pipeline_kwargs(args) -> dict:
-    """Translate GGUF import/export flags into pipeline constructor kwargs."""
-    gguf_file = getattr(args, "gguf_file", None)
-    model_name = str(getattr(args, "model", ""))
-    if gguf_file is None and Path(model_name).suffix.lower() == ".gguf":
-        gguf_file = model_name
-
-    return {
-        "gguf_file": gguf_file,
-        "base_model_id": getattr(args, "base_model_id", None),
-        "tokenizer_path": getattr(args, "tokenizer_path", None),
-        "output_format": getattr(args, "output_format", "hf"),
-        "gguf_quant": getattr(args, "gguf_quant", "Q4_K_M"),
-        "llama_cpp_dir": getattr(args, "llama_cpp_dir", None),
-        "llama_cpp_python": getattr(args, "llama_cpp_python", None),
-        "gguf_imatrix": getattr(args, "gguf_imatrix", None),
-        "keep_dense_intermediate": getattr(args, "keep_dense_intermediate", False),
-        "post_quant_verify": getattr(args, "post_quant_verify", True),
-    }
-
-
 def _default_abliteration_output_dir(model_name: str) -> str:
-    """Return a compact default output path for Hub IDs and local GGUF files."""
-    model_path = Path(model_name)
-    if model_path.suffix.lower() == ".gguf":
-        safe_name = model_path.stem or "model"
-    else:
-        safe_name = model_name.replace("/", "_")
+    """Return a compact default output path for a Hugging Face model."""
+    safe_name = model_name.replace("/", "_")
     return str(Path("abliterated") / safe_name)
 
 
@@ -330,7 +305,7 @@ def main(argv: list[str] | None = None):
 
     # --- info ---
     info_parser = subparsers.add_parser("info", help="Print model architecture info")
-    info_parser.add_argument("model", type=str, help="HuggingFace model name/path or local GGUF")
+    info_parser.add_argument("model", type=str, help="HuggingFace model name/path")
     info_parser.add_argument("--task", type=str, default="causal_lm", choices=["causal_lm", "classification"])
     info_parser.add_argument("--device", type=str, default="cpu")
     info_parser.add_argument("--dtype", type=str, default="float32")
@@ -387,84 +362,11 @@ def main(argv: list[str] | None = None):
         p.add_argument(
             "model",
             type=str,
-            help="HuggingFace model name/path or a local .gguf file",
+            help="HuggingFace model name/path",
         )
         p.add_argument("--output-dir", type=str, default=None, help="Where to save the obliterated model")
         p.add_argument("--device", type=str, default="auto")
         p.add_argument("--dtype", type=str, default="float16")
-        gguf_group = p.add_argument_group("GGUF import and export")
-        gguf_group.add_argument(
-            "--gguf-file",
-            type=str,
-            default=None,
-            help=(
-                "Repository-relative GGUF filename to import from the model source. "
-                "Pass a local .gguf path positionally instead; it is detected automatically."
-            ),
-        )
-        gguf_group.add_argument(
-            "--base-model-id",
-            type=str,
-            default=None,
-            help="Canonical HuggingFace model ID used to recover config/tokenizer metadata.",
-        )
-        gguf_group.add_argument(
-            "--tokenizer-path",
-            type=str,
-            default=None,
-            help="Offline tokenizer/config directory to use instead of the base model ID.",
-        )
-        gguf_group.add_argument(
-            "--output-format",
-            type=str,
-            choices=["hf", "gguf", "both"],
-            default="hf",
-            help="Published artifact format (default: hf).",
-        )
-        gguf_group.add_argument(
-            "--gguf-quant",
-            type=str,
-            default="Q4_K_M",
-            help="llama.cpp quantization type for GGUF output (default: Q4_K_M).",
-        )
-        gguf_group.add_argument(
-            "--llama-cpp-dir",
-            type=str,
-            default=None,
-            help="Path to a pinned llama.cpp checkout used for conversion and quantization.",
-        )
-        gguf_group.add_argument(
-            "--llama-cpp-python",
-            type=str,
-            default=None,
-            help="Optional Python executable for llama.cpp conversion scripts.",
-        )
-        gguf_group.add_argument(
-            "--gguf-imatrix",
-            type=str,
-            default=None,
-            help="Optional llama.cpp importance-matrix file for output quantization.",
-        )
-        gguf_group.add_argument(
-            "--keep-dense-intermediate",
-            action="store_true",
-            default=False,
-            help="Keep the dense HuggingFace/BF16 staging artifact after GGUF export.",
-        )
-        post_quant_group = gguf_group.add_mutually_exclusive_group()
-        post_quant_group.add_argument(
-            "--post-quant-verify",
-            dest="post_quant_verify",
-            action="store_true",
-            default=True,
-            help="Reload and verify the final quantized GGUF before publishing (default).",
-        )
-        post_quant_group.add_argument(
-            "--no-post-quant-verify",
-            dest="post_quant_verify",
-            action="store_false",
-            help="Skip final GGUF reload verification.",
-        )
         p.add_argument(
             "--method", type=str, default="advanced",
             choices=[
@@ -1085,18 +987,6 @@ def _cmd_run(args):
 
 
 def _cmd_info(args):
-    if Path(args.model).suffix.lower() == ".gguf":
-        from obliteratus.model_profile import profile_model
-
-        console.print(f"[bold cyan]Reading GGUF metadata:[/bold cyan] {args.model}")
-        profile = profile_model(args.model)
-        for key, val in profile.to_json().items():
-            if isinstance(val, int) and val > 1000:
-                console.print(f"  {key}: {val:,}")
-            else:
-                console.print(f"  {key}: {val}")
-        return
-
     from obliteratus.models.loader import load_model
 
     console.print(f"[bold cyan]Loading model:[/bold cyan] {args.model}")
@@ -1389,7 +1279,6 @@ def _cmd_abliterate(args):
         )
 
     safety_kwargs = _damage_pipeline_kwargs(args)
-    gguf_kwargs = _gguf_pipeline_kwargs(args)
     if method == "informed":
         from obliteratus.informed_pipeline import InformedAbliterationPipeline
 
@@ -1404,7 +1293,6 @@ def _cmd_abliterate(args):
             on_stage=on_stage,
             on_log=on_log,
             **safety_kwargs,
-            **gguf_kwargs,
             **prompt_kwargs,
         )
     else:
@@ -1433,7 +1321,6 @@ def _cmd_abliterate(args):
             on_stage=on_stage,
             on_log=on_log,
             **safety_kwargs,
-            **gguf_kwargs,
             **prompt_kwargs,
         )
 
@@ -1447,8 +1334,6 @@ def _cmd_abliterate(args):
             if residue_meta:
                 import json
                 result_bundle = Path(result_path)
-                if not result_bundle.is_dir() and result_bundle.suffix.lower() == ".gguf":
-                    result_bundle = result_bundle.parent
                 (result_bundle / "hard_negative_residue.json").write_text(
                     json.dumps(residue_meta, indent=2)
                 )
@@ -1721,24 +1606,6 @@ def _make_remote_runner(args):
 
 def _cmd_remote_abliterate(args):
     from rich.panel import Panel
-
-    gguf_requested = (
-        Path(str(args.model)).suffix.lower() == ".gguf"
-        or getattr(args, "gguf_file", None) is not None
-        or getattr(args, "base_model_id", None) is not None
-        or getattr(args, "tokenizer_path", None) is not None
-        or getattr(args, "output_format", "hf") != "hf"
-        or getattr(args, "gguf_imatrix", None) is not None
-        or getattr(args, "keep_dense_intermediate", False)
-    )
-    if gguf_requested:
-        console.print(
-            "[red]Remote GGUF import/export is not supported yet.[/] The SSH runner "
-            "does not upload local GGUF files or forward GGUF provenance/toolchain "
-            "options. Run locally, or stage the artifact remotely and use the local "
-            "CLI on that host."
-        )
-        raise SystemExit(2)
 
     runner = _make_remote_runner(args)
 
