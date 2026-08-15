@@ -10,7 +10,7 @@ Tests the new capabilities added to the OBLITERATUS abliteration pipeline:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
@@ -200,6 +200,28 @@ class TestBiasProjection:
 # ---------------------------------------------------------------------------
 
 class TestChatTemplate:
+    def test_reasoning_protocol_ignores_non_string_canonical_model_id(self):
+        """Dynamic mock attributes must not replace the real model identifier."""
+        pipeline = AbliterationPipeline(model_name="pipeline-fallback")
+        handle = MagicMock()
+        handle.canonical_model_id = MagicMock()
+        handle.model_name = "openai/gpt-oss-20b"
+        pipeline.handle = handle
+        expected = MagicMock()
+
+        with patch(
+            "obliteratus.abliterate.detect_reasoning_protocol",
+            return_value=expected,
+        ) as detect:
+            result = pipeline._get_reasoning_protocol()
+
+        assert result is expected
+        detect.assert_called_once_with(
+            handle.tokenizer,
+            handle.config,
+            "openai/gpt-oss-20b",
+        )
+
     def test_no_wrap_when_disabled(self):
         """Should not wrap prompts when use_chat_template is False."""
         pipeline = AbliterationPipeline(
@@ -235,6 +257,7 @@ class TestChatTemplate:
 
         tokenizer.apply_chat_template = mock_apply
         handle.tokenizer = tokenizer
+        handle.model_name = "test-model"
         pipeline.handle = handle
         pipeline._on_log = lambda m: None
 
@@ -251,6 +274,7 @@ class TestChatTemplate:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.side_effect = Exception("No template")
         handle.tokenizer = tokenizer
+        handle.model_name = "test-model"
         pipeline.handle = handle
         pipeline._on_log = lambda m: None
 
@@ -270,6 +294,7 @@ class TestMetadata:
         pipeline = AbliterationPipeline(
             model_name="test-model",
             method="aggressive",
+            damage_gate_enabled=False,
         )
         pipeline.handle = handle
         pipeline._on_log = lambda m: None
@@ -277,7 +302,12 @@ class TestMetadata:
         pipeline._strong_layers = [0]
         pipeline._quality_metrics = {"perplexity": 8.5, "coherence": 1.0}
 
-        handle.model.save_pretrained = MagicMock()
+        def save_minimal_checkpoint(path, **_kwargs):
+            path = Path(path)
+            (path / "config.json").write_text("{}")
+            (path / "pytorch_model.bin").write_bytes(b"weights")
+
+        handle.model.save_pretrained = MagicMock(side_effect=save_minimal_checkpoint)
         handle.tokenizer.save_pretrained = MagicMock()
 
         import tempfile

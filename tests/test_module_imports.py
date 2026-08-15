@@ -83,3 +83,7 @@ class TestDirectImports:
             run_benchmarks,
         )
         assert callable(run_benchmarks)
+
+    def test_som_direction_extractor(self):
+        from obliteratus.analysis.som_directions import SOMDirectionExtractor
+        assert callable(SOMDirectionExtractor)

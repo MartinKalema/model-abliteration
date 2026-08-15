@@ -20,6 +20,11 @@ from obliteratus.abliterate import (
     StageResult,
 )
 from obliteratus.models.loader import ModelHandle
+from obliteratus.prompts import (
+    DATASET_SOURCES,
+    PROMPT_VOLUME_OPTIONS,
+    get_valid_volumes,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +67,16 @@ def _make_tiny_handle():
 def _make_varied_tokenizer(handle):
     """Set up a tokenizer mock that returns different tokens per call."""
     call_count = [0]
+
     def mock_tokenizer(prompt, **kwargs):
         call_count[0] += 1
         torch.manual_seed(call_count[0])
+        batch_size = len(prompt) if isinstance(prompt, (list, tuple)) else 1
         return {
-            "input_ids": torch.randint(0, 1000, (1, 5)),
-            "attention_mask": torch.ones(1, 5, dtype=torch.long),
+            "input_ids": torch.randint(0, 1000, (batch_size, 5)),
+            "attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
         }
+
     handle.tokenizer.side_effect = mock_tokenizer
 
 
@@ -91,16 +99,24 @@ class TestPrompts:
     def test_prompt_lists_same_length(self):
         assert len(HARMFUL_PROMPTS) == len(HARMLESS_PROMPTS)
 
-    def test_prompt_count_512(self):
-        """512 prompts across 7 severity tiers."""
-        assert len(HARMFUL_PROMPTS) == 512
-        assert len(HARMLESS_PROMPTS) == 512
+    def test_builtin_prompt_count_matches_registry(self):
+        """The canonical corpus and its public registry stay in sync."""
+        expected = DATASET_SOURCES["builtin"].estimated_count
+        assert expected == 842
+        assert len(HARMFUL_PROMPTS) == expected
+        assert len(HARMLESS_PROMPTS) == expected
 
     def test_prompt_volume_slicing(self):
         """Slicing at standard volumes gives correct counts."""
-        for n in (33, 66, 99, 256, 512):
+        for n in (33, 66, 99, 256, 512, 842):
             assert len(HARMFUL_PROMPTS[:n]) == n
             assert len(HARMLESS_PROMPTS[:n]) == n
+
+    def test_builtin_volume_labels_share_the_canonical_registry(self):
+        labels = get_valid_volumes("builtin")
+        assert labels == list(PROMPT_VOLUME_OPTIONS)
+        assert PROMPT_VOLUME_OPTIONS["512 (large)"] == 512
+        assert PROMPT_VOLUME_OPTIONS["842 (built-in max)"] == 842
 
 
 class TestStages:
@@ -129,7 +145,22 @@ class TestStages:
 
 class TestMethods:
     def test_methods_exist(self):
-        assert set(METHODS.keys()) == {"basic", "advanced", "aggressive", "informed", "surgical", "inverted", "nuclear", "optimized", "failspy", "gabliteration", "heretic", "rdo", "spectral_cascade"}
+        assert set(METHODS.keys()) == {
+            "basic",
+            "advanced",
+            "aggressive",
+            "informed",
+            "surgical",
+            "inverted",
+            "nuclear",
+            "optimized",
+            "failspy",
+            "gabliteration",
+            "heretic",
+            "rdo",
+            "spectral_cascade",
+            "som",
+        }
 
     def test_basic_single_direction(self):
         cfg = METHODS["basic"]
@@ -137,6 +168,15 @@ class TestMethods:
         assert cfg["norm_preserve"] is False
         assert cfg["regularization"] == 0.0
         assert cfg["refinement_passes"] == 1
+
+    def test_projection_target_defaults_to_writer_baseline(self):
+        pipeline = AbliterationPipeline(model_name="test", method="advanced")
+        assert pipeline.projection_target == "output"
+
+        explicitly_broad = AbliterationPipeline(
+            model_name="test", method="advanced", projection_target="all",
+        )
+        assert explicitly_broad.projection_target == "all"
 
     def test_advanced_multi_direction(self):
         cfg = METHODS["advanced"]
@@ -235,32 +275,91 @@ class TestPipelineInit:
 # ---------------------------------------------------------------------------
 
 class TestProjectOutAdvanced:
+    def test_square_attention_projections_use_explicit_orientation(self):
+        """Square q_proj and o_proj must project opposite matrix sides."""
+        hidden = 4
+
+        class FakeAttn(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = torch.nn.Linear(hidden, hidden, bias=False)
+                self.o_proj = torch.nn.Linear(hidden, hidden, bias=False)
+
+        attn = FakeAttn()
+        W_orig = torch.arange(1, hidden * hidden + 1, dtype=torch.float32).reshape(
+            hidden, hidden,
+        )
+        attn.q_proj.weight.data.copy_(W_orig)
+        attn.o_proj.weight.data.copy_(W_orig)
+        direction = torch.tensor([[1.0], [2.0], [-1.0], [0.5]])
+        direction /= direction.norm()
+
+        AbliterationPipeline._project_out_advanced(
+            attn, direction, ["q_proj"], orientation="input",
+        )
+        AbliterationPipeline._project_out_advanced(
+            attn, direction, ["o_proj"], orientation="output",
+        )
+
+        expected_q = W_orig - (W_orig @ direction) @ direction.T
+        expected_o = W_orig - direction @ (direction.T @ W_orig)
+        assert torch.allclose(attn.q_proj.weight.data, expected_q, atol=1e-6)
+        assert torch.allclose(attn.o_proj.weight.data, expected_o, atol=1e-6)
+        assert not torch.allclose(expected_q, expected_o)
+        assert torch.allclose(
+            attn.q_proj.weight.data @ direction,
+            torch.zeros(hidden, 1),
+            atol=1e-5,
+        )
+        assert torch.allclose(
+            direction.T @ attn.o_proj.weight.data,
+            torch.zeros(1, hidden),
+            atol=1e-5,
+        )
+
+    def test_orientation_is_required_and_validated(self):
+        class Wrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(4, 4, bias=False)
+
+        module = Wrapper()
+        direction = torch.nn.functional.normalize(torch.randn(4, 1), dim=0)
+
+        with pytest.raises(TypeError, match="orientation"):
+            AbliterationPipeline._project_out_advanced(
+                module, direction, ["proj"],
+            )
+        with pytest.raises(ValueError, match="orientation"):
+            AbliterationPipeline._project_out_advanced(
+                module, direction, ["proj"], orientation="auto",
+            )
+
     def test_norm_preserving(self):
         """Norm-preserving mode should keep Frobenius norm constant."""
         class Wrapper(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.o_proj = torch.nn.Linear(4, 8, bias=False)
+                self.q_proj = torch.nn.Linear(4, 8, bias=False)
 
         module = Wrapper()
         torch.manual_seed(42)
-        module.o_proj.weight.data = torch.randn(8, 4)
-        original_norm = module.o_proj.weight.data.norm().item()
+        module.q_proj.weight.data = torch.randn(8, 4)
+        original_norm = module.q_proj.weight.data.norm().item()
 
         direction = torch.randn(4, 1)
         direction = direction / direction.norm()
 
         AbliterationPipeline._project_out_advanced(
-            module, direction, ["o_proj"], norm_preserve=True, regularization=0.0
+            module, direction, ["q_proj"], orientation="input",
+            norm_preserve=True, regularization=0.0,
         )
 
-        new_norm = module.o_proj.weight.data.norm().item()
+        new_norm = module.q_proj.weight.data.norm().item()
         # With amplification cap (1.10x max), exact norm preservation isn't
         # guaranteed on tiny matrices (hidden_dim=4) where a single direction
-        # removes a large fraction of energy.  Verify the norm is closer to
-        # original than the un-preserved norm would be (i.e. cap is working).
-        without_preserve_norm_sq = original_norm ** 2 - (module.o_proj.weight.data @ direction).pow(2).sum().item()
-        # The new norm should be >= the un-preserved norm (cap restores some)
+        # removes a large fraction of energy. Verify the cap avoids severe
+        # norm collapse.
         assert new_norm >= original_norm * 0.85, \
             f"Norm should be approximately preserved (within cap): {original_norm:.4f} vs {new_norm:.4f}"
 
@@ -269,29 +368,31 @@ class TestProjectOutAdvanced:
         class Wrapper(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.o_proj = torch.nn.Linear(4, 8, bias=False)
+                self.q_proj = torch.nn.Linear(4, 8, bias=False)
 
         module_full = Wrapper()
         module_reg = Wrapper()
         torch.manual_seed(42)
         W_orig = torch.randn(8, 4)
-        module_full.o_proj.weight.data = W_orig.clone()
-        module_reg.o_proj.weight.data = W_orig.clone()
+        module_full.q_proj.weight.data = W_orig.clone()
+        module_reg.q_proj.weight.data = W_orig.clone()
 
         direction = torch.randn(4, 1)
         direction = direction / direction.norm()
 
         # Full removal
         AbliterationPipeline._project_out_advanced(
-            module_full, direction, ["o_proj"], norm_preserve=False, regularization=0.0
+            module_full, direction, ["q_proj"], orientation="input",
+            norm_preserve=False, regularization=0.0,
         )
         # Regularized (30% preserved)
         AbliterationPipeline._project_out_advanced(
-            module_reg, direction, ["o_proj"], norm_preserve=False, regularization=0.3
+            module_reg, direction, ["q_proj"], orientation="input",
+            norm_preserve=False, regularization=0.3,
         )
 
-        W_full = module_full.o_proj.weight.data
-        W_reg = module_reg.o_proj.weight.data
+        W_full = module_full.q_proj.weight.data
+        W_reg = module_reg.q_proj.weight.data
 
         # Full removal should have zero projection on direction
         proj_full = (W_full @ direction).norm().item()
@@ -321,7 +422,8 @@ class TestProjectOutAdvanced:
         direction = direction / direction.norm()
 
         AbliterationPipeline._project_out_advanced(
-            module, direction, ["c_proj"], norm_preserve=True, regularization=0.0
+            module, direction, ["c_proj"], orientation="output",
+            norm_preserve=True, regularization=0.0,
         )
 
         new_norm = module.c_proj.weight.data.norm().item()
@@ -366,7 +468,10 @@ class TestAttentionFullProjection:
 
         from obliteratus.abliterate import _ATTN_OUT_NAMES, _ATTN_IN_NAMES
         count = AbliterationPipeline._project_out_advanced(
-            attn, d, _ATTN_OUT_NAMES + _ATTN_IN_NAMES,
+            attn, d, _ATTN_OUT_NAMES, orientation="output",
+        )
+        count += AbliterationPipeline._project_out_advanced(
+            attn, d, _ATTN_IN_NAMES, orientation="input",
         )
 
         assert count == 4, f"Should project 4 weights (q/k/v/o), got {count}"
@@ -394,11 +499,78 @@ class TestAttentionFullProjection:
         d = d / d.norm()
 
         from obliteratus.abliterate import _FFN_IN_NAMES
-        count = AbliterationPipeline._project_out_advanced(mod, d, _FFN_IN_NAMES)
+        count = AbliterationPipeline._project_out_advanced(
+            mod, d, _FFN_IN_NAMES, orientation="input",
+        )
 
         assert count == 2, f"Should project both up_proj and gate_proj, got {count}"
         assert not torch.allclose(mod.up_proj.weight.data, orig_up), "up_proj should be modified"
         assert not torch.allclose(mod.gate_proj.weight.data, orig_gate), "gate_proj should be modified"
+
+    def test_current_mla_and_fused_ffn_aliases_are_projected(self):
+        """DeepSeek V4 and fused-gate FFN names must not be silently skipped."""
+        hidden = 16
+
+        class FakeCurrentBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.o_b_proj = torch.nn.Linear(hidden, hidden, bias=False)
+                self.q_a_proj = torch.nn.Linear(hidden, 8, bias=False)
+                self.kv_proj = torch.nn.Linear(hidden, 8, bias=False)
+                self.gate_up_proj = torch.nn.Linear(hidden, 32, bias=False)
+
+        block = FakeCurrentBlock()
+        originals = {
+            name: getattr(block, name).weight.detach().clone()
+            for name in ("o_b_proj", "q_a_proj", "kv_proj", "gate_up_proj")
+        }
+        direction = torch.randn(hidden, 1)
+        direction /= direction.norm()
+
+        from obliteratus.abliterate import (
+            _ATTN_IN_NAMES,
+            _ATTN_OUT_NAMES,
+            _FFN_IN_NAMES,
+        )
+
+        count = AbliterationPipeline._project_out_advanced(
+            block, direction, _ATTN_OUT_NAMES, orientation="output",
+        )
+        count += AbliterationPipeline._project_out_advanced(
+            block, direction, _ATTN_IN_NAMES, orientation="input",
+        )
+        count += AbliterationPipeline._project_out_advanced(
+            block, direction, _FFN_IN_NAMES, orientation="input",
+        )
+
+        assert count == 4
+        for name, original in originals.items():
+            assert not torch.allclose(getattr(block, name).weight, original), name
+
+    def test_fused_moe_gate_up_parameter_is_projected(self):
+        """Modern HF MoE experts fuse gate/up matrices into one 3-D tensor."""
+        hidden = 8
+
+        class FakeExperts(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_up_proj = torch.nn.Parameter(torch.randn(3, 16, hidden))
+
+        experts = FakeExperts()
+        original = experts.gate_up_proj.detach().clone()
+        direction = torch.randn(hidden, 1)
+        direction /= direction.norm()
+
+        count = AbliterationPipeline._project_fused_3d(
+            experts,
+            direction,
+            ["gate_up_proj", "up_proj", "gate_proj", "w1", "w3"],
+            norm_preserve=False,
+            scale=1.0,
+        )
+
+        assert count == 3
+        assert not torch.allclose(experts.gate_up_proj, original)
 
     def test_lm_head_projection(self):
         """lm_head should be projectable via _project_out_advanced."""
@@ -418,7 +590,7 @@ class TestAttentionFullProjection:
         d = d / d.norm()
 
         count = AbliterationPipeline._project_out_advanced(
-            model, d, ["lm_head"], regularization=0.0,
+            model, d, ["lm_head"], orientation="input", regularization=0.0,
         )
 
         assert count == 1, "Should project lm_head"
@@ -469,7 +641,7 @@ class TestProjectMoEExperts:
             @staticmethod
             def _make_expert():
                 m = torch.nn.Module()
-                m.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                m.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 m.up_proj = torch.nn.Linear(hidden, 32, bias=False)
                 return m
 
@@ -497,7 +669,7 @@ class TestProjectMoEExperts:
                 super().__init__()
                 self.gate = torch.nn.Linear(hidden, 2, bias=False)
                 self.shared_expert = torch.nn.Module()
-                self.shared_expert.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.shared_expert.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.shared_expert.up_proj = torch.nn.Linear(hidden, 32, bias=False)
                 self.experts = torch.nn.ModuleList([
                     self._make_expert() for _ in range(2)
@@ -506,7 +678,7 @@ class TestProjectMoEExperts:
             @staticmethod
             def _make_expert():
                 m = torch.nn.Module()
-                m.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                m.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 m.up_proj = torch.nn.Linear(hidden, 32, bias=False)
                 return m
 
@@ -531,7 +703,7 @@ class TestProjectMoEExperts:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.up_proj = torch.nn.Linear(hidden, 32, bias=False)
                 self.gate_proj = torch.nn.Linear(hidden, 32, bias=False)
 
@@ -641,7 +813,7 @@ class TestProjectMoEExperts:
             @staticmethod
             def _make_expert():
                 m = torch.nn.Module()
-                m.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                m.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 return m
 
         moe = FakeMoE()
@@ -678,7 +850,7 @@ class TestProjectMoEExperts:
             @staticmethod
             def _make_expert():
                 m = torch.nn.Module()
-                m.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                m.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 return m
 
         moe = FakeMoE()
@@ -707,7 +879,7 @@ class TestProjectMoEExperts:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.up_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         class FakeMoE(torch.nn.Module):
@@ -715,7 +887,7 @@ class TestProjectMoEExperts:
                 super().__init__()
                 self.gate = torch.nn.Linear(hidden, 4, bias=False)
                 self.shared_expert = torch.nn.Module()
-                self.shared_expert.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.shared_expert.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.shared_expert.up_proj = torch.nn.Linear(hidden, 32, bias=False)
                 self.experts = torch.nn.ModuleList([FakeExpert() for _ in range(4)])
 
@@ -1077,7 +1249,14 @@ class TestSAEAbliteration:
         torch.manual_seed(42)
         acts = [torch.randn(hidden) for _ in range(64)]
 
-        sae = train_sae(acts, hidden, expansion=2, n_epochs=10, lr=1e-3)
+        sae = train_sae(
+            acts,
+            hidden,
+            expansion=2,
+            n_epochs=10,
+            lr=1e-3,
+            device="cpu",
+        )
 
         # Forward pass should work
         x = torch.randn(1, hidden)
@@ -1224,11 +1403,11 @@ class TestInvertedMethod:
         class Wrapper(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.o_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.q_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         module = Wrapper()
         torch.manual_seed(42)
-        W_orig = module.o_proj.weight.data.clone()
+        W_orig = module.q_proj.weight.data.clone()
 
         d = torch.randn(hidden, 1)
         d = d / d.norm()
@@ -1238,10 +1417,10 @@ class TestInvertedMethod:
 
         # Reflection: regularization=-1.0 → scale=2.0
         AbliterationPipeline._project_out_advanced(
-            module, d, ["o_proj"], regularization=-1.0,
+            module, d, ["q_proj"], orientation="input", regularization=-1.0,
         )
 
-        W_reflected = module.o_proj.weight.data
+        W_reflected = module.q_proj.weight.data
         new_proj = (W_reflected @ d).squeeze()
 
         # After reflection, projection should be NEGATED (sign flipped)
@@ -1256,11 +1435,11 @@ class TestInvertedMethod:
         class Wrapper(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.o_proj = torch.nn.Linear(hidden, 16, bias=False)
+                self.q_proj = torch.nn.Linear(hidden, 16, bias=False)
 
         module = Wrapper()
         torch.manual_seed(42)
-        W_orig = module.o_proj.weight.data.clone()
+        W_orig = module.q_proj.weight.data.clone()
 
         d = torch.randn(hidden, 1)
         d = d / d.norm()
@@ -1270,10 +1449,10 @@ class TestInvertedMethod:
         orig_ortho = W_orig - orig_d_component  # everything except d-component
 
         AbliterationPipeline._project_out_advanced(
-            module, d, ["o_proj"], regularization=-1.0,
+            module, d, ["q_proj"], orientation="input", regularization=-1.0,
         )
 
-        W_reflected = module.o_proj.weight.data
+        W_reflected = module.q_proj.weight.data
         new_d_component = (W_reflected @ d) @ d.T
         new_ortho = W_reflected - new_d_component
 
@@ -1387,6 +1566,7 @@ class TestInvertedMethod:
         }
 
         orig_router = moe.gate.weight.data.clone()
+        orig_safety = moe.experts[0].down_proj.weight.data.clone()
 
         count = pipeline._project_moe_experts_inverted(
             moe, d, 0, norm_preserve=False, project_biases=False,
@@ -1409,13 +1589,16 @@ class TestInvertedMethod:
             f"Router projection should be at least partially reflected, cosine={cosine.item():.3f}"
         )
 
-        # Safety expert 0: should be reflected (projection negated)
-        e0_proj = (moe.experts[0].down_proj.weight.data @ d).norm()
-        # After reflection the projection doesn't go to zero — it negates
-        assert e0_proj > 1e-4, "Safety expert should have non-zero projection (reflected, not removed)"
+        # Safety expert 0 is an output writer, so its left-side refusal
+        # component should be reflected (negated), not right-projected.
+        e0_before = d.T @ orig_safety
+        e0_after = d.T @ moe.experts[0].down_proj.weight.data
+        assert torch.allclose(e0_after, -e0_before, atol=1e-4), (
+            "Safety expert output component should be reflected"
+        )
 
-        # Capability expert 3: should have projection removed (near zero)
-        e3_proj = (moe.experts[3].down_proj.weight.data @ d).norm().item()
+        # Capability expert 3: its output-side component should be removed.
+        e3_proj = (d.T @ moe.experts[3].down_proj.weight.data).norm().item()
         assert e3_proj < 1e-3, f"Capability expert should have projection removed, got {e3_proj}"
 
 
@@ -1431,9 +1614,9 @@ class TestNuclearMethod:
         assert cfg["n_directions"] == 4  # fewer than inverted to avoid over-ablation
         assert cfg["refinement_passes"] == 2  # same as inverted
         assert cfg["reflection_strength"] == 1.25  # tempered for CoT coherence
-        assert cfg["project_embeddings"] is True
+        assert cfg["project_embeddings"] is False
         assert cfg["embed_regularization"] == 0.50  # conservative cascade limit
-        assert cfg["activation_steering"] is True  # residual cleanup hooks
+        assert cfg["activation_steering"] is False  # hooks are not serializable
         assert cfg["steering_strength"] == 0.15  # light residual correction
         assert cfg["expert_transplant"] is True
         assert cfg["transplant_blend"] == 0.10  # gentle nudge, not overwrite
@@ -1448,8 +1631,8 @@ class TestNuclearMethod:
         assert pipeline.reflection_strength == 1.25
         assert pipeline.embed_regularization == 0.50
         assert pipeline.transplant_blend == 0.10
-        assert pipeline.project_embeddings is True
-        assert pipeline.activation_steering is True  # residual cleanup
+        assert pipeline.project_embeddings is False
+        assert pipeline.activation_steering is False
         assert pipeline.expert_transplant is True
         assert pipeline.n_directions == 4
         assert pipeline.refinement_passes == 2
@@ -1474,7 +1657,7 @@ class TestNuclearMethod:
         class Wrapper(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.o_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.q_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         d = torch.randn(hidden, 1)
         d = d / d.norm()
@@ -1482,20 +1665,22 @@ class TestNuclearMethod:
         # 2x reflection
         module_2x = Wrapper()
         torch.manual_seed(42)
-        module_2x.o_proj.weight.data = torch.randn(32, hidden)
-        orig = module_2x.o_proj.weight.data.clone()
+        module_2x.q_proj.weight.data = torch.randn(32, hidden)
+        orig = module_2x.q_proj.weight.data.clone()
         AbliterationPipeline._project_out_advanced(
-            module_2x, d, ["o_proj"], regularization=-1.0,  # scale=2.0
+            module_2x, d, ["q_proj"], orientation="input",
+            regularization=-1.0,  # scale=2.0
         )
-        proj_2x = (module_2x.o_proj.weight.data @ d).squeeze()
+        proj_2x = (module_2x.q_proj.weight.data @ d).squeeze()
 
         # 2.5x reflection
         module_25x = Wrapper()
-        module_25x.o_proj.weight.data = orig.clone()
+        module_25x.q_proj.weight.data = orig.clone()
         AbliterationPipeline._project_out_advanced(
-            module_25x, d, ["o_proj"], regularization=-1.5,  # scale=2.5
+            module_25x, d, ["q_proj"], orientation="input",
+            regularization=-1.5,  # scale=2.5
         )
-        proj_25x = (module_25x.o_proj.weight.data @ d).squeeze()
+        proj_25x = (module_25x.q_proj.weight.data @ d).squeeze()
 
         # 2.5x should be 25% stronger negation than 2x
         assert proj_25x.norm() > proj_2x.norm(), (
@@ -1714,10 +1899,7 @@ class TestActivationCollection:
         layers = get_layer_modules(handle)
         prompts = ["Hello world", "Test prompt"]
 
-        handle.tokenizer.return_value = {
-            "input_ids": torch.randint(0, 1000, (1, 5)),
-            "attention_mask": torch.ones(1, 5, dtype=torch.long),
-        }
+        _make_varied_tokenizer(handle)
 
         activations = pipeline._collect_activations(layers, prompts, "test")
 
@@ -1820,6 +2002,7 @@ class TestExcise:
         pipeline._on_log = lambda m: None
         pipeline._on_stage = lambda r: None
         _make_varied_tokenizer(handle)
+        pipeline._prepare_projection_manifests()
 
         layers = get_layer_modules(handle)
         original_weights = {}
@@ -1854,6 +2037,7 @@ class TestExcise:
         pipeline._on_log = lambda m: None
         pipeline._on_stage = lambda r: None
         _make_varied_tokenizer(handle)
+        pipeline._prepare_projection_manifests()
 
         get_layer_modules(handle)
 
@@ -1876,6 +2060,7 @@ class TestRebirth:
             model_name="test-model",
             output_dir=str(tmp_path / "output"),
             method="advanced",
+            damage_gate_enabled=False,
         )
         pipeline.handle = handle
         pipeline._on_log = lambda m: None
@@ -1883,7 +2068,12 @@ class TestRebirth:
         pipeline._strong_layers = [0]
         pipeline._quality_metrics = {"perplexity": 8.5, "coherence": 1.0}
 
-        handle.model.save_pretrained = MagicMock()
+        def save_minimal_checkpoint(path, **_kwargs):
+            path = Path(path)
+            (path / "config.json").write_text("{}")
+            (path / "pytorch_model.bin").write_bytes(b"weights")
+
+        handle.model.save_pretrained = MagicMock(side_effect=save_minimal_checkpoint)
         handle.tokenizer.save_pretrained = MagicMock()
 
         result_path = pipeline._rebirth()
@@ -2244,7 +2434,7 @@ class TestProjectMoEExpertsGranular:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.up_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         class FakeMoE(torch.nn.Module):
@@ -2297,7 +2487,7 @@ class TestProjectMoEExpertsGranular:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.up_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         class FakeMoE(torch.nn.Module):
@@ -2339,7 +2529,7 @@ class TestProjectMoEExpertsGranular:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
 
         class FakeMoE(torch.nn.Module):
             def __init__(self):
@@ -2373,7 +2563,7 @@ class TestProjectMoEExpertsGranular:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.up_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         class FakeMoE(torch.nn.Module):
@@ -2381,7 +2571,7 @@ class TestProjectMoEExpertsGranular:
                 super().__init__()
                 self.gate = torch.nn.Linear(hidden, 2, bias=False)
                 self.shared_expert = torch.nn.Module()
-                self.shared_expert.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.shared_expert.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.shared_expert.up_proj = torch.nn.Linear(hidden, 32, bias=False)
                 self.experts = torch.nn.ModuleList([FakeExpert() for _ in range(2)])
 
@@ -2541,14 +2731,15 @@ class TestEGAExciseIntegration:
         assert pipeline.per_expert_directions is True
 
     def test_ega_only_on_primary_direction(self):
-        """EGA should only apply for dir_idx==0, not higher SVD directions."""
-        # This is enforced by the `and dir_idx == 0` check in _excise
-        # We verify the code structure exists
+        """EGA should only apply for direction_index==0 in manifest execution."""
+        # The strict manifest executor replaced the legacy singular-FFN call.
+        # Verify its per-expert direction gate still limits EGA to the primary
+        # SVD direction.
         from obliteratus.abliterate import AbliterationPipeline
         import inspect
-        source = inspect.getsource(AbliterationPipeline._excise_inner)
-        assert "dir_idx == 0" in source, "EGA should only apply for primary direction"
-        assert "_project_moe_experts_granular" in source, "EGA method should be called in excise"
+        source = inspect.getsource(AbliterationPipeline._project_manifest_entry)
+        assert "direction_index == 0" in source
+        assert "_expert_directions" in source
 
     def test_ega_distill_integration(self):
         """EGA should be called during distill when per_expert_directions is enabled."""
@@ -2583,7 +2774,7 @@ class TestEGAExciseIntegration:
         class FakeExpert(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.down_proj = torch.nn.Linear(hidden, 32, bias=False)
+                self.down_proj = torch.nn.Linear(32, hidden, bias=False)
                 self.up_proj = torch.nn.Linear(hidden, 32, bias=False)
 
         class FakeMoE(torch.nn.Module):

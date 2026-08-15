@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from obliteratus.abliterate import METHODS, AbliterationPipeline
 from obliteratus.informed_pipeline import (
+    INFORMED_METHOD,
     AnalysisInsights,
     InformedAbliterationPipeline,
     InformedPipelineReport,
-    INFORMED_METHOD,
 )
-from obliteratus.abliterate import METHODS
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -50,7 +50,8 @@ class TestAnalysisInsights:
         assert insights.cluster_count == 0
         assert insights.direction_persistence == 0.0
         assert insights.use_sparse_surgery is False
-        assert insights.recommended_n_directions == 4
+        assert insights.recommended_n_directions == 1
+        assert insights.recommended_direction_method == "diff_means"
         assert insights.recommended_regularization == 0.0
         assert insights.recommended_refinement_passes == 2
         assert insights.recommended_layers == []
@@ -71,7 +72,7 @@ class TestInformedPipelineReport:
         assert report.analysis_duration == 0.0
         assert report.total_duration == 0.0
         assert report.ouroboros_passes == 0
-        assert report.final_refusal_rate == 0.0
+        assert report.final_refusal_rate is None
         assert report.stages == []
 
 
@@ -86,12 +87,15 @@ class TestInformedMethod:
         assert cfg["norm_preserve"] is True
         assert cfg["project_biases"] is True
         assert cfg["use_chat_template"] is True
-        assert cfg["use_whitened_svd"] is True
+        assert cfg["n_directions"] == 1
+        assert cfg["direction_method"] == "diff_means"
+        assert cfg["use_whitened_svd"] is False
         assert cfg["true_iterative_refinement"] is True
 
     def test_informed_method_standalone(self):
         assert INFORMED_METHOD["label"] == "Informed (Analysis-Guided)"
-        assert INFORMED_METHOD["n_directions"] == 4
+        assert INFORMED_METHOD["n_directions"] == 1
+        assert INFORMED_METHOD["direction_method"] == "diff_means"
         assert INFORMED_METHOD["norm_preserve"] is True
 
 
@@ -114,6 +118,14 @@ class TestPipelineInit:
         assert pipeline._ouroboros_threshold == 0.5
         assert pipeline._max_ouroboros_passes == 3
 
+    def test_informed_keeps_deterministic_path_when_bayesian_is_disabled(self, pipeline):
+        pipeline._configure_bayesian_warm_start()
+
+        assert pipeline._bayesian_trials == 0
+        assert pipeline.layer_adaptive_strength is True
+        assert pipeline.float_layer_interpolation is True
+        assert pipeline.use_kl_optimization is False
+
     def test_entanglement_gate(self, pipeline):
         assert pipeline._entanglement_gate == 0.8
 
@@ -121,8 +133,18 @@ class TestPipelineInit:
         assert pipeline.norm_preserve is True
         assert pipeline.project_biases is True
         assert pipeline.use_chat_template is True
-        assert pipeline.use_whitened_svd is True
+        assert pipeline.n_directions == 1
+        assert pipeline.direction_method == "diff_means"
+        assert pipeline.use_whitened_svd is False
         assert pipeline.true_iterative_refinement is True
+
+    def test_projection_target_is_forwarded_to_base_pipeline(self):
+        pipeline = InformedAbliterationPipeline(
+            model_name="test",
+            projection_target="all",
+        )
+
+        assert pipeline.projection_target == "all"
 
     def test_custom_flags(self):
         p = InformedAbliterationPipeline(
@@ -165,14 +187,16 @@ class TestConfigurationDerivation:
         # Polyhedral with dim 3.5 → n_dirs = max(4, min(8, int(3.5*2))) = 7
         assert p.n_directions == 7
 
-    def test_linear_cone_fewer_directions(self):
+    def test_linear_cone_uses_single_difference_of_means(self):
         p = self._make_pipeline_with_insights(
             cone_is_polyhedral=False,
             cone_dimensionality=1.0,
         )
         p._derive_configuration()
-        # Linear with dim 1.0 → n_dirs = max(1, min(4, int(1.0+1))) = 2
-        assert p.n_directions == 2
+        # Linear geometry does not justify a higher-dimensional subspace.
+        assert p.n_directions == 1
+        assert p.direction_method == "diff_means"
+        assert p.use_whitened_svd is False
 
     def test_dpo_zero_regularization(self):
         p = self._make_pipeline_with_insights(
@@ -383,3 +407,248 @@ class TestEdgeCases:
         p._insights.cone_dimensionality = 0.1
         p._derive_configuration()
         assert p.n_directions >= 1  # at least 1
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed informed orchestration
+# ---------------------------------------------------------------------------
+
+class TestFailClosedInformedOrchestration:
+    @staticmethod
+    def _assessment(*, damage_accepted=True, accepted=True):
+        return SimpleNamespace(
+            damage_accepted=damage_accepted,
+            efficacy_accepted=accepted,
+            accepted=accepted,
+        )
+
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_each_excise_call_applies_one_persistent_pass_and_removes_hooks(
+        self,
+        pipeline,
+        monkeypatch,
+        sparse,
+    ):
+        class FakeHook:
+            def __init__(self):
+                self.removed = False
+
+            def remove(self):
+                self.removed = True
+
+        hook = FakeHook()
+        observed_pass_counts = []
+        pipeline.refinement_passes = 3
+        pipeline._insights.use_sparse_surgery = sparse
+        monkeypatch.setattr(
+            pipeline,
+            "_configure_bayesian_warm_start",
+            lambda: None,
+        )
+
+        def edit_once():
+            observed_pass_counts.append(pipeline.refinement_passes)
+            pipeline._steering_hooks.append(hook)
+
+        target = "_excise_sparse" if sparse else "_excise"
+        monkeypatch.setattr(pipeline, target, edit_once)
+
+        pipeline._excise_informed()
+
+        assert observed_pass_counts == [1]
+        assert pipeline.refinement_passes == 3
+        assert hook.removed is True
+        assert pipeline._steering_hooks == []
+
+    def test_excise_failure_still_restores_configuration_and_removes_hooks(
+        self,
+        pipeline,
+        monkeypatch,
+    ):
+        class FakeHook:
+            removed = False
+
+            def remove(self):
+                self.removed = True
+
+        hook = FakeHook()
+        pipeline.refinement_passes = 3
+        pipeline._insights.use_sparse_surgery = False
+        monkeypatch.setattr(
+            pipeline,
+            "_configure_bayesian_warm_start",
+            lambda: None,
+        )
+
+        def fail_during_edit():
+            pipeline._steering_hooks.append(hook)
+            raise RuntimeError("edit failed")
+
+        monkeypatch.setattr(pipeline, "_excise", fail_during_edit)
+
+        with pytest.raises(RuntimeError, match="edit failed"):
+            pipeline._excise_informed()
+
+        assert pipeline.refinement_passes == 3
+        assert hook.removed is True
+        assert pipeline._steering_hooks == []
+
+    def test_every_compensation_edit_is_followed_by_verification(
+        self,
+        pipeline,
+        monkeypatch,
+    ):
+        rates = iter([0.8, 0.4, 0.1])
+        events = []
+        pipeline._strong_layers = [1]
+        pipeline._max_ouroboros_passes = 2
+
+        def verify():
+            rate = next(rates)
+            pipeline._quality_metrics.update(
+                {
+                    "refusal_rate": rate,
+                    "refusal_eval_count": 30,
+                    # A missing compatibility alias must not crash logging.
+                    "kl_divergence": None,
+                }
+            )
+            events.append(("verify", rate))
+            return self._assessment(accepted=rate <= 0.2)
+
+        monkeypatch.setattr(pipeline, "_verify", verify)
+        monkeypatch.setattr(pipeline, "_probe", lambda: events.append(("probe", None)))
+        monkeypatch.setattr(
+            pipeline,
+            "_distill_inner",
+            lambda: events.append(("distill", None)),
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "_excise_informed",
+            lambda: events.append(("edit", None)),
+        )
+        monkeypatch.setattr(pipeline, "_remove_activation_steering", lambda: 0)
+
+        assessment = pipeline._verify_and_compensate()
+
+        assert assessment.accepted is True
+        assert [event for event, _ in events].count("edit") == 2
+        assert [event for event, _ in events].count("verify") == 3
+        assert events[-1] == ("verify", 0.1)
+        assert pipeline._report.ouroboros_passes == 2
+        assert pipeline._report.final_refusal_rate == pytest.approx(0.1)
+
+    def test_missing_refusal_evidence_rejects_without_another_edit(
+        self,
+        pipeline,
+        monkeypatch,
+    ):
+        class Rejected(RuntimeError):
+            pass
+
+        edits = []
+        assessment = self._assessment(accepted=False)
+        pipeline._quality_metrics.update(
+            {"refusal_rate": None, "refusal_eval_count": None}
+        )
+        monkeypatch.setattr(pipeline, "_verify", lambda: assessment)
+        monkeypatch.setattr(
+            pipeline,
+            "_excise_informed",
+            lambda: edits.append("edit"),
+        )
+
+        def reject(candidate):
+            assert candidate is assessment
+            raise Rejected("rejected")
+
+        monkeypatch.setattr(pipeline, "_reject_and_restore", reject)
+
+        with pytest.raises(Rejected, match="rejected"):
+            pipeline._verify_and_compensate()
+
+        assert edits == []
+
+    def test_damage_failure_rejects_before_compensation(self, pipeline, monkeypatch):
+        class Rejected(RuntimeError):
+            pass
+
+        edits = []
+        assessment = self._assessment(damage_accepted=False, accepted=False)
+        monkeypatch.setattr(pipeline, "_verify", lambda: assessment)
+        monkeypatch.setattr(
+            pipeline,
+            "_excise_informed",
+            lambda: edits.append("edit"),
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "_reject_and_restore",
+            lambda candidate: (_ for _ in ()).throw(Rejected("damage")),
+        )
+
+        with pytest.raises(Rejected, match="damage"):
+            pipeline._verify_and_compensate()
+
+        assert edits == []
+
+    def test_run_captures_baseline_before_edit_and_does_not_save_on_rejection(
+        self,
+        pipeline,
+        monkeypatch,
+    ):
+        events = []
+        monkeypatch.setattr(pipeline, "_remove_activation_steering", lambda: 0)
+        for name in ("_summon", "_probe", "_analyze", "_distill_informed"):
+            monkeypatch.setattr(
+                pipeline,
+                name,
+                lambda stage=name: events.append(stage),
+            )
+        monkeypatch.setattr(
+            pipeline,
+            "_capture_damage_baseline",
+            lambda: events.append("baseline"),
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "_excise_informed",
+            lambda: events.append("edit"),
+        )
+
+        def reject():
+            events.append("verify")
+            raise RuntimeError("gate rejected")
+
+        monkeypatch.setattr(pipeline, "_verify_and_compensate", reject)
+        monkeypatch.setattr(
+            pipeline,
+            "_rebirth_informed",
+            lambda: events.append("save"),
+        )
+
+        with pytest.raises(RuntimeError, match="gate rejected"):
+            pipeline.run_informed()
+
+        assert events.index("baseline") < events.index("edit")
+        assert events.index("edit") < events.index("verify")
+        assert "save" not in events
+
+    def test_rebirth_delegates_to_transactional_base_path(
+        self,
+        pipeline,
+        monkeypatch,
+        tmp_path,
+    ):
+        expected = tmp_path / "published"
+        calls = []
+
+        def base_rebirth(instance):
+            calls.append(instance)
+            return expected
+
+        monkeypatch.setattr(AbliterationPipeline, "_rebirth", base_rebirth)
+
+        assert pipeline._rebirth_informed() == expected
+        assert calls == [pipeline]

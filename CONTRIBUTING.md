@@ -15,7 +15,7 @@ This installs the package in editable mode with test dependencies (pytest, ruff)
 ## Running Tests
 
 ```bash
-pytest                    # full suite (823 tests)
+pytest                    # full suite (1,000+ tests)
 pytest tests/test_abliterate.py  # single file
 pytest -x                 # stop on first failure
 pytest -k "test_name"     # run specific test

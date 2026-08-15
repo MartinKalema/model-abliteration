@@ -461,6 +461,17 @@ def get_source_key_from_label(label: str) -> str:
     return "builtin"
 
 
+PROMPT_VOLUME_OPTIONS = {
+    "33 (fast)": 33,
+    "66 (better signal)": 66,
+    "99 (classic)": 99,
+    "256 (balanced)": 256,
+    "512 (large)": 512,
+    "842 (built-in max)": 842,
+    "all (use entire dataset)": -1,
+}
+
+
 def get_valid_volumes(source_key: str) -> list[str]:
     """Return the prompt volume choices that are valid for a given dataset source.
 
@@ -471,26 +482,17 @@ def get_valid_volumes(source_key: str) -> list[str]:
         return ["all (use entire dataset)"]
 
     count = source.estimated_count
-    all_volumes = {
-        "33 (fast)": 33,
-        "66 (better signal)": 66,
-        "99 (classic)": 99,
-        "256 (balanced)": 256,
-        "512 (large)": 512,
-        "842 (built-in max)": 842,
-        "all (use entire dataset)": -1,
-    }
     valid = []
-    for label, n in all_volumes.items():
+    for label, n in PROMPT_VOLUME_OPTIONS.items():
         if n == -1 or n <= count:
             valid.append(label)
     return valid
 
 
-# ── Built-in prompts (backward-compatible re-export) ─────────────────────
-# These are the 842 prompts across 7 severity tiers, preserved here
-# for backward compatibility. The canonical copies remain in abliterate.py
-# and are imported here for the built-in loader.
+# ── Built-in prompts ─────────────────────────────────────────────────────
+# These are the canonical 842 prompts across 7 severity tiers.  The main
+# pipeline re-exports them as HARMFUL_PROMPTS / HARMLESS_PROMPTS for backward
+# compatibility.
 
 BUILTIN_HARMFUL = [
     # === TIER 1: Standard severity (1-33) ===

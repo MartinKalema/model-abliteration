@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 from rich.console import Console
@@ -64,6 +65,226 @@ def _add_remote_args(parser):
     )
 
 
+def _nonnegative_float(value: str) -> float:
+    """Argparse type for finite values greater than or equal to zero."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than or equal to 0")
+    return parsed
+
+
+def _unit_interval(value: str) -> float:
+    """Argparse type for finite probabilities and rates."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be a finite number between 0 and 1")
+    return parsed
+
+
+def _perplexity_ratio(value: str) -> float:
+    """Argparse type for a non-negative NLL budget expressed as a PPL ratio."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 1.0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than or equal to 1")
+    return parsed
+
+
+def _damage_eval_size(value: str) -> int:
+    """Argparse type enforcing the gate's default minimum benign sample size."""
+    parsed = int(value)
+    if parsed < 32:
+        raise argparse.ArgumentTypeError(
+            "must be at least 32 (the default damage gate requires 32 benign prompts)"
+        )
+    return parsed
+
+
+def _add_damage_safety_args(parser):
+    """Add held-out acceptance-gate and conservative checkpoint controls."""
+    group = parser.add_argument_group("model-damage acceptance and checkpoint safety")
+    gate_switch = group.add_mutually_exclusive_group()
+    gate_switch.add_argument(
+        "--damage-gate",
+        dest="damage_gate_enabled",
+        action="store_true",
+        default=True,
+        help="Require held-out damage and refusal checks before saving (default).",
+    )
+    gate_switch.add_argument(
+        "--unsafe-disable-damage-gate",
+        dest="damage_gate_enabled",
+        action="store_false",
+        help=(
+            "UNSAFE: permit saving without held-out damage/refusal acceptance. "
+            "Use only for controlled diagnostics."
+        ),
+    )
+    group.add_argument(
+        "--damage-eval-size",
+        type=_damage_eval_size,
+        default=64,
+        metavar="N",
+        help="Maximum held-out benign prompts evaluated by the gate (default: 64; minimum: 32).",
+    )
+    group.add_argument(
+        "--max-ppl-ratio",
+        type=_perplexity_ratio,
+        default=None,
+        metavar="RATIO",
+        help=(
+            "Maximum one-sided 95%% upper bound on candidate/baseline benign "
+            "perplexity (default: exp(0.05), about 1.0513)."
+        ),
+    )
+    group.add_argument(
+        "--max-sampled-token-kl",
+        type=_nonnegative_float,
+        default=None,
+        metavar="NATS",
+        help="Maximum one-sided 95%% upper bound on mean sampled-token KL (default: 0.05).",
+    )
+    group.add_argument(
+        "--max-p95-sampled-token-kl",
+        type=_nonnegative_float,
+        default=None,
+        metavar="NATS",
+        help="Maximum p95 sampled-token KL on held-out benign prompts (default: 0.20).",
+    )
+    group.add_argument(
+        "--max-top1-flip-rate",
+        type=_unit_interval,
+        default=None,
+        metavar="RATE",
+        help="Maximum benign next-token top-1 change rate (default: 0.02).",
+    )
+    group.add_argument(
+        "--max-coherence-drop",
+        type=_unit_interval,
+        default=None,
+        metavar="RATE",
+        help="Maximum baseline-relative generation coherence drop (default: 0.10).",
+    )
+    group.add_argument(
+        "--max-refusal-rate",
+        type=_unit_interval,
+        default=None,
+        metavar="RATE",
+        help="Maximum held-out refusal rate required for efficacy (default: 0.20).",
+    )
+    lm_head_switch = group.add_mutually_exclusive_group()
+    lm_head_switch.add_argument(
+        "--project-lm-head",
+        dest="project_lm_head",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Opt in to projecting the output head; tied input embeddings are protected.",
+    )
+    lm_head_switch.add_argument(
+        "--no-project-lm-head",
+        dest="project_lm_head",
+        action="store_const",
+        const=False,
+        help="Explicitly prohibit output-head projection.",
+    )
+    embedding_switch = group.add_mutually_exclusive_group()
+    embedding_switch.add_argument(
+        "--project-embeddings",
+        dest="project_embeddings",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Opt in to projecting input embeddings; this can cause broad capability drift.",
+    )
+    embedding_switch.add_argument(
+        "--no-project-embeddings",
+        dest="project_embeddings",
+        action="store_const",
+        const=False,
+        help="Explicitly prohibit input-embedding projection.",
+    )
+    group.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        default=False,
+        help="Replace an existing non-empty output only after staged checkpoint validation.",
+    )
+
+
+def _damage_pipeline_kwargs(args) -> dict:
+    """Translate CLI safety flags into ``AbliterationPipeline`` kwargs."""
+    from obliteratus.evaluation.damage_gate import (
+        AcceptanceBudget,
+        DamageBudget,
+        EfficacyBudget,
+    )
+
+    damage_overrides = {}
+    max_ppl_ratio = getattr(args, "max_ppl_ratio", None)
+    if max_ppl_ratio is not None:
+        damage_overrides["max_nll_increase_upper_ci"] = math.log(max_ppl_ratio)
+    max_sampled_kl = getattr(args, "max_sampled_token_kl", None)
+    if max_sampled_kl is not None:
+        damage_overrides["max_sampled_token_kl_upper_ci"] = max_sampled_kl
+    max_p95_kl = getattr(args, "max_p95_sampled_token_kl", None)
+    if max_p95_kl is not None:
+        damage_overrides["max_p95_sampled_token_kl"] = max_p95_kl
+    max_top1_flip = getattr(args, "max_top1_flip_rate", None)
+    if max_top1_flip is not None:
+        damage_overrides["max_top1_flip_rate"] = max_top1_flip
+    max_coherence_drop = getattr(args, "max_coherence_drop", None)
+    if max_coherence_drop is not None:
+        damage_overrides["max_coherence_drop"] = max_coherence_drop
+
+    efficacy_overrides = {}
+    max_refusal_rate = getattr(args, "max_refusal_rate", None)
+    if max_refusal_rate is not None:
+        efficacy_overrides["max_refusal_rate"] = max_refusal_rate
+
+    return {
+        "damage_gate_enabled": getattr(args, "damage_gate_enabled", True),
+        "damage_budget": AcceptanceBudget(
+            damage=DamageBudget(**damage_overrides),
+            efficacy=EfficacyBudget(**efficacy_overrides),
+        ),
+        "damage_eval_max_samples": getattr(args, "damage_eval_size", 64),
+        "project_lm_head": getattr(args, "project_lm_head", None),
+        "project_embeddings": getattr(args, "project_embeddings", None),
+        "overwrite_output": getattr(args, "overwrite_output", False),
+    }
+
+
+def _gguf_pipeline_kwargs(args) -> dict:
+    """Translate GGUF import/export flags into pipeline constructor kwargs."""
+    gguf_file = getattr(args, "gguf_file", None)
+    model_name = str(getattr(args, "model", ""))
+    if gguf_file is None and Path(model_name).suffix.lower() == ".gguf":
+        gguf_file = model_name
+
+    return {
+        "gguf_file": gguf_file,
+        "base_model_id": getattr(args, "base_model_id", None),
+        "tokenizer_path": getattr(args, "tokenizer_path", None),
+        "output_format": getattr(args, "output_format", "hf"),
+        "gguf_quant": getattr(args, "gguf_quant", "Q4_K_M"),
+        "llama_cpp_dir": getattr(args, "llama_cpp_dir", None),
+        "llama_cpp_python": getattr(args, "llama_cpp_python", None),
+        "gguf_imatrix": getattr(args, "gguf_imatrix", None),
+        "keep_dense_intermediate": getattr(args, "keep_dense_intermediate", False),
+        "post_quant_verify": getattr(args, "post_quant_verify", True),
+    }
+
+
+def _default_abliteration_output_dir(model_name: str) -> str:
+    """Return a compact default output path for Hub IDs and local GGUF files."""
+    model_path = Path(model_name)
+    if model_path.suffix.lower() == ".gguf":
+        safe_name = model_path.stem or "model"
+    else:
+        safe_name = model_name.replace("/", "_")
+    return str(Path("abliterated") / safe_name)
+
+
 def _apply_gpu_selection(args):
     """Set CUDA_VISIBLE_DEVICES based on --gpus flag (for local runs only)."""
     import os
@@ -109,7 +330,7 @@ def main(argv: list[str] | None = None):
 
     # --- info ---
     info_parser = subparsers.add_parser("info", help="Print model architecture info")
-    info_parser.add_argument("model", type=str, help="HuggingFace model name/path")
+    info_parser.add_argument("model", type=str, help="HuggingFace model name/path or local GGUF")
     info_parser.add_argument("--task", type=str, default="causal_lm", choices=["causal_lm", "classification"])
     info_parser.add_argument("--device", type=str, default="cpu")
     info_parser.add_argument("--dtype", type=str, default="float32")
@@ -163,10 +384,87 @@ def main(argv: list[str] | None = None):
 
     # --- obliterate (primary) + abliterate (backward-compat alias) ---
     def _add_obliterate_args(p):
-        p.add_argument("model", type=str, help="HuggingFace model name/path")
+        p.add_argument(
+            "model",
+            type=str,
+            help="HuggingFace model name/path or a local .gguf file",
+        )
         p.add_argument("--output-dir", type=str, default=None, help="Where to save the obliterated model")
         p.add_argument("--device", type=str, default="auto")
         p.add_argument("--dtype", type=str, default="float16")
+        gguf_group = p.add_argument_group("GGUF import and export")
+        gguf_group.add_argument(
+            "--gguf-file",
+            type=str,
+            default=None,
+            help=(
+                "Repository-relative GGUF filename to import from the model source. "
+                "Pass a local .gguf path positionally instead; it is detected automatically."
+            ),
+        )
+        gguf_group.add_argument(
+            "--base-model-id",
+            type=str,
+            default=None,
+            help="Canonical HuggingFace model ID used to recover config/tokenizer metadata.",
+        )
+        gguf_group.add_argument(
+            "--tokenizer-path",
+            type=str,
+            default=None,
+            help="Offline tokenizer/config directory to use instead of the base model ID.",
+        )
+        gguf_group.add_argument(
+            "--output-format",
+            type=str,
+            choices=["hf", "gguf", "both"],
+            default="hf",
+            help="Published artifact format (default: hf).",
+        )
+        gguf_group.add_argument(
+            "--gguf-quant",
+            type=str,
+            default="Q4_K_M",
+            help="llama.cpp quantization type for GGUF output (default: Q4_K_M).",
+        )
+        gguf_group.add_argument(
+            "--llama-cpp-dir",
+            type=str,
+            default=None,
+            help="Path to a pinned llama.cpp checkout used for conversion and quantization.",
+        )
+        gguf_group.add_argument(
+            "--llama-cpp-python",
+            type=str,
+            default=None,
+            help="Optional Python executable for llama.cpp conversion scripts.",
+        )
+        gguf_group.add_argument(
+            "--gguf-imatrix",
+            type=str,
+            default=None,
+            help="Optional llama.cpp importance-matrix file for output quantization.",
+        )
+        gguf_group.add_argument(
+            "--keep-dense-intermediate",
+            action="store_true",
+            default=False,
+            help="Keep the dense HuggingFace/BF16 staging artifact after GGUF export.",
+        )
+        post_quant_group = gguf_group.add_mutually_exclusive_group()
+        post_quant_group.add_argument(
+            "--post-quant-verify",
+            dest="post_quant_verify",
+            action="store_true",
+            default=True,
+            help="Reload and verify the final quantized GGUF before publishing (default).",
+        )
+        post_quant_group.add_argument(
+            "--no-post-quant-verify",
+            dest="post_quant_verify",
+            action="store_false",
+            help="Skip final GGUF reload verification.",
+        )
         p.add_argument(
             "--method", type=str, default="advanced",
             choices=[
@@ -213,8 +511,12 @@ def main(argv: list[str] | None = None):
         )
         p.add_argument(
             "--projection-target", type=str, default=None,
-            choices=["all", "attention", "ffn", "output"],
-            help="Projection target modules: all, attention, ffn, or output.",
+            choices=["auto", "all", "attention", "ffn", "output"],
+            help=(
+                "Projection target modules. 'auto' independently evaluates output, "
+                "attention, ffn, and all against the held-out damage gate; it requires "
+                "an unquantized model and roughly one extra model-size of CPU RAM."
+            ),
         )
         p.add_argument(
             "--projection-row-fraction", type=float, default=None,
@@ -257,6 +559,7 @@ def main(argv: list[str] | None = None):
             "--contribute-notes", type=str, default="",
             help="Optional notes to include with the community contribution.",
         )
+        _add_damage_safety_args(p)
 
     abl_parser = subparsers.add_parser(
         "obliterate",
@@ -286,7 +589,7 @@ def main(argv: list[str] | None = None):
     si_parser.add_argument("--params-b", type=float, default=None, help="Override detected total parameter count in billions for planning/defaults")
     si_parser.add_argument("--no-param-auto-scale", action="store_true", default=False, help="Do not apply size-aware defaults when knobs are omitted")
     si_parser.add_argument("--method", type=str, default="advanced", choices=["basic", "advanced", "aggressive", "spectral_cascade", "informed", "surgical", "optimized", "som", "inverted", "nuclear"])
-    si_parser.add_argument("--direction-method", type=str, default="diff_means", choices=["diff_means", "svd", "leace", "som"])
+    si_parser.add_argument("--direction-method", type=str, default=None, choices=["diff_means", "svd", "leace", "som"])
     si_parser.add_argument("--n-directions", type=int, default=None)
     si_parser.add_argument("--regularization", type=float, default=None)
     si_parser.add_argument("--refinement-passes", type=int, default=None)
@@ -297,12 +600,23 @@ def main(argv: list[str] | None = None):
     si_parser.add_argument("--shield-ridge", type=float, default=None)
     si_parser.add_argument("--shield-residualize", action="store_true", default=None)
     si_parser.add_argument("--shield-layer-penalty", type=float, default=None)
-    si_parser.add_argument("--projection-target", type=str, default=None, choices=["all", "attention", "ffn", "output"])
+    si_parser.add_argument(
+        "--projection-target",
+        type=str,
+        default=None,
+        choices=["auto", "all", "attention", "ffn", "output"],
+        help=(
+            "Projection target modules. 'auto' evaluates four independent targets "
+            "under the held-out damage gate and requires an unquantized model plus "
+            "roughly one extra model-size of CPU RAM."
+        ),
+    )
     si_parser.add_argument("--projection-row-fraction", type=float, default=None)
     si_parser.add_argument("--device", type=str, default="auto")
     si_parser.add_argument("--dtype", type=str, default="float16")
     si_parser.add_argument("--verify-sample-size", type=int, default=None)
     si_parser.add_argument("--dry-run", action="store_true", default=False, help="Only write residue/plan; do not run surgery")
+    _add_damage_safety_args(si_parser)
     _add_gpu_args(si_parser)
 
     # --- report ---
@@ -332,7 +646,15 @@ def main(argv: list[str] | None = None):
         "--quantization", type=str, default=None, choices=["4bit", "8bit"],
         help="Load model with quantization",
     )
-    tourney_parser.add_argument("--output-dir", type=str, default="/tmp/obliteratus_tourney")
+    tourney_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/tmp/obliteratus_tourney",
+        help=(
+            "Tournament run directory. If it is an unrelated non-empty directory, "
+            "a dedicated tool-owned child is used without deleting existing files."
+        ),
+    )
     tourney_parser.add_argument(
         "--methods", type=str, nargs="+", default=None,
         help="Override: only run these methods (space-separated)",
@@ -428,6 +750,8 @@ def main(argv: list[str] | None = None):
 def _cmd_self_improve(args):
     """Run one recursive hard-negative OBLITERATUS iteration."""
 
+    from tempfile import TemporaryDirectory
+
     from rich.panel import Panel
     from rich.table import Table
 
@@ -460,108 +784,180 @@ def _cmd_self_improve(args):
     residue_examples = []
     for audit in args.audit:
         residue_examples.extend(load_residue_file(audit))
-    residue_path = Path(args.residue_out or Path(args.output_dir, "mined_residue.json"))
-    save_residue_file(residue_examples, residue_path)
-
-    harmful, harmless, meta = build_weighted_prompt_pairs(
-        base_dataset=args.dataset,
-        residue_files=[residue_path],
-        residue_weight=residue_weight,
-        max_residue=args.residue_max,
+    output_path = Path(args.output_dir)
+    residue_destination = (
+        Path(args.residue_out)
+        if args.residue_out
+        else output_path / "mined_residue.json"
     )
+    plan_destination = output_path / "self_improve_plan.json"
+    safety_kwargs = _damage_pipeline_kwargs(args)
 
-    meta["model_profile"] = profile.to_json()
-    meta["size_aware_defaults"] = size_defaults
-    meta["effective_settings"] = {
-        "n_directions": n_directions,
-        "regularization": regularization,
-        "refinement_passes": refinement_passes,
-        "residue_weight": residue_weight,
-        "verify_sample_size": verify_sample_size,
-        "projection_row_fraction": args.projection_row_fraction,
-    }
-    plan_path = Path(args.output_dir, "self_improve_plan.json")
-    plan_path.parent.mkdir(parents=True, exist_ok=True)
-    plan_path.write_text(json.dumps(meta, indent=2))
-
-    table = Table(title="Recursive hard-negative mining plan")
-    table.add_column("Field", style="cyan")
-    table.add_column("Value", style="green")
-    table.add_row("source model", args.model)
-    table.add_row("params", f"{profile.total_params_b:.3f}B" if profile.total_params_b is not None else "unknown")
-    table.add_row("profile source", profile.source)
-    table.add_row("layers / hidden", f"{profile.num_layers or '?'} / {profile.hidden_size or '?'}")
-    table.add_row("size default note", size_defaults["note"])
-    table.add_row("output", args.output_dir)
-    table.add_row("residue file", str(residue_path))
-    table.add_row("plan file", str(plan_path))
-    table.add_row("unique residue prompts", str(meta["residue_examples"]))
-    table.add_row("weighted residue pairs", str(meta["residue_added_pairs"]))
-    table.add_row("total prompt pairs", str(meta["total_pairs"]))
-    table.add_row("method", args.method)
-    table.add_row("directions", str(n_directions))
-    table.add_row("regularization", str(regularization))
-    table.add_row("refinement passes", str(refinement_passes))
-    table.add_row("verify sample size", str(verify_sample_size))
-    console.print(table)
-
+    staging: TemporaryDirectory[str] | None = None
     if args.dry_run:
+        staged_residue_path = residue_destination
+        staged_plan_path = plan_destination
+    else:
+        # The checkpoint publisher requires an empty destination.  Keep all
+        # pre-run planning artifacts in a sibling temporary directory, then
+        # publish them only after the model itself passes and commits.
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        staging = TemporaryDirectory(
+            prefix=f".{output_path.name}.self-improve-",
+            dir=output_path.parent,
+        )
+        staging_path = Path(staging.name)
+        staged_residue_path = staging_path / "mined_residue.json"
+        staged_plan_path = staging_path / "self_improve_plan.json"
+
+    try:
+        save_residue_file(residue_examples, staged_residue_path)
+        harmful, harmless, meta = build_weighted_prompt_pairs(
+            base_dataset=args.dataset,
+            residue_files=[staged_residue_path],
+            residue_weight=residue_weight,
+            max_residue=args.residue_max,
+        )
+
+        meta["model_profile"] = profile.to_json()
+        meta["size_aware_defaults"] = size_defaults
+        meta["effective_settings"] = {
+            "n_directions": n_directions,
+            "regularization": regularization,
+            "refinement_passes": refinement_passes,
+            "residue_weight": residue_weight,
+            "verify_sample_size": verify_sample_size,
+            "projection_row_fraction": args.projection_row_fraction,
+        }
+        meta["acceptance_policy"] = {
+            "damage_gate_enabled": safety_kwargs["damage_gate_enabled"],
+            "damage_eval_max_samples": safety_kwargs["damage_eval_max_samples"],
+            "budget": safety_kwargs["damage_budget"].to_dict(),
+        }
+        staged_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_plan_path.write_text(json.dumps(meta, indent=2))
+
+        table = Table(title="Recursive hard-negative mining plan")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("source model", args.model)
+        profile_size = (
+            f"{profile.total_params_b:.3f}B"
+            if profile.total_params_b is not None
+            else "unknown"
+        )
+        table.add_row("params", profile_size)
+        table.add_row("profile source", profile.source)
+        table.add_row(
+            "layers / hidden",
+            f"{profile.num_layers or '?'} / {profile.hidden_size or '?'}",
+        )
+        table.add_row("size default note", size_defaults["note"])
+        table.add_row("output", args.output_dir)
+        table.add_row("residue file", str(residue_destination))
+        table.add_row("plan file", str(plan_destination))
+        table.add_row("unique residue prompts", str(meta["residue_examples"]))
+        table.add_row("weighted residue pairs", str(meta["residue_added_pairs"]))
+        table.add_row("total prompt pairs", str(meta["total_pairs"]))
+        table.add_row("method", args.method)
+        table.add_row("directions", str(n_directions))
+        table.add_row("regularization", str(regularization))
+        table.add_row("refinement passes", str(refinement_passes))
+        table.add_row("verify sample size", str(verify_sample_size))
+        console.print(table)
+
+        if args.dry_run:
+            console.print(
+                Panel(
+                    "[bold yellow]Dry run only.[/]\n\n"
+                    f"Plan JSON: {plan_destination}\n"
+                    "Run without --dry-run to launch surgery, or pass this residue file to:\n"
+                    f"  obliteratus obliterate {args.model} "
+                    f"--residue-file {residue_destination} --output-dir {args.output_dir}",
+                    border_style="yellow",
+                    title="SELF-IMPROVE PLAN WRITTEN",
+                )
+            )
+            return
+
+        from obliteratus.abliterate import AbliterationPipeline
+
+        log_lines: list[str] = []
+
+        def on_log(msg):
+            log_lines.append(msg)
+            console.print(f"[dim]>[/] {msg}")
+
+        if args.method == "informed":
+            from obliteratus.informed_pipeline import InformedAbliterationPipeline
+
+            pipeline = InformedAbliterationPipeline(
+                model_name=args.model,
+                output_dir=args.output_dir,
+                device=args.device,
+                dtype=args.dtype,
+                verify_sample_size=verify_sample_size,
+                harmful_prompts=harmful,
+                harmless_prompts=harmless,
+                projection_target=args.projection_target,
+                on_log=on_log,
+                **safety_kwargs,
+            )
+            result_path, _ = pipeline.run_informed()
+        else:
+            pipeline = AbliterationPipeline(
+                model_name=args.model,
+                output_dir=args.output_dir,
+                device=args.device,
+                dtype=args.dtype,
+                method=args.method,
+                n_directions=n_directions,
+                direction_method=args.direction_method,
+                regularization=regularization,
+                refinement_passes=refinement_passes,
+                min_layer_fraction=args.min_layer_fraction,
+                max_layer_fraction=args.max_layer_fraction,
+                harmless_pc_count=args.harmless_pc_count,
+                shield_concept_count=args.shield_concept_count,
+                shield_ridge=args.shield_ridge,
+                shield_residualize=args.shield_residualize,
+                shield_layer_penalty=args.shield_layer_penalty,
+                projection_target=args.projection_target,
+                projection_row_fraction=args.projection_row_fraction,
+                verify_sample_size=verify_sample_size,
+                harmful_prompts=harmful,
+                harmless_prompts=harmless,
+                on_log=on_log,
+                **safety_kwargs,
+            )
+            result_path = pipeline.run()
+
+        # These files are supplementary to the validated HF checkpoint, so
+        # write them only after the checkpoint transaction has committed.
+        result_dir = Path(result_path)
+        final_plan_path = result_dir / "self_improve_plan.json"
+        final_plan_path.write_text(json.dumps(meta, indent=2))
+        final_residue_path = (
+            Path(args.residue_out)
+            if args.residue_out
+            else result_dir / "mined_residue.json"
+        )
+        save_residue_file(residue_examples, final_residue_path)
+        residue_meta_path = result_dir / "hard_negative_residue.json"
+        residue_meta_path.write_text(json.dumps(meta, indent=2))
         console.print(
             Panel(
-                "[bold yellow]Dry run only.[/]\n\n"
-                f"Plan JSON: {plan_path}\n"
-                "Run without --dry-run to launch surgery, or pass this residue file to:\n"
-                f"  obliteratus obliterate {args.model} --residue-file {residue_path} --output-dir {args.output_dir}",
-                border_style="yellow",
-                title="SELF-IMPROVE PLAN WRITTEN",
+                f"[bold green]Self-improvement iteration complete![/]\n\n"
+                f"  Model saved to: [cyan]{result_path}[/]\n"
+                f"  Residue metadata: [cyan]{residue_meta_path}[/]\n"
+                "  Next loop: audit refusals from this artifact and feed them back with --audit.",
+                border_style="green",
+                title="RECURSIVE REBIRTH COMPLETE",
             )
         )
-        return
-
-    from obliteratus.abliterate import AbliterationPipeline
-
-    log_lines: list[str] = []
-
-    def on_log(msg):
-        log_lines.append(msg)
-        console.print(f"[dim]>[/] {msg}")
-
-    pipeline = AbliterationPipeline(
-        model_name=args.model,
-        output_dir=args.output_dir,
-        device=args.device,
-        dtype=args.dtype,
-        method=args.method,
-        n_directions=n_directions,
-        direction_method=args.direction_method,
-        regularization=regularization,
-        refinement_passes=refinement_passes,
-        min_layer_fraction=args.min_layer_fraction,
-        max_layer_fraction=args.max_layer_fraction,
-        harmless_pc_count=args.harmless_pc_count,
-        shield_concept_count=args.shield_concept_count,
-        shield_ridge=args.shield_ridge,
-        shield_residualize=args.shield_residualize,
-        shield_layer_penalty=args.shield_layer_penalty,
-        projection_target=args.projection_target,
-        projection_row_fraction=args.projection_row_fraction,
-        verify_sample_size=verify_sample_size,
-        harmful_prompts=harmful,
-        harmless_prompts=harmless,
-        on_log=on_log,
-    )
-    result_path = pipeline.run()
-    Path(result_path, "hard_negative_residue.json").write_text(json.dumps(meta, indent=2))
-    console.print(
-        Panel(
-            f"[bold green]Self-improvement iteration complete![/]\n\n"
-            f"  Model saved to: [cyan]{result_path}[/]\n"
-            f"  Residue metadata: [cyan]{result_path}/hard_negative_residue.json[/]\n"
-            f"  Next loop: audit refusals from this artifact and feed them back with --audit.",
-            border_style="green",
-            title="RECURSIVE REBIRTH COMPLETE",
-        )
-    )
+    finally:
+        if staging is not None:
+            staging.cleanup()
 
 
 
@@ -689,6 +1085,18 @@ def _cmd_run(args):
 
 
 def _cmd_info(args):
+    if Path(args.model).suffix.lower() == ".gguf":
+        from obliteratus.model_profile import profile_model
+
+        console.print(f"[bold cyan]Reading GGUF metadata:[/bold cyan] {args.model}")
+        profile = profile_model(args.model)
+        for key, val in profile.to_json().items():
+            if isinstance(val, int) and val > 1000:
+                console.print(f"  {key}: {val:,}")
+            else:
+                console.print(f"  {key}: {val}")
+        return
+
     from obliteratus.models.loader import load_model
 
     console.print(f"[bold cyan]Loading model:[/bold cyan] {args.model}")
@@ -877,6 +1285,7 @@ def _cmd_tourney(args):
         on_log=on_log,
         on_round=on_round,
     )
+    console.print(f"[dim]Tournament files:[/] {runner.output_dir}")
 
     result = runner.run()
 
@@ -888,7 +1297,7 @@ def _cmd_tourney(args):
         console.print(f"  Coherence:    {result.winner.metrics.get('coherence', '?')}")
         if result.hub_repo:
             console.print(f"  Pushed to:    [link=https://huggingface.co/{result.hub_repo}]{result.hub_repo}[/link]")
-        console.print(f"\n  Full bracket: {args.output_dir}/tourney_bracket.md")
+        console.print(f"\n  Full bracket: {runner.output_dir}/tourney_bracket.md")
 
 
 def _cmd_abliterate(args):
@@ -900,7 +1309,7 @@ def _cmd_abliterate(args):
     from obliteratus.abliterate import METHODS, STAGES, AbliterationPipeline
 
     model_name = args.model
-    output_dir = args.output_dir or f"abliterated/{model_name.replace('/', '_')}"
+    output_dir = args.output_dir or _default_abliteration_output_dir(model_name)
     method = args.method
     method_label = METHODS.get(method, {}).get("label", method)
 
@@ -927,7 +1336,7 @@ def _cmd_abliterate(args):
                 bar = "[dim]" + "░" * 20 + "[/]"
             msg = stage_msgs.get(s.key, "")
             table.add_row(
-                f"[cyan][{i + 1}/6][/]",
+                f"[cyan][{i + 1}/{len(STAGES)}][/]",
                 f"{icon} [bold]{s.name}[/]",
                 f"{bar}  {msg}",
             )
@@ -979,40 +1388,68 @@ def _cmd_abliterate(args):
             f"({residue_meta['total_pairs']} total)."
         )
 
-    pipeline = AbliterationPipeline(
-        model_name=model_name,
-        output_dir=output_dir,
-        device=args.device,
-        dtype=args.dtype,
-        method=method,
-        n_directions=args.n_directions,
-        direction_method=getattr(args, "direction_method", None),
-        regularization=args.regularization,
-        refinement_passes=args.refinement_passes,
-        min_layer_fraction=getattr(args, "min_layer_fraction", None),
-        max_layer_fraction=getattr(args, "max_layer_fraction", None),
-        harmless_pc_count=getattr(args, "harmless_pc_count", None),
-        shield_concept_count=getattr(args, "shield_concept_count", None),
-        shield_ridge=getattr(args, "shield_ridge", None),
-        shield_residualize=getattr(args, "shield_residualize", None),
-        shield_layer_penalty=getattr(args, "shield_layer_penalty", None),
-        projection_target=getattr(args, "projection_target", None),
-        projection_row_fraction=getattr(args, "projection_row_fraction", None),
-        quantization=args.quantization,
-        large_model_mode=getattr(args, "large_model", False),
-        verify_sample_size=getattr(args, "verify_sample_size", None),
-        on_stage=on_stage,
-        on_log=on_log,
-        **prompt_kwargs,
-    )
+    safety_kwargs = _damage_pipeline_kwargs(args)
+    gguf_kwargs = _gguf_pipeline_kwargs(args)
+    if method == "informed":
+        from obliteratus.informed_pipeline import InformedAbliterationPipeline
+
+        pipeline = InformedAbliterationPipeline(
+            model_name=model_name,
+            output_dir=output_dir,
+            device=args.device,
+            dtype=args.dtype,
+            quantization=args.quantization,
+            projection_target=getattr(args, "projection_target", None),
+            verify_sample_size=getattr(args, "verify_sample_size", None),
+            on_stage=on_stage,
+            on_log=on_log,
+            **safety_kwargs,
+            **gguf_kwargs,
+            **prompt_kwargs,
+        )
+    else:
+        pipeline = AbliterationPipeline(
+            model_name=model_name,
+            output_dir=output_dir,
+            device=args.device,
+            dtype=args.dtype,
+            method=method,
+            n_directions=args.n_directions,
+            direction_method=getattr(args, "direction_method", None),
+            regularization=args.regularization,
+            refinement_passes=args.refinement_passes,
+            min_layer_fraction=getattr(args, "min_layer_fraction", None),
+            max_layer_fraction=getattr(args, "max_layer_fraction", None),
+            harmless_pc_count=getattr(args, "harmless_pc_count", None),
+            shield_concept_count=getattr(args, "shield_concept_count", None),
+            shield_ridge=getattr(args, "shield_ridge", None),
+            shield_residualize=getattr(args, "shield_residualize", None),
+            shield_layer_penalty=getattr(args, "shield_layer_penalty", None),
+            projection_target=getattr(args, "projection_target", None),
+            projection_row_fraction=getattr(args, "projection_row_fraction", None),
+            quantization=args.quantization,
+            large_model_mode=getattr(args, "large_model", False),
+            verify_sample_size=getattr(args, "verify_sample_size", None),
+            on_stage=on_stage,
+            on_log=on_log,
+            **safety_kwargs,
+            **gguf_kwargs,
+            **prompt_kwargs,
+        )
 
     with Live(make_display(), console=console, refresh_per_second=4) as live_ctx:
         live = live_ctx
         try:
-            result_path = pipeline.run()
+            if method == "informed":
+                result_path, _ = pipeline.run_informed()
+            else:
+                result_path = pipeline.run()
             if residue_meta:
                 import json
-                Path(result_path, "hard_negative_residue.json").write_text(
+                result_bundle = Path(result_path)
+                if not result_bundle.is_dir() and result_bundle.suffix.lower() == ".gguf":
+                    result_bundle = result_bundle.parent
+                (result_bundle / "hard_negative_residue.json").write_text(
                     json.dumps(residue_meta, indent=2)
                 )
             live.update(make_display())
@@ -1285,6 +1722,24 @@ def _make_remote_runner(args):
 def _cmd_remote_abliterate(args):
     from rich.panel import Panel
 
+    gguf_requested = (
+        Path(str(args.model)).suffix.lower() == ".gguf"
+        or getattr(args, "gguf_file", None) is not None
+        or getattr(args, "base_model_id", None) is not None
+        or getattr(args, "tokenizer_path", None) is not None
+        or getattr(args, "output_format", "hf") != "hf"
+        or getattr(args, "gguf_imatrix", None) is not None
+        or getattr(args, "keep_dense_intermediate", False)
+    )
+    if gguf_requested:
+        console.print(
+            "[red]Remote GGUF import/export is not supported yet.[/] The SSH runner "
+            "does not upload local GGUF files or forward GGUF provenance/toolchain "
+            "options. Run locally, or stage the artifact remotely and use the local "
+            "CLI on that host."
+        )
+        raise SystemExit(2)
+
     runner = _make_remote_runner(args)
 
     kwargs = {}
@@ -1326,6 +1781,23 @@ def _cmd_remote_abliterate(args):
         kwargs["large_model"] = True
     if getattr(args, "verify_sample_size", None) is not None:
         kwargs["verify_sample_size"] = args.verify_sample_size
+    kwargs["damage_gate_enabled"] = getattr(args, "damage_gate_enabled", True)
+    kwargs["damage_eval_size"] = getattr(args, "damage_eval_size", 64)
+    for name in (
+        "max_ppl_ratio",
+        "max_sampled_token_kl",
+        "max_p95_sampled_token_kl",
+        "max_top1_flip_rate",
+        "max_coherence_drop",
+        "max_refusal_rate",
+        "project_lm_head",
+        "project_embeddings",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            kwargs[name] = value
+    if getattr(args, "overwrite_output", False):
+        kwargs["overwrite_output"] = True
 
     result_path = runner.run_obliterate(
         model=args.model,

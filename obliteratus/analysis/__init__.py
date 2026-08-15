@@ -35,6 +35,10 @@ from obliteratus.analysis.spectral_certification import (
 from obliteratus.analysis.activation_patching import ActivationPatcher
 from obliteratus.analysis.wasserstein_optimal import WassersteinOptimalExtractor
 from obliteratus.analysis.bayesian_kernel_projection import BayesianKernelProjection
+from obliteratus.analysis.som_directions import (
+    SOMDirectionExtractor,
+    SOMDirectionResult,
+)
 
 __all__ = [
     "CrossLayerAlignmentAnalyzer",
@@ -67,4 +71,6 @@ __all__ = [
     "ActivationPatcher",
     "WassersteinOptimalExtractor",
     "BayesianKernelProjection",
+    "SOMDirectionExtractor",
+    "SOMDirectionResult",
 ]

@@ -19,14 +19,13 @@ Usage (YAML config):
 
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import subprocess
-import sys
-import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from rich.console import Console
 
@@ -174,14 +173,19 @@ class RemoteRunner:
         """Build environment variable prefix for remote commands (e.g. CUDA_VISIBLE_DEVICES)."""
         parts = []
         if self.config.gpus and self.config.gpus.lower() != "all":
-            parts.append(f"CUDA_VISIBLE_DEVICES={self.config.gpus}")
+            raw_ids = [item.strip() for item in self.config.gpus.split(",")]
+            if not raw_ids or any(not item.isdigit() for item in raw_ids):
+                raise ValueError("gpus must be 'all' or a comma-separated list of integer IDs")
+            gpu_ids = ",".join(str(int(item)) for item in raw_ids)
+            parts.append(f"CUDA_VISIBLE_DEVICES={shlex.quote(gpu_ids)}")
         return " ".join(parts) + " " if parts else ""
 
     def ensure_obliteratus(self) -> bool:
         """Install or update obliteratus on the remote if needed."""
         # Check if already installed
         check = self.run_ssh(
-            f"{self.config.python} -c \"import obliteratus; print(obliteratus.__version__)\"",
+            f"{shlex.quote(self.config.python)} "
+            '-c "import obliteratus; print(obliteratus.__version__)"',
             timeout=30,
         )
         if isinstance(check, subprocess.CompletedProcess) and check.returncode == 0:
@@ -192,7 +196,7 @@ class RemoteRunner:
         # Install from PyPI or git
         self.on_log("Installing obliteratus on remote...")
         install_cmd = (
-            f"{self.config.python} -m pip install --quiet "
+            f"{shlex.quote(self.config.python)} -m pip install --quiet "
             f"git+https://github.com/StellaAthena/OBLITERATUS.git"
         )
         rc = self.run_ssh(install_cmd, stream=True, timeout=self.config.install_timeout)
@@ -235,41 +239,162 @@ class RemoteRunner:
         direction_method: str | None = None,
         regularization: float | None = None,
         refinement_passes: int | None = None,
+        min_layer_fraction: float | None = None,
+        max_layer_fraction: float | None = None,
+        harmless_pc_count: int | None = None,
+        shield_concept_count: int | None = None,
+        shield_ridge: float | None = None,
+        shield_residualize: bool | None = None,
+        shield_layer_penalty: float | None = None,
+        projection_target: str | None = None,
+        projection_row_fraction: float | None = None,
         large_model: bool = False,
         verify_sample_size: int | None = None,
+        damage_gate_enabled: bool = True,
+        damage_eval_size: int = 64,
+        max_ppl_ratio: float | None = None,
+        max_sampled_token_kl: float | None = None,
+        max_p95_sampled_token_kl: float | None = None,
+        max_top1_flip_rate: float | None = None,
+        max_coherence_drop: float | None = None,
+        max_refusal_rate: float | None = None,
+        project_lm_head: bool | None = None,
+        project_embeddings: bool | None = None,
+        overwrite_output: bool = False,
     ) -> str:
         """Build the remote obliteratus CLI command."""
+        if not isinstance(damage_gate_enabled, bool):
+            raise TypeError("damage_gate_enabled must be a boolean")
+        if not isinstance(damage_eval_size, int) or isinstance(damage_eval_size, bool):
+            raise TypeError("damage_eval_size must be an integer")
+        if damage_eval_size < 32:
+            raise ValueError("damage_eval_size must be an integer greater than or equal to 32")
+
+        def _validate_finite(name: str, value: float | None, minimum: float) -> None:
+            if value is None:
+                return
+            if not math.isfinite(float(value)) or float(value) < minimum:
+                raise ValueError(f"{name} must be finite and greater than or equal to {minimum}")
+
+        def _validate_rate(name: str, value: float | None) -> None:
+            if value is None:
+                return
+            if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be finite and between 0 and 1")
+
+        _validate_finite("max_ppl_ratio", max_ppl_ratio, 1.0)
+        _validate_finite("max_sampled_token_kl", max_sampled_token_kl, 0.0)
+        _validate_finite("max_p95_sampled_token_kl", max_p95_sampled_token_kl, 0.0)
+        _validate_rate("max_top1_flip_rate", max_top1_flip_rate)
+        _validate_rate("max_coherence_drop", max_coherence_drop)
+        _validate_rate("max_refusal_rate", max_refusal_rate)
+        for name, value in (
+            ("min_layer_fraction", min_layer_fraction),
+            ("max_layer_fraction", max_layer_fraction),
+        ):
+            _validate_rate(name, value)
+        for name, value in (
+            ("harmless_pc_count", harmless_pc_count),
+            ("shield_concept_count", shield_concept_count),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer")
+        _validate_finite("shield_ridge", shield_ridge, 0.0)
+        _validate_finite("shield_layer_penalty", shield_layer_penalty, 0.0)
+        if shield_residualize is not None and not isinstance(shield_residualize, bool):
+            raise TypeError("shield_residualize must be a boolean or None")
+        if projection_target is not None and projection_target not in {
+            "auto", "all", "attention", "ffn", "output",
+        }:
+            raise ValueError(
+                "projection_target must be one of: auto, all, attention, ffn, output"
+            )
+        if projection_row_fraction is not None and (
+            not math.isfinite(float(projection_row_fraction))
+            or not 0.0 < float(projection_row_fraction) <= 1.0
+        ):
+            raise ValueError("projection_row_fraction must be finite and in (0, 1]")
+        if projection_target == "auto" and quantization is not None:
+            raise ValueError("projection_target='auto' is not compatible with quantization")
+        if projection_target == "auto" and damage_eval_size < 64:
+            raise ValueError("projection_target='auto' requires damage_eval_size >= 64")
+        for name, value in (
+            ("project_lm_head", project_lm_head),
+            ("project_embeddings", project_embeddings),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean or None")
+        if not isinstance(overwrite_output, bool):
+            raise TypeError("overwrite_output must be a boolean")
+
         remote_output = output_dir or f"{self.config.remote_dir}/output/{model.replace('/', '_')}"
 
         parts = [
-            self._env_prefix() + self.config.python, "-m", "obliteratus",
+            self._env_prefix() + shlex.quote(self.config.python), "-m", "obliteratus",
             "obliterate", shlex.quote(model),
             "--output-dir", shlex.quote(remote_output),
-            "--method", method,
-            "--device", device,
-            "--dtype", dtype,
+            "--method", shlex.quote(method),
+            "--device", shlex.quote(device),
+            "--dtype", shlex.quote(dtype),
         ]
         if quantization:
-            parts.extend(["--quantization", quantization])
+            parts.extend(["--quantization", shlex.quote(quantization)])
         if n_directions is not None:
-            parts.extend(["--n-directions", str(n_directions)])
+            parts.extend(["--n-directions", shlex.quote(str(n_directions))])
         if direction_method:
-            parts.extend(["--direction-method", direction_method])
+            parts.extend(["--direction-method", shlex.quote(direction_method)])
         if regularization is not None:
-            parts.extend(["--regularization", str(regularization)])
+            parts.extend(["--regularization", shlex.quote(str(regularization))])
         if refinement_passes is not None:
-            parts.extend(["--refinement-passes", str(refinement_passes)])
+            parts.extend(["--refinement-passes", shlex.quote(str(refinement_passes))])
+        for flag, value in (
+            ("--min-layer-fraction", min_layer_fraction),
+            ("--max-layer-fraction", max_layer_fraction),
+            ("--harmless-pc-count", harmless_pc_count),
+            ("--shield-concept-count", shield_concept_count),
+            ("--shield-ridge", shield_ridge),
+            ("--shield-layer-penalty", shield_layer_penalty),
+            ("--projection-target", projection_target),
+            ("--projection-row-fraction", projection_row_fraction),
+        ):
+            if value is not None:
+                parts.extend([flag, shlex.quote(str(value))])
+        if shield_residualize:
+            parts.append("--shield-residualize")
         if large_model:
             parts.append("--large-model")
         if verify_sample_size is not None:
-            parts.extend(["--verify-sample-size", str(verify_sample_size)])
+            parts.extend(["--verify-sample-size", shlex.quote(str(verify_sample_size))])
+
+        parts.append("--damage-gate" if damage_gate_enabled else "--unsafe-disable-damage-gate")
+        parts.extend(["--damage-eval-size", str(damage_eval_size)])
+        for flag, value in (
+            ("--max-ppl-ratio", max_ppl_ratio),
+            ("--max-sampled-token-kl", max_sampled_token_kl),
+            ("--max-p95-sampled-token-kl", max_p95_sampled_token_kl),
+            ("--max-top1-flip-rate", max_top1_flip_rate),
+            ("--max-coherence-drop", max_coherence_drop),
+            ("--max-refusal-rate", max_refusal_rate),
+        ):
+            if value is not None:
+                parts.extend([flag, shlex.quote(str(value))])
+        if project_lm_head is not None:
+            parts.append("--project-lm-head" if project_lm_head else "--no-project-lm-head")
+        if project_embeddings is not None:
+            parts.append(
+                "--project-embeddings" if project_embeddings else "--no-project-embeddings"
+            )
+        if overwrite_output:
+            parts.append("--overwrite-output")
 
         return " ".join(parts)
 
     def build_run_command(self, remote_config_path: str, output_dir: str | None = None, preset: str | None = None) -> str:
         """Build remote 'obliteratus run' command."""
         parts = [
-            self._env_prefix() + self.config.python, "-m", "obliteratus",
+            self._env_prefix() + shlex.quote(self.config.python), "-m", "obliteratus",
             "run", shlex.quote(remote_config_path),
         ]
         if output_dir:
@@ -294,7 +419,7 @@ class RemoteRunner:
         remote_output = output_dir or f"{self.config.remote_dir}/tourney/{model.replace('/', '_')}"
 
         parts = [
-            self._env_prefix() + self.config.python, "-m", "obliteratus",
+            self._env_prefix() + shlex.quote(self.config.python), "-m", "obliteratus",
             "tourney", shlex.quote(model),
             "--output-dir", shlex.quote(remote_output),
             "--device", device,

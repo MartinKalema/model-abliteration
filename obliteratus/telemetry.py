@@ -1187,6 +1187,13 @@ def maybe_send_pipeline_report(pipeline) -> None:
             val = getattr(pipeline, key, None)
             if val is not None:
                 method_config[key] = val
+        quality_metrics = dict(getattr(pipeline, "_quality_metrics", {}) or {})
+        assessment = getattr(pipeline, "_damage_assessment", None)
+        to_dict = getattr(assessment, "to_dict", None)
+        if callable(to_dict):
+            serialized_assessment = to_dict()
+            if isinstance(serialized_assessment, dict):
+                quality_metrics["acceptance"] = serialized_assessment
         report = build_report(
             architecture=summary.get("architecture", "unknown"),
             num_layers=summary.get("num_layers", 0),
@@ -1195,7 +1202,7 @@ def maybe_send_pipeline_report(pipeline) -> None:
             total_params=summary.get("total_params", 0),
             method=pipeline.method,
             method_config=method_config,
-            quality_metrics=pipeline._quality_metrics,
+            quality_metrics=quality_metrics,
             stage_durations=_extract_stage_durations(pipeline),
             strong_layers=pipeline._strong_layers,
             direction_stats=_direction_stats(pipeline),
@@ -1219,6 +1226,13 @@ def maybe_send_informed_report(pipeline, informed_report) -> None:
             val = getattr(pipeline, key, None)
             if val is not None:
                 method_config[key] = val
+        quality_metrics = dict(getattr(pipeline, "_quality_metrics", {}) or {})
+        assessment = getattr(pipeline, "_damage_assessment", None)
+        to_dict = getattr(assessment, "to_dict", None)
+        if callable(to_dict):
+            serialized_assessment = to_dict()
+            if isinstance(serialized_assessment, dict):
+                quality_metrics["acceptance"] = serialized_assessment
         analysis_insights = _extract_analysis_insights(informed_report)
         informed_extras = {}
         for attr in ("ouroboros_passes", "final_refusal_rate",
@@ -1234,7 +1248,7 @@ def maybe_send_informed_report(pipeline, informed_report) -> None:
             total_params=summary.get("total_params", 0),
             method=pipeline.method,
             method_config=method_config,
-            quality_metrics=pipeline._quality_metrics,
+            quality_metrics=quality_metrics,
             stage_durations=_extract_stage_durations(pipeline),
             strong_layers=pipeline._strong_layers,
             direction_stats=_direction_stats(pipeline),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 import torch
 from tqdm import tqdm
 
@@ -74,9 +73,12 @@ class Evaluator:
 
             input_ids = encodings["input_ids"]
             attention_mask = encodings["attention_mask"]
+            labels = input_ids.clone()
+            labels.masked_fill_(attention_mask == 0, -100)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
-            # Mask out padding tokens for loss computation
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            # Hugging Face causal-LM loss shifts labels internally. Padding
+            # targets must be -100 or short rows contaminate the batch loss.
             num_tokens = attention_mask[:, 1:].sum().item()
             total_loss += outputs.loss.item() * num_tokens
             total_tokens += num_tokens

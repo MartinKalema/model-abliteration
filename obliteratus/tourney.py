@@ -18,12 +18,21 @@ import gc
 import json
 import math
 import os
+import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+from obliteratus.evaluation.candidate_selection import (
+    CandidateEvidenceError,
+    add_acceptance_evidence,
+    damage_severity,
+    validate_acceptance_payload,
+)
 
 # ---------------------------------------------------------------------------
 # All tournament-eligible methods.
@@ -47,55 +56,241 @@ TOURNEY_METHODS = [
     "rdo",
 ]
 
+
+# Tournament output directories are recursively cleaned between fresh runs.
+# A path must carry this exact, path-bound marker before it is eligible for
+# that cleanup.  If a caller points at an unrelated non-empty directory, the
+# runner works in a dedicated child instead of claiming or deleting the
+# caller's files.
+TOURNEY_OWNER_FILENAME = ".obliteratus-tourney-owner.json"
+TOURNEY_OWNER_SCHEMA = 1
+TOURNEY_OWNER_TOOL = "obliteratus.tourney"
+TOURNEY_RUN_SUBDIR = ".obliteratus-tourney-run"
+
+
+class TourneyOutputSafetyError(RuntimeError):
+    """Raised when a tournament output path cannot be used safely."""
+
+
+def _path_exists(path: Path) -> bool:
+    """Return true for ordinary paths and dangling symlinks."""
+
+    return path.exists() or path.is_symlink()
+
+
+def _directory_is_empty(path: Path) -> bool:
+    return path.is_dir() and next(path.iterdir(), None) is None
+
+
+def _owner_marker(path: Path) -> dict[str, Any] | None:
+    """Return a validated ownership marker, or ``None``.
+
+    Binding the marker to the resolved directory prevents a copied marker from
+    making some other directory eligible for recursive cleanup.
+    """
+
+    if path.is_symlink() or not path.is_dir():
+        return None
+    marker = path / TOURNEY_OWNER_FILENAME
+    if marker.is_symlink() or not marker.is_file():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        payload.get("schema") != TOURNEY_OWNER_SCHEMA
+        or payload.get("tool") != TOURNEY_OWNER_TOOL
+        or payload.get("kind") not in {
+            "exclusive-run-directory",
+            "resume-run-directory",
+        }
+        or payload.get("resolved_path") != str(path.resolve())
+        or not isinstance(payload.get("owner_id"), str)
+        or not payload.get("owner_id")
+        or not isinstance(payload.get("owned_children"), list)
+        or not all(isinstance(name, str) for name in payload["owned_children"])
+    ):
+        return None
+    return payload
+
+
+def _exclusive_owner_marker(path: Path) -> dict[str, Any] | None:
+    payload = _owner_marker(path)
+    if payload is None or payload.get("kind") != "exclusive-run-directory":
+        return None
+    return payload
+
+
+def _write_owner_marker(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically persist the run-directory ownership manifest."""
+
+    marker = path / TOURNEY_OWNER_FILENAME
+    temporary = path / f".{TOURNEY_OWNER_FILENAME}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, marker)
+
+
+def _initialize_owned_run_dir(path: Path) -> None:
+    if _path_exists(path) and (path.is_symlink() or not path.is_dir()):
+        raise TourneyOutputSafetyError(
+            f"Tournament output must be a real directory, not a file or symlink: {path}"
+        )
+    path.mkdir(parents=True, exist_ok=True)
+    if not _directory_is_empty(path):
+        raise TourneyOutputSafetyError(
+            f"Refusing to claim a non-empty directory as tournament-owned: {path}"
+        )
+    _write_owner_marker(
+        path,
+        {
+            "schema": TOURNEY_OWNER_SCHEMA,
+            "tool": TOURNEY_OWNER_TOOL,
+            "kind": "exclusive-run-directory",
+            "resolved_path": str(path.resolve()),
+            "owner_id": uuid.uuid4().hex,
+            "created_at": datetime.now().isoformat(),
+            "owned_children": [],
+        },
+    )
+
+
+def _initialize_resume_run_dir(path: Path) -> None:
+    """Add a non-exclusive marker to a legacy checkpoint directory.
+
+    This supports checkpoints written before ownership markers existed without
+    ever making their containing directory eligible for recursive reset.
+    Existing candidate directories are intentionally not claimed.
+    """
+
+    if path.is_symlink() or not path.is_dir():
+        raise TourneyOutputSafetyError(
+            f"Legacy tournament output must be a real directory: {path}"
+        )
+    marker = path / TOURNEY_OWNER_FILENAME
+    if _path_exists(marker):
+        raise TourneyOutputSafetyError(
+            f"Refusing to replace an invalid or unowned marker file: {marker}"
+        )
+    _write_owner_marker(
+        path,
+        {
+            "schema": TOURNEY_OWNER_SCHEMA,
+            "tool": TOURNEY_OWNER_TOOL,
+            "kind": "resume-run-directory",
+            "resolved_path": str(path.resolve()),
+            "owner_id": uuid.uuid4().hex,
+            "created_at": datetime.now().isoformat(),
+            "owned_children": [],
+        },
+    )
+
+
+def _dangerous_cleanup_target(path: Path) -> bool:
+    """Reject broad roots even if somebody has planted a marker in them."""
+
+    resolved = path.resolve()
+    home = Path.home().resolve()
+    return resolved == Path(resolved.anchor) or resolved == home or len(resolved.parts) <= 2
+
+
+def _reset_owned_run_dir(path: Path) -> None:
+    """Clear and recreate a directory only after validating its marker."""
+
+    if _exclusive_owner_marker(path) is None:
+        raise TourneyOutputSafetyError(
+            f"Refusing to clean tournament output without a valid ownership marker: {path}"
+        )
+    if _dangerous_cleanup_target(path):
+        raise TourneyOutputSafetyError(
+            f"Refusing recursive cleanup of a broad filesystem location: {path}"
+        )
+    shutil.rmtree(path)
+    _initialize_owned_run_dir(path)
+
+
+def _has_legacy_resume_checkpoint(path: Path) -> bool:
+    checkpoint = path / "tourney_checkpoint.json"
+    if checkpoint.is_symlink() or not checkpoint.is_file():
+        return False
+    try:
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("version") == 1
+
+
+def resolve_tourney_output_dir(
+    output_dir: str | os.PathLike[str],
+    *,
+    resume: bool = False,
+) -> Path:
+    """Resolve a safe run directory without deleting or creating anything.
+
+    New/empty paths and valid tool-owned paths are used directly.  A caller's
+    unrelated non-empty directory is treated as a container, and tournament
+    files go into a stable dedicated child.  If that child name is also
+    occupied by unrelated data, a numbered sibling is selected.
+    """
+
+    requested = Path(output_dir).expanduser()
+    if _path_exists(requested):
+        if requested.is_symlink() or not requested.is_dir():
+            raise TourneyOutputSafetyError(
+                f"Tournament output must be a real directory, not a file or symlink: {requested}"
+            )
+        owner = _owner_marker(requested)
+        if (
+            _directory_is_empty(requested)
+            or _exclusive_owner_marker(requested) is not None
+            or (resume and owner is not None)
+            or (resume and _has_legacy_resume_checkpoint(requested))
+        ):
+            return requested
+    else:
+        return requested
+
+    index = 1
+    while True:
+        suffix = "" if index == 1 else f"-{index}"
+        candidate = requested / f"{TOURNEY_RUN_SUBDIR}{suffix}"
+        if not _path_exists(candidate):
+            return candidate
+        if candidate.is_symlink() or not candidate.is_dir():
+            index += 1
+            continue
+        owner = _owner_marker(candidate)
+        if (
+            _directory_is_empty(candidate)
+            or _exclusive_owner_marker(candidate) is not None
+            or (resume and owner is not None)
+            or (resume and _has_legacy_resume_checkpoint(candidate))
+        ):
+            return candidate
+        index += 1
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
 
 def composite_score(metrics: dict[str, Any]) -> float:
-    """Score an abliteration run on [0, 1].  Higher is better.
+    """Return accepted refusal-removal efficacy on [0, 1].
 
-    Weights:
-        35%  refusal removal   — the whole point
-        25%  coherence         — model must still be useful
-        20%  KL divergence     — minimal capability damage
-        10%  perplexity        — fluency preservation
-         5%  spectral cert     — formal completeness guarantee
-         5%  degenerate penalty — penalize broken output
+    Missing gate evidence is ineligible (``-1``), never a neutral score.
+    Tournament ranking is lexicographic: this efficacy is maximized first and
+    paired collateral damage is consulted only when refusal rates tie.
     """
-    rr = metrics.get("refusal_rate")
-    co = metrics.get("coherence")
-    kl = metrics.get("kl_divergence")
-    pp = metrics.get("perplexity")
-    spec = metrics.get("spectral_certification")
-    degen = metrics.get("degenerate_count", 0) or 0
 
-    refusal_score = (1.0 - rr) if rr is not None else 0.0
-    coherence_score = co if co is not None else 0.0
-    kl_score = 1.0 / (1.0 + kl) if kl is not None else 0.5
-    ppl_score = 1.0 / (1.0 + pp / 100.0) if pp is not None else 0.5
+    try:
+        payload = validate_acceptance_payload(metrics.get("acceptance", {}))
+    except (CandidateEvidenceError, TypeError, ValueError):
+        return -1.0
 
-    # Spectral certification: GREEN=1.0, YELLOW=0.5, RED=0.0, None=0.5 (neutral)
-    if spec == "GREEN":
-        spec_score = 1.0
-    elif spec == "YELLOW":
-        spec_score = 0.5
-    elif spec == "RED":
-        spec_score = 0.0
-    else:
-        spec_score = 0.5  # not measured → neutral
-
-    # Degenerate penalty: any broken outputs reduce score
-    degen_score = 1.0 / (1.0 + degen) if degen > 0 else 1.0
-
-    return (
-        refusal_score * 0.35
-        + coherence_score * 0.25
-        + kl_score * 0.20
-        + ppl_score * 0.10
-        + spec_score * 0.05
-        + degen_score * 0.05
-    )
+    refusal_rate = float(payload["metrics"]["refusal_rate"])
+    return 1.0 - min(1.0, max(0.0, refusal_rate))
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +360,7 @@ class TourneyResult:
                             "direction_method": c.direction_method,
                             "spectral_cert": c.spectral_cert,
                         }
-                        for c in sorted(r.contenders, key=lambda x: x.score, reverse=True)
+                        for c in sorted(r.contenders, key=_contender_rank_key)
                     ],
                     "advanced": r.advanced_to,
                     "eliminated": r.eliminated,
@@ -176,6 +371,46 @@ class TourneyResult:
             "hub_repo": self.hub_repo,
             "timestamp": self.timestamp,
         }
+
+
+def _contender_is_eligible(contender: Contender) -> bool:
+    """Return whether a contender may advance or be crowned."""
+
+    if contender.error is not None or contender.score < 0.0:
+        return False
+    try:
+        validate_acceptance_payload(contender.metrics.get("acceptance", {}))
+    except (CandidateEvidenceError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _contender_rank_key(contender: Contender) -> tuple[float, float, float, str]:
+    """Put accepted candidates first, ordered by efficacy then damage."""
+
+    if not _contender_is_eligible(contender):
+        return (1.0, 1.0, float("inf"), contender.method)
+    payload = validate_acceptance_payload(contender.metrics["acceptance"])
+    return (
+        0.0,
+        float(payload["metrics"]["refusal_rate"]),
+        damage_severity(payload),
+        contender.method,
+    )
+
+
+def _rank_and_select(
+    contenders: list[Contender],
+    advance_count: int,
+) -> tuple[list[Contender], list[Contender], list[Contender]]:
+    """Rank all results while allowing only gate-accepted ones to advance."""
+
+    ranked = sorted(contenders, key=_contender_rank_key)
+    eligible = [contender for contender in ranked if _contender_is_eligible(contender)]
+    advanced = eligible[: max(0, advance_count)]
+    advanced_ids = {id(contender) for contender in advanced}
+    eliminated = [contender for contender in ranked if id(contender) not in advanced_ids]
+    return ranked, advanced, eliminated
 
 
 CHECKPOINT_FILENAME = "tourney_checkpoint.json"
@@ -306,10 +541,11 @@ def _restore_rounds(checkpoint: dict) -> tuple[TourneyResult, list[Contender], l
             eliminated=rnd_data.get("eliminated", []),
         )
         for c_data in rnd_data.get("contenders", []):
+            restored_metrics = c_data.get("metrics", {})
             rnd.contenders.append(Contender(
                 method=c_data["method"],
-                score=c_data.get("score", 0.0),
-                metrics=c_data.get("metrics", {}),
+                score=composite_score(restored_metrics),
+                metrics=restored_metrics,
                 output_dir=c_data.get("output_dir", ""),
                 time_s=c_data.get("time_s", 0.0),
                 error=c_data.get("error"),
@@ -317,15 +553,29 @@ def _restore_rounds(checkpoint: dict) -> tuple[TourneyResult, list[Contender], l
                 direction_method=c_data.get("direction_method", ""),
                 spectral_cert=c_data.get("spectral_cert", ""),
             ))
+        eligible_methods = {
+            contender.method
+            for contender in rnd.contenders
+            if _contender_is_eligible(contender)
+        }
+        rnd.advanced_to = [
+            method for method in rnd.advanced_to if method in eligible_methods
+        ]
+        rnd.eliminated = [
+            contender.method
+            for contender in rnd.contenders
+            if contender.method not in rnd.advanced_to
+        ]
         result.rounds.append(rnd)
 
     ir = checkpoint.get("interrupted_round", {})
     partial_contenders = []
     for c_data in ir.get("completed_methods", []):
+        restored_metrics = c_data.get("metrics", {})
         partial_contenders.append(Contender(
             method=c_data["method"],
-            score=c_data.get("score", 0.0),
-            metrics=c_data.get("metrics", {}),
+            score=composite_score(restored_metrics),
+            metrics=restored_metrics,
             output_dir=c_data.get("output_dir", ""),
             time_s=c_data.get("time_s", 0.0),
             error=c_data.get("error"),
@@ -361,7 +611,7 @@ def render_bracket(result: TourneyResult) -> str:
         lines.append("| Rank | Method | Dir | Score | Refusal | Coherence | KL Div | PPL | Cert | Time |")
         lines.append("|------|--------|-----|-------|---------|-----------|--------|-----|------|------|")
 
-        sorted_contenders = sorted(rnd.contenders, key=lambda x: x.score, reverse=True)
+        sorted_contenders = sorted(rnd.contenders, key=_contender_rank_key)
         for i, c in enumerate(sorted_contenders, 1):
             if c.error:
                 lines.append(
@@ -636,7 +886,7 @@ def render_bracket_html(result: TourneyResult) -> str:
             f'<div class="round-subtitle">{rnd.prompt_volume} pairs</div></div>'
         )
 
-        sorted_c = sorted(rnd.contenders, key=lambda c: c.score, reverse=True)
+        sorted_c = sorted(rnd.contenders, key=_contender_rank_key)
         is_final = ri == n_rounds - 1
 
         for rank, c in enumerate(sorted_c, 1):
@@ -750,7 +1000,7 @@ in elimination rounds.
 
 | Metric | Value |
 |--------|-------|
-| Composite Score | **{w.score:.4f}** |
+| Refusal-removal efficacy | **{w.score:.4f}** |
 | Direction Method | {w.direction_method or 'N/A'} |
 | Refusal Rate | {f'{w.metrics["refusal_rate"]:.1%}' if w.metrics.get('refusal_rate') is not None else 'N/A'} |
 | Coherence | {f'{w.metrics["coherence"]:.3f}' if w.metrics.get('coherence') is not None else 'N/A'} |
@@ -832,6 +1082,7 @@ class TourneyRunner:
         on_log: Callable[[str], None] | None = None,
         on_round: Callable[[TourneyRound], None] | None = None,
         resume: bool = False,
+        trust_remote_code: bool = False,
     ):
         self.model_name = model_name
         self.hub_org = hub_org
@@ -841,26 +1092,158 @@ class TourneyRunner:
         self.dataset_key = dataset_key
         self.quantization = quantization
         self.methods = methods or list(TOURNEY_METHODS)
-        self.output_dir = Path(output_dir)
+        self.requested_output_dir = Path(output_dir).expanduser()
+        self.output_dir = resolve_tourney_output_dir(
+            self.requested_output_dir,
+            resume=resume,
+        )
         self.resume = resume
+        self.trust_remote_code = trust_remote_code
 
-        # When resuming, preserve the output directory (it contains
-        # checkpoints and model saves from completed methods).
-        if not resume:
-            if self.output_dir.exists():
-                shutil.rmtree(self.output_dir, ignore_errors=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # A pre-marker checkpoint can still be resumed in place.  Only adopt it
+        # as a non-exclusive run when its configuration matches this runner;
+        # otherwise route the fresh work to a safe owned directory.
+        owner = _owner_marker(self.output_dir)
+        if resume and owner is None and _has_legacy_resume_checkpoint(self.output_dir):
+            checkpoint = _load_checkpoint(self.output_dir)
+            marker_available = not _path_exists(
+                self.output_dir / TOURNEY_OWNER_FILENAME
+            )
+            if marker_available and checkpoint is not None and _checkpoint_matches(
+                checkpoint,
+                self.model_name,
+                self.dataset_key,
+                self.quantization,
+            ):
+                _initialize_resume_run_dir(self.output_dir)
+                owner = _owner_marker(self.output_dir)
+            else:
+                self.output_dir = resolve_tourney_output_dir(
+                    self.requested_output_dir,
+                    resume=False,
+                )
+                owner = _owner_marker(self.output_dir)
+
+        # A fresh run may only reset a directory that this tool created and
+        # marked as exclusively owned.  An unrelated non-empty path is handled
+        # by ``resolve_tourney_output_dir`` via a dedicated child directory.
+        # Resume never cleans its run directory.
+        if resume and owner is not None:
+            pass
+        elif not resume and _exclusive_owner_marker(self.output_dir) is not None:
+            _reset_owned_run_dir(self.output_dir)
+        elif not _path_exists(self.output_dir) or _directory_is_empty(self.output_dir):
+            _initialize_owned_run_dir(self.output_dir)
+        else:  # Defend against a path replacement between resolve and init.
+            raise TourneyOutputSafetyError(
+                "Tournament output became non-empty before it could be claimed; "
+                f"no files were removed: {self.output_dir}"
+            )
         self._on_log = on_log or _noop_log
         self._on_round = on_round or _noop_round
 
     def log(self, msg: str):
         self._on_log(msg)
 
+    def _register_candidate_dir(self, candidate: Path) -> Path:
+        """Record a direct child as tool-owned before a method may write it."""
+
+        owner = _owner_marker(self.output_dir)
+        if owner is None:
+            raise TourneyOutputSafetyError(
+                f"Tournament run directory lost its ownership marker: {self.output_dir}"
+            )
+        resolved_root = self.output_dir.resolve()
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate.parent != resolved_root or candidate.is_symlink():
+            raise TourneyOutputSafetyError(
+                f"Candidate output must be a direct child of the tournament run: {candidate}"
+            )
+
+        name = resolved_candidate.name
+        owned_children = list(owner["owned_children"])
+        if _path_exists(candidate) and name not in owned_children:
+            raise TourneyOutputSafetyError(
+                f"Refusing to replace unowned candidate output: {candidate}"
+            )
+        if name not in owned_children:
+            owned_children.append(name)
+            owner["owned_children"] = owned_children
+            _write_owner_marker(self.output_dir, owner)
+        return candidate
+
+    def _candidate_dir(self, round_num: int, method: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", method):
+            raise TourneyOutputSafetyError(
+                f"Candidate method is not a safe directory component: {method!r}"
+            )
+        return self._register_candidate_dir(
+            self.output_dir / f"r{round_num}_{method}"
+        )
+
+    def _remove_owned_candidate_dir(self, candidate: str | os.PathLike[str]) -> bool:
+        """Remove a candidate only when the root manifest proves ownership."""
+
+        path = Path(candidate)
+        owner = _owner_marker(self.output_dir)
+        if owner is None:
+            self.log(f"  Skipping cleanup without run ownership marker: {path}")
+            return False
+        try:
+            relative = path.resolve().relative_to(self.output_dir.resolve())
+        except (OSError, ValueError):
+            self.log(f"  Skipping cleanup outside tournament output: {path}")
+            return False
+        if len(relative.parts) != 1 or relative.name not in owner["owned_children"]:
+            self.log(f"  Skipping cleanup of unowned candidate output: {path}")
+            return False
+        if not _path_exists(path):
+            return False
+        if path.is_symlink() or not path.is_dir():
+            self.log(f"  Skipping unsafe candidate cleanup target: {path}")
+            return False
+
+        shutil.rmtree(path)
+        owner["owned_children"] = [
+            name for name in owner["owned_children"] if name != relative.name
+        ]
+        _write_owner_marker(self.output_dir, owner)
+        return True
+
     def _load_prompts(self, volume: int) -> tuple[list[str], list[str]]:
         from obliteratus.prompts import load_dataset_source
         harmful, harmless = load_dataset_source(self.dataset_key)
         n = min(volume, len(harmful), len(harmless))
         return harmful[:n], harmless[:n]
+
+    def _load_prompt_sets(
+        self,
+        volume: int,
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Return disjoint direction-discovery and locked evaluation pairs."""
+
+        from obliteratus.evaluation.prompt_split import split_prompt_pairs
+        from obliteratus.prompts import load_dataset_source
+
+        harmful, harmless = load_dataset_source(self.dataset_key)
+        split = split_prompt_pairs(
+            harmful,
+            harmless,
+            holdout_fraction=0.15,
+            seed=42,
+            min_holdout=32,
+        )
+        n = min(
+            volume,
+            len(split.discovery_harmful),
+            len(split.discovery_harmless),
+        )
+        return (
+            list(split.discovery_harmful[:n]),
+            list(split.discovery_harmless[:n]),
+            list(split.holdout_harmful),
+            list(split.holdout_harmless),
+        )
 
     def _run_method(
         self,
@@ -869,6 +1252,8 @@ class TourneyRunner:
         harmless: list[str],
         save_dir: str,
         verify_sample_size: int = 30,
+        evaluation_harmful: list[str] | None = None,
+        evaluation_harmless: list[str] | None = None,
     ) -> Contender:
         """Run a single abliteration method and return its Contender result."""
         import torch
@@ -888,9 +1273,12 @@ class TourneyRunner:
                     device=self.device,
                     dtype=self.dtype,
                     quantization=self.quantization,
-                    trust_remote_code=True,
+                    trust_remote_code=self.trust_remote_code,
                     harmful_prompts=harmful,
                     harmless_prompts=harmless,
+                    evaluation_harmful_prompts=evaluation_harmful,
+                    evaluation_harmless_prompts=evaluation_harmless,
+                    damage_gate_enabled=True,
                     on_log=method_log,
                 )
                 pipeline.run_informed()
@@ -903,16 +1291,26 @@ class TourneyRunner:
                     dtype=self.dtype,
                     method=method,
                     quantization=self.quantization,
-                    trust_remote_code=True,
+                    trust_remote_code=self.trust_remote_code,
                     harmful_prompts=harmful,
                     harmless_prompts=harmless,
+                    evaluation_harmful_prompts=evaluation_harmful,
+                    evaluation_harmless_prompts=evaluation_harmless,
+                    damage_gate_enabled=True,
                     verify_sample_size=verify_sample_size,
                     on_log=method_log,
                 )
                 pipeline.run()
 
-            contender.metrics = dict(pipeline._quality_metrics)
+            contender.metrics = add_acceptance_evidence(
+                getattr(pipeline, "_quality_metrics", {}) or {},
+                getattr(pipeline, "_damage_assessment", None),
+            )
             contender.score = composite_score(contender.metrics)
+            if contender.score < 0.0:
+                raise CandidateEvidenceError(
+                    "candidate did not produce complete accepted damage evidence"
+                )
             contender.output_dir = save_dir
             contender.direction_method = getattr(pipeline, "direction_method", "")
             contender.spectral_cert = contender.metrics.get("spectral_certification", "") or ""
@@ -960,7 +1358,9 @@ class TourneyRunner:
                  f"top {advance_count} advance")
         self.log("=" * 60)
 
-        harmful, harmless = self._load_prompts(prompt_volume)
+        harmful, harmless, evaluation_harmful, evaluation_harmless = (
+            self._load_prompt_sets(prompt_volume)
+        )
 
         rnd = TourneyRound(
             round_num=round_num,
@@ -970,9 +1370,15 @@ class TourneyRunner:
 
         for i, method in enumerate(methods, 1):
             self.log(f"\n[{i}/{len(methods)}] Running: {method}")
-            save_dir = str(self.output_dir / f"r{round_num}_{method}")
+            save_dir = str(self._candidate_dir(round_num, method))
             contender = self._run_method(
-                method, harmful, harmless, save_dir, verify_sample_size,
+                method,
+                harmful,
+                harmless,
+                save_dir,
+                verify_sample_size,
+                evaluation_harmful,
+                evaluation_harmless,
             )
             rnd.contenders.append(contender)
             self.log(
@@ -986,12 +1392,15 @@ class TourneyRunner:
             # We'll keep them until we know who advances
 
         # Rank by score
-        ranked = sorted(rnd.contenders, key=lambda c: c.score, reverse=True)
-        rnd.advanced_to = [c.method for c in ranked[:advance_count]]
-        rnd.eliminated = [c.method for c in ranked[advance_count:]]
+        ranked, advanced, eliminated = _rank_and_select(
+            rnd.contenders,
+            advance_count,
+        )
+        rnd.advanced_to = [c.method for c in advanced]
+        rnd.eliminated = [c.method for c in eliminated]
 
         # Mark eliminated
-        for c in ranked[advance_count:]:
+        for c in eliminated:
             c.round_eliminated = round_num
 
         self.log(f"\n{'─' * 40}")
@@ -1001,9 +1410,9 @@ class TourneyRunner:
             self.log(f"  {i}. {c.method}: {c.score:.4f} [{status}]")
 
         # Clean up eliminated checkpoints to free disk
-        for c in ranked[advance_count:]:
-            if c.output_dir and Path(c.output_dir).exists():
-                shutil.rmtree(c.output_dir, ignore_errors=True)
+        for c in eliminated:
+            if c.output_dir:
+                self._remove_owned_candidate_dir(c.output_dir)
 
         self._on_round(rnd)
         return rnd
@@ -1043,7 +1452,7 @@ class TourneyRunner:
             methods=self.methods,
             prompt_volume=64,       # fast qualifier round
             advance_count=r1_advance,
-            verify_sample_size=20,
+            verify_sample_size=30,
         )
         result.rounds.append(r1)
         alive = list(r1.advanced_to)
@@ -1092,16 +1501,18 @@ class TourneyRunner:
 
         # ── Determine winner ──────────────────────────────────────────
         last_round = result.rounds[-1]
-        ranked = sorted(last_round.contenders, key=lambda c: c.score, reverse=True)
-        # Only crown a winner if they completed without error
-        winner = ranked[0] if ranked and not ranked[0].error else None
+        ranked, eligible_finalists, _ = _rank_and_select(
+            last_round.contenders,
+            len(last_round.contenders),
+        )
+        winner = eligible_finalists[0] if eligible_finalists else None
         result.winner = winner
         result.total_time_s = time.time() - t_start
 
         # Clean up non-winner finalist dirs to free disk
-        for c in ranked[1:]:
-            if c.output_dir and Path(c.output_dir).exists():
-                shutil.rmtree(c.output_dir, ignore_errors=True)
+        for c in ranked:
+            if c is not winner and c.output_dir:
+                self._remove_owned_candidate_dir(c.output_dir)
 
         self.log("")
         self.log("=" * 60)
@@ -1137,15 +1548,31 @@ class TourneyRunner:
             return True
         return False
 
-    def _run_one_method(self, method, harmful, harmless, save_dir, verify_sz, gpu_wrapper):
+    def _run_one_method(
+        self,
+        method,
+        harmful,
+        harmless,
+        save_dir,
+        verify_sz,
+        gpu_wrapper,
+        evaluation_harmful=None,
+        evaluation_harmless=None,
+    ):
         """Run a single method, optionally inside a gpu_wrapper."""
         if gpu_wrapper is not None:
             return gpu_wrapper(
                 self._run_method, method, harmful, harmless,
-                save_dir, verify_sz,
+                save_dir, verify_sz, evaluation_harmful, evaluation_harmless,
             )
         return self._run_method(
-            method, harmful, harmless, save_dir, verify_sz,
+            method,
+            harmful,
+            harmless,
+            save_dir,
+            verify_sz,
+            evaluation_harmful,
+            evaluation_harmless,
         )
 
     def run_iter(self, gpu_wrapper=None):
@@ -1253,7 +1680,7 @@ class TourneyRunner:
         # Always build the full schedule starting from round 1.
         # Completed rounds will be skipped below.
         r1_advance = max(2, math.ceil(n_methods / 2))
-        rounds_schedule.append((1, "Qualifiers", self.methods, 64, r1_advance, 20))
+        rounds_schedule.append((1, "Qualifiers", self.methods, 64, r1_advance, 30))
 
         for round_spec in rounds_schedule:
             round_num, name, methods, volume, advance_count, verify_sz = round_spec
@@ -1299,7 +1726,9 @@ class TourneyRunner:
                      f"top {advance_count} advance")
             self.log("=" * 60)
 
-            harmful, harmless = self._load_prompts(volume)
+            harmful, harmless, evaluation_harmful, evaluation_harmless = (
+                self._load_prompt_sets(volume)
+            )
 
             rnd = TourneyRound(
                 round_num=round_num,
@@ -1327,12 +1756,12 @@ class TourneyRunner:
                     result,
                 )
 
-                save_dir = str(self.output_dir / f"r{round_num}_{method}")
+                save_dir = str(self._candidate_dir(round_num, method))
 
                 try:
                     contender = self._run_one_method(
                         method, harmful, harmless, save_dir, verify_sz,
-                        gpu_wrapper,
+                        gpu_wrapper, evaluation_harmful, evaluation_harmless,
                     )
                 except Exception as exc:
                     if self._is_quota_error(exc):
@@ -1371,10 +1800,13 @@ class TourneyRunner:
                 )
 
             # Rank, advance, eliminate
-            ranked = sorted(rnd.contenders, key=lambda c: c.score, reverse=True)
-            rnd.advanced_to = [c.method for c in ranked[:advance_count]]
-            rnd.eliminated = [c.method for c in ranked[advance_count:]]
-            for c in ranked[advance_count:]:
+            ranked, advanced, eliminated = _rank_and_select(
+                rnd.contenders,
+                advance_count,
+            )
+            rnd.advanced_to = [c.method for c in advanced]
+            rnd.eliminated = [c.method for c in eliminated]
+            for c in eliminated:
                 c.round_eliminated = round_num
 
             self.log(f"\n{'─' * 40}")
@@ -1384,9 +1816,9 @@ class TourneyRunner:
                 self.log(f"  {idx}. {c.method}: {c.score:.4f} [{status}]")
 
             # Clean up eliminated checkpoints
-            for c in ranked[advance_count:]:
-                if c.output_dir and Path(c.output_dir).exists():
-                    shutil.rmtree(c.output_dir, ignore_errors=True)
+            for c in eliminated:
+                if c.output_dir:
+                    self._remove_owned_candidate_dir(c.output_dir)
 
             self._on_round(rnd)
             result.rounds.append(rnd)
@@ -1402,15 +1834,18 @@ class TourneyRunner:
 
         # ── Determine winner ──────────────────────────────────────────
         last_round = result.rounds[-1]
-        ranked = sorted(last_round.contenders, key=lambda c: c.score, reverse=True)
-        winner = ranked[0] if ranked and not ranked[0].error else None
+        ranked, eligible_finalists, _ = _rank_and_select(
+            last_round.contenders,
+            len(last_round.contenders),
+        )
+        winner = eligible_finalists[0] if eligible_finalists else None
         result.winner = winner
         result.total_time_s = time.time() - t_start
 
         # Clean up non-winner finalist dirs to free disk
-        for c in ranked[1:]:
-            if c.output_dir and Path(c.output_dir).exists():
-                shutil.rmtree(c.output_dir, ignore_errors=True)
+        for c in ranked:
+            if c is not winner and c.output_dir:
+                self._remove_owned_candidate_dir(c.output_dir)
 
         self.log("")
         self.log("=" * 60)

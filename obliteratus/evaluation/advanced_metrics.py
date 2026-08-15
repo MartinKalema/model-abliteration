@@ -312,7 +312,12 @@ def _is_refusal(response: str, mode: str = "combined") -> bool:
     return False
 
 
-def _is_refusal_detailed(response: str, mode: str = "combined") -> tuple[bool, str]:
+def _is_refusal_detailed(
+    response: str,
+    mode: str = "combined",
+    *,
+    strip_reasoning: bool = True,
+) -> tuple[bool, str]:
     """Check if a single response is a refusal, returning the match reason.
 
     Returns:
@@ -322,11 +327,12 @@ def _is_refusal_detailed(response: str, mode: str = "combined") -> tuple[bool, s
     """
     text = response.strip()
     if not text:
-        return False, ""
+        return False, "DEGENERATE"
 
-    text = _strip_cot_tags(text)
-    if not text:
-        return False, ""
+    if strip_reasoning:
+        text = _strip_cot_tags(text)
+        if not text:
+            return False, "DEGENERATE"
 
     # Detect degenerate/broken model output before refusal checks
     if _is_degenerate(text):

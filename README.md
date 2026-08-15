@@ -225,6 +225,60 @@ obliteratus aggregate --format summary
 obliteratus aggregate --format latex --metric refusal_rate --min-runs 3
 ```
 
+#### GGUF input and output
+
+OBLITERATUS accepts a local GGUF or a GGUF file in a Hugging Face repository.
+It dequantizes the checkpoint into editable FP16/BF16 PyTorch weights, performs
+the intervention, saves a dense Hugging Face staging checkpoint, converts that
+checkpoint with a pinned `llama.cpp` checkout, and quantizes the result exactly
+once. Packed Q4 tensors are never edited or requantized in place.
+
+GGUF imports require a canonical configuration source (`--base-model-id`, or
+an offline `--tokenizer-path` directory that also contains `config.json`). The
+pinned Transformers release has incomplete GPT-OSS and Gemma 4 GGUF mappings;
+OBLITERATUS applies a scoped compatibility layer and audits every source tensor
+against the canonical meta-model before any expensive dequantization begins.
+
+```bash
+# GPT-OSS 20B
+obliteratus obliterate models/gpt-oss-20b/gpt-oss-20b-Q4_K_M.gguf \
+    --base-model-id openai/gpt-oss-20b \
+    --tokenizer-path openai/gpt-oss-20b \
+    --dtype bfloat16 \
+    --output-format gguf \
+    --gguf-quant Q4_K_M \
+    --llama-cpp-dir /path/to/llama.cpp \
+    --output-dir abliterated/gpt-oss-20b
+
+# Gemma 4 26B A4B (GGUF contains the text backbone)
+obliteratus obliterate models/gemma-4-26b-a4b-it/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
+    --base-model-id google/gemma-4-26B-A4B-it \
+    --tokenizer-path google/gemma-4-26B-A4B-it \
+    --dtype bfloat16 \
+    --output-format both \
+    --gguf-quant Q4_K_M \
+    --llama-cpp-dir /path/to/llama.cpp \
+    --output-dir abliterated/gemma-4-26b-a4b-it
+```
+
+`--output-format gguf` publishes a bundle directory containing one top-level
+GGUF, the exact tokenizer/chat template, and abliteration metadata. `both` also
+keeps the validated dense Hugging Face checkpoint under `hf/`. The default
+post-quantization gate reloads the final GGUF, checks tensor coverage and the
+tokenizer contract, runs a one-token `llama.cpp` smoke test, and rejects excess
+quality drift before the bundle is atomically published.
+
+GGUF storage size is not editing memory. A Q4 file is expanded to every dense
+parameter: budget roughly 40–50 GB just for GPT-OSS weights and 50–60 GB for
+Gemma 4 weights, plus activations, state-dict gathering, conversion workspace,
+and output. Use a high-memory host and ample temporary disk. `--quantization`
+still means BitsAndBytes in-memory loading and is intentionally incompatible
+with GGUF input. The SSH remote runner does not upload GGUF artifacts; invoke
+the local CLI on a host where the files and pinned `llama.cpp` checkout exist.
+The supported toolchain is pinned to `llama.cpp` commit
+`8e7f22b67ef4667b4ddd50230771287f328cfb3f`; every export records the checkout's
+actual Git revision in `abliteration_metadata.json` for reproducibility.
+
 ### 5. Python API (full programmatic control)
 
 For researchers who want to integrate OBLITERATUS into their own pipelines:
@@ -668,7 +722,7 @@ obliteratus run examples/preset_quick.yaml
 | Analysis-informed abliteration | Yes (closed-loop feedback) | N/A | N/A | N/A | N/A | N/A |
 | Auto parameter optimization | Analysis-guided | N/A | Bayesian (Optuna) | N/A | N/A | N/A |
 | Model compatibility | Any HuggingFace model | ~50 architectures | 16/16 tested | TransformerLens only | HuggingFace | TransformerLens |
-| Test suite | 837 tests | Community | Unknown | None | Minimal | Moderate |
+| Test suite | 1,000+ tests | Community | Unknown | None | Minimal | Moderate |
 
 ## Community-powered research — every run advances the science
 
@@ -681,7 +735,7 @@ This is where OBLITERATUS gets truly unprecedented: **it's a crowd-sourced resea
 Enable telemetry and your runs automatically contribute to the shared dataset. On HuggingFace Spaces it's on by default — every person who clicks "Obliterate" on the Space is advancing the research without lifting a finger. Locally, opt in with a single flag:
 
 ```bash
-# Every run with --contribute feeds the community dataset
+# Save a local contribution record (submit it separately by pull request)
 obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct --method advanced \
     --contribute --contribute-notes "A100, default prompts"
 
@@ -689,7 +743,13 @@ obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct --method advanced \
 export OBLITERATUS_TELEMETRY=1
 ```
 
-**What gets collected:** model name, method, aggregate benchmark scores (refusal rate, perplexity, coherence, KL divergence), hardware info, and timestamps. **What never gets collected:** prompts, outputs, IP addresses, user identity, or anything that could trace back to you. The full schema is in `obliteratus/telemetry.py` — read every line, we have nothing to hide.
+**What gets collected:** depending on schema version, model or architecture
+metadata, method/configuration, aggregate quality evidence, hardware/software
+information, timestamps, and error text. Project telemetry does not include
+prompt or generated-response bodies. Exact local model paths and raw errors can
+still contain identifying path text, and the hosting/network providers involved
+in an upload can observe ordinary connection metadata. Review the current schema
+in `obliteratus/telemetry.py` before enabling it.
 
 ### The community leaderboard
 
@@ -762,7 +822,7 @@ If you use OBLITERATUS in your research, please cite:
   author    = {{OBLITERATUS Contributors}},
   year      = {2026},
   url       = {https://github.com/elder-plinius/OBLITERATUS},
-  note      = {15 analysis modules, 837 tests}
+  note      = {15 analysis modules, 1,000+ tests}
 }
 ```
 
@@ -773,7 +833,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-837 tests across 28 test files covering CLI, all analysis modules, abliteration pipeline, architecture detection, visualization sanitization, community contributions, edge cases, and evaluation metrics.
+More than 1,000 tests cover the CLI, analysis modules, abliteration pipeline,
+architecture detection, visualization sanitization, community contributions,
+edge cases, and evaluation metrics.
 
 ## License
 

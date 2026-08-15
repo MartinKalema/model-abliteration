@@ -341,6 +341,7 @@ METHODS = {
     "gabliteration (Gülmez 2026 baseline)": "gabliteration",
     "heretic (p-e-w 2025-2026 baseline)": "heretic",
     "rdo (Wollschlager ICML 2025 baseline)": "rdo",
+    "som (AAAI 2026 manifold directions)": "som",
 }
 
 # ── Community Hub push ────────────────────────────────────────────────
@@ -353,6 +354,7 @@ _HUB_COMMUNITY_TOKEN = os.environ.get("OBLITERATUS_HUB_TOKEN")
 from obliteratus.abliterate import METHODS as _PRESET_CONFIGS  # noqa: E402
 from obliteratus.prompts import (  # noqa: E402
     DATASET_SOURCES,
+    PROMPT_VOLUME_OPTIONS,
     get_source_choices,
     get_source_key_from_label,
     get_valid_volumes,
@@ -367,6 +369,7 @@ def _get_preset_defaults(method_display: str):
     return {
         "n_directions": cfg.get("n_directions", 4),
         "direction_method": cfg.get("direction_method", "svd"),
+        "projection_target": cfg.get("projection_target", "output"),
         "regularization": cfg.get("regularization", 0.3),
         "refinement_passes": cfg.get("refinement_passes", 2),
         "norm_preserve": cfg.get("norm_preserve", True),
@@ -411,6 +414,7 @@ def _on_method_change(method_display: str):
     return (
         d["n_directions"],
         d["direction_method"],
+        d["projection_target"],
         d["regularization"],
         d["refinement_passes"],
         d["reflection_strength"],
@@ -455,12 +459,18 @@ def _on_dataset_change(dataset_label: str):
     valid = get_valid_volumes(key)
     source = DATASET_SOURCES.get(key)
     desc = source.description if source else ""
-    # Pick a sensible default: "33 (fast)" if available, else the first option
-    default = valid[0] if valid else "all (use entire dataset)"
-    for v in valid:
-        if "33" in v:
-            default = v
-            break
+    # The fail-closed gate needs enough pairs for both discovery and a
+    # 32-prompt held-out set. Prefer 99, then the smallest available volume
+    # of at least 64; use the full dataset when no fixed safe volume exists.
+    default = "all (use entire dataset)"
+    if "99 (classic)" in valid:
+        default = "99 (classic)"
+    else:
+        for label in valid:
+            volume = PROMPT_VOLUME_OPTIONS[label]
+            if volume >= 64:
+                default = label
+                break
     return gr.update(choices=valid, value=default), f"*{desc}*"
 
 
@@ -643,11 +653,12 @@ def push_session_to_hub(
             if dataset_key == "custom":
                 dataset_key = "builtin"
             harmful, harmless = load_dataset_source(dataset_key)
-            n = min(33, len(harmful), len(harmless))
+            n = min(99, len(harmful), len(harmless))
+            refined_output_dir = f"{output_dir}.refined"
 
             pipeline = AbliterationPipeline(
                 model_name=output_dir,  # load from saved checkpoint
-                output_dir=output_dir,
+                output_dir=refined_output_dir,
                 device="auto",
                 dtype="float16",
                 method=meta.get("method", "advanced"),
@@ -655,8 +666,9 @@ def push_session_to_hub(
                 refinement_passes=refine_passes,
                 harmful_prompts=harmful[:n],
                 harmless_prompts=harmless[:n],
+                overwrite_output=True,
             )
-            pipeline.run()
+            output_dir = str(pipeline.run())
         except Exception as e:
             yield f"**Refinement failed:** {e}", ""
             return
@@ -694,14 +706,7 @@ def push_session_to_hub(
     )
 
 
-PROMPT_VOLUMES = {
-    "33 (fast)": 33,
-    "66 (better signal)": 66,
-    "99 (classic)": 99,
-    "256 (balanced)": 256,
-    "512 (built-in max)": 512,
-    "all (use entire dataset)": -1,  # -1 = use all available
-}
+PROMPT_VOLUMES = dict(PROMPT_VOLUME_OPTIONS)
 
 # Models that need 4bit quantization to fit on a T4 16GB
 _NEEDS_QUANTIZATION = {
@@ -1206,6 +1211,7 @@ def benchmark(
                     pipeline = InformedAbliterationPipeline(
                         model_name=model_id,
                         output_dir=f"/tmp/bench_{method_key}",
+                        overwrite_output=True,
                         device="auto",
                         dtype="float16",
                         quantization=quantization,
@@ -1222,6 +1228,7 @@ def benchmark(
                     pipeline = AbliterationPipeline(
                         model_name=model_id,
                         output_dir=f"/tmp/bench_{method_key}",
+                        overwrite_output=True,
                         device="auto",
                         dtype="float16",
                         method=method_key,
@@ -1561,6 +1568,7 @@ def benchmark_multi_model(
                     pipeline = InformedAbliterationPipeline(
                         model_name=model_id,
                         output_dir=f"/tmp/bench_mm_{mi}",
+                        overwrite_output=True,
                         device="auto",
                         dtype="float16",
                         quantization=quantization,
@@ -1577,6 +1585,7 @@ def benchmark_multi_model(
                     pipeline = AbliterationPipeline(
                         model_name=model_id,
                         output_dir=f"/tmp/bench_mm_{mi}",
+                        overwrite_output=True,
                         device="auto",
                         dtype="float16",
                         method=method_key,
@@ -1806,6 +1815,7 @@ def obliterate(model_choice: str, method_choice: str,
                custom_harmful: str, custom_harmless: str,
                # Advanced params (sliders + radio)
                adv_n_directions: int, adv_direction_method: str,
+               adv_projection_target: str,
                adv_regularization: float,
                adv_refinement_passes: int, adv_reflection_strength: float,
                adv_embed_regularization: float, adv_steering_strength: float,
@@ -1841,13 +1851,17 @@ def obliterate(model_choice: str, method_choice: str,
     model_id = MODELS.get(model_choice, model_choice)
     is_preset = model_choice in MODELS
     method = METHODS.get(method_choice, "advanced")
+    _adaptive_requested = method == "adaptive"
+    _adaptive_overrides = {}
+    _adaptive_rejected = {}
     prompt_volume = PROMPT_VOLUMES.get(prompt_volume_choice, 33)
 
     # Resolve "adaptive" → telemetry-recommended method for this model
     _adaptive_info = ""
-    if method == "adaptive":
+    if _adaptive_requested:
         try:
             from obliteratus.architecture_profiles import detect_architecture, enhance_profile_with_telemetry
+            from obliteratus.adaptive_surface import validate_adaptive_overrides
             from transformers import AutoConfig
             try:
                 _cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
@@ -1857,18 +1871,29 @@ def obliterate(model_choice: str, method_choice: str,
                 _cfg, _nl, _hs = None, 0, 0
             _profile = detect_architecture(model_id, _cfg, _nl, _hs)
             _profile, _rec = enhance_profile_with_telemetry(_profile)
-            if _rec and _rec.recommended_method and _rec.confidence != "none":
+            if (
+                _rec
+                and _rec.recommended_method in _PRESET_CONFIGS
+                and _rec.confidence in ("medium", "high")
+            ):
                 method = _rec.recommended_method
                 _adaptive_info = (
                     f"Adaptive: telemetry recommends `{method}` "
                     f"({_rec.confidence} confidence, {_rec.n_records} runs)"
                 )
             else:
-                method = _profile.recommended_method or "advanced"
+                method = (
+                    _profile.recommended_method
+                    if _profile.recommended_method in _PRESET_CONFIGS
+                    else "advanced"
+                )
                 _adaptive_info = (
                     f"Adaptive: using architecture default `{method}` "
                     f"(no telemetry data yet)"
                 )
+            _adaptive_overrides, _adaptive_rejected = validate_adaptive_overrides(
+                _profile.method_overrides
+            )
         except Exception:
             method = "advanced"
             _adaptive_info = "Adaptive: fallback to `advanced` (could not detect architecture)"
@@ -1956,9 +1981,22 @@ def obliterate(model_choice: str, method_choice: str,
             if method == "informed":
                 # Use the analysis-guided InformedAbliterationPipeline
                 from obliteratus.informed_pipeline import InformedAbliterationPipeline
+                _informed_override_keys = {
+                    "project_lm_head", "project_embeddings", "projection_target",
+                }
+                _informed_overrides = (
+                    {
+                        key: value
+                        for key, value in _adaptive_overrides.items()
+                        if key in _informed_override_keys
+                    }
+                    if _adaptive_requested
+                    else {"projection_target": adv_projection_target}
+                )
                 pipeline = InformedAbliterationPipeline(
                     model_name=model_id,
                     output_dir=save_dir,
+                    overwrite_output=True,
                     device="auto",
                     dtype="float16",
                     quantization=quantization,
@@ -1967,14 +2005,61 @@ def obliterate(model_choice: str, method_choice: str,
                     harmless_prompts=harmless_all[:n],
                     on_stage=on_stage,
                     on_log=on_log,
+                    **_informed_overrides,
                 )
                 pipeline_ref[0] = pipeline
                 pipeline.run_informed()
             else:
                 from obliteratus.abliterate import AbliterationPipeline
+                if _adaptive_requested:
+                    # Let the selected method supply its own preset. Only
+                    # architecture/telemetry overrides cross this boundary;
+                    # the Advanced panel currently displays a different preset.
+                    _edit_overrides = dict(_adaptive_overrides)
+                else:
+                    _edit_overrides = {
+                        "n_directions": int(adv_n_directions),
+                        "direction_method": adv_direction_method,
+                        "projection_target": adv_projection_target,
+                        "regularization": float(adv_regularization),
+                        "refinement_passes": int(adv_refinement_passes),
+                        "norm_preserve": adv_norm_preserve,
+                        "project_biases": adv_project_biases,
+                        "use_chat_template": adv_use_chat_template,
+                        "use_whitened_svd": adv_use_whitened_svd,
+                        "true_iterative_refinement": adv_true_iterative,
+                        "use_jailbreak_contrast": adv_jailbreak_contrast,
+                        "layer_adaptive_strength": adv_layer_adaptive,
+                        "safety_neuron_masking": adv_safety_neuron,
+                        "per_expert_directions": adv_per_expert,
+                        "attention_head_surgery": adv_attn_surgery,
+                        "use_sae_features": adv_sae_features,
+                        "invert_refusal": adv_invert_refusal,
+                        "reflection_strength": float(adv_reflection_strength),
+                        "project_embeddings": adv_project_embeddings,
+                        "embed_regularization": float(adv_embed_regularization),
+                        "activation_steering": adv_activation_steering,
+                        "steering_strength": float(adv_steering_strength),
+                        "expert_transplant": adv_expert_transplant,
+                        "transplant_blend": float(adv_transplant_blend),
+                        "use_wasserstein_optimal": adv_wasserstein_optimal,
+                        "spectral_cascade": adv_spectral_cascade,
+                        "spectral_bands": int(adv_spectral_bands),
+                        "spectral_threshold": float(adv_spectral_threshold),
+                        "layer_selection": adv_layer_selection,
+                        "winsorize_activations": adv_winsorize,
+                        "winsorize_percentile": float(adv_winsorize_percentile),
+                        "use_kl_optimization": adv_kl_optimization,
+                        "kl_budget": float(adv_kl_budget),
+                        "float_layer_interpolation": adv_float_layer_interp,
+                        "rdo_refinement": adv_rdo_refinement,
+                        "cot_aware": adv_cot_aware,
+                        "n_sae_features": int(adv_n_sae_features),
+                    }
                 pipeline = AbliterationPipeline(
                     model_name=model_id,
                     output_dir=save_dir,
+                    overwrite_output=True,
                     device="auto",
                     dtype="float16",
                     method=method,
@@ -1984,44 +2069,8 @@ def obliterate(model_choice: str, method_choice: str,
                     harmless_prompts=harmless_all[:n],
                     on_stage=on_stage,
                     on_log=on_log,
-                    # Advanced overrides from UI
-                    n_directions=int(adv_n_directions),
-                    direction_method=adv_direction_method,
-                    regularization=float(adv_regularization),
-                    refinement_passes=int(adv_refinement_passes),
-                    norm_preserve=adv_norm_preserve,
-                    project_biases=adv_project_biases,
-                    use_chat_template=adv_use_chat_template,
-                    use_whitened_svd=adv_use_whitened_svd,
-                    true_iterative_refinement=adv_true_iterative,
-                    use_jailbreak_contrast=adv_jailbreak_contrast,
-                    layer_adaptive_strength=adv_layer_adaptive,
-                    safety_neuron_masking=adv_safety_neuron,
-                    per_expert_directions=adv_per_expert,
-                    attention_head_surgery=adv_attn_surgery,
-                    use_sae_features=adv_sae_features,
-                    invert_refusal=adv_invert_refusal,
-                    reflection_strength=float(adv_reflection_strength),
-                    project_embeddings=adv_project_embeddings,
-                    embed_regularization=float(adv_embed_regularization),
-                    activation_steering=adv_activation_steering,
-                    steering_strength=float(adv_steering_strength),
-                    expert_transplant=adv_expert_transplant,
-                    transplant_blend=float(adv_transplant_blend),
-                    use_wasserstein_optimal=adv_wasserstein_optimal,
-                    spectral_cascade=adv_spectral_cascade,
-                    spectral_bands=int(adv_spectral_bands),
-                    spectral_threshold=float(adv_spectral_threshold),
                     verify_sample_size=int(adv_verify_sample_size),
-                    layer_selection=adv_layer_selection,
-                    winsorize_activations=adv_winsorize,
-                    winsorize_percentile=float(adv_winsorize_percentile),
-                    use_kl_optimization=adv_kl_optimization,
-                    kl_budget=float(adv_kl_budget),
-                    float_layer_interpolation=adv_float_layer_interp,
-                    rdo_refinement=adv_rdo_refinement,
-                    cot_aware=adv_cot_aware,
-                    n_sae_features=int(adv_n_sae_features),
+                    **_edit_overrides,
                 )
                 pipeline_ref[0] = pipeline
                 pipeline.run()
@@ -2037,6 +2086,11 @@ def obliterate(model_choice: str, method_choice: str,
     log_lines.append(f"Method: {method}")
     if _adaptive_info:
         log_lines.append(_adaptive_info)
+        if _adaptive_rejected:
+            log_lines.append(
+                "Adaptive ignored invalid/non-edit overrides: "
+                + ", ".join(sorted(_adaptive_rejected))
+            )
     log_lines.append(f"Dataset: {source_label}")
     vol_label = "all" if prompt_volume == -1 else str(prompt_volume)
     log_lines.append(f"Prompt volume: {vol_label} pairs")
@@ -2746,6 +2800,7 @@ def load_bench_into_chat(choice: str, progress=gr.Progress()):
             pipeline = AbliterationPipeline(
                 model_name=model_id,
                 output_dir="/tmp/obliterated",
+                overwrite_output=True,
                 device="auto",
                 dtype="float16",
                 method=method_key,
@@ -3089,6 +3144,7 @@ def strength_sweep(model_choice: str, method_choice: str,
                 pipe = AbliterationPipeline(
                     model_id, method=method_key,
                     output_dir=f"/tmp/sweep_{step_i}",
+                    overwrite_output=True,
                     device="auto",
                     dtype="float16",
                     quantization=quantization,
@@ -3300,7 +3356,7 @@ def run_tourney(model_choice, selected_methods, dataset, quantization):
 
     from obliteratus.tourney import (
         TourneyRunner, render_bracket_html,
-        _load_checkpoint, _checkpoint_matches,
+        _load_checkpoint, _checkpoint_matches, resolve_tourney_output_dir,
     )
 
     # Resolve display label → HuggingFace model ID
@@ -3315,7 +3371,10 @@ def run_tourney(model_choice, selected_methods, dataset, quantization):
     dataset_key = get_source_key_from_label(dataset) if dataset else "builtin"
 
     # Check for a resumable checkpoint from a previous quota-interrupted run
-    tourney_dir = Path("/tmp/obliteratus_tourney")
+    tourney_dir = resolve_tourney_output_dir(
+        "/tmp/obliteratus_tourney",
+        resume=True,
+    )
     checkpoint = _load_checkpoint(tourney_dir)
     resume = (
         checkpoint is not None
@@ -4003,7 +4062,7 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
                 )
                 prompt_vol_dd = gr.Dropdown(
                     choices=list(PROMPT_VOLUMES.keys()),
-                    value="33 (fast)",
+                    value="99 (classic)",
                     label="Prompt Volume",
                     info="More prompts = better SVD signal but slower. Use 'all' for entire dataset.",
                 )
@@ -4013,7 +4072,7 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
                     choices=get_source_choices(),
                     value=get_source_choices()[0],
                     label="Dataset Source",
-                    info="Built-in (512 pairs) or download larger research datasets from HuggingFace",
+                    info="Built-in (842 pairs) or download other research datasets from HuggingFace",
                 )
             dataset_info_md = gr.Markdown(
                 f"*{DATASET_SOURCES['builtin'].description}*",
@@ -4054,10 +4113,23 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
                         label="Directions", info="Number of refusal directions to extract",
                     )
                     adv_direction_method = gr.Radio(
-                        choices=["diff_means", "svd", "leace"],
+                        choices=["diff_means", "svd", "leace", "som"],
                         value=_defaults["direction_method"],
                         label="Direction Method",
-                        info="diff_means: simple & robust, svd: multi-direction, leace: optimal erasure",
+                        info=(
+                            "diff_means: simple & robust, svd: orthogonal multi-direction, "
+                            "leace: covariance-aware erasure, som: manifold prototypes"
+                        ),
+                    )
+                    adv_projection_target = gr.Dropdown(
+                        choices=["output", "attention", "ffn", "all", "auto"],
+                        value=_defaults["projection_target"],
+                        label="Projection Target",
+                        info=(
+                            "auto tests four independent targets under the damage gate; "
+                            "it needs an unquantized model and about one extra model-size "
+                            "of CPU RAM"
+                        ),
                     )
                     adv_regularization = gr.Slider(
                         0.0, 1.0, value=_defaults["regularization"], step=0.05,
@@ -4167,7 +4239,7 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
 
             # List of all advanced controls (order must match _on_method_change return)
             _adv_controls = [
-                adv_n_directions, adv_direction_method,
+                adv_n_directions, adv_direction_method, adv_projection_target,
                 adv_regularization, adv_refinement_passes,
                 adv_reflection_strength, adv_embed_regularization,
                 adv_steering_strength, adv_transplant_blend,
@@ -4236,7 +4308,7 @@ client = Client("your-username/obliteratus")
 result = client.predict(
     model_choice="Alibaba (Qwen) / Qwen2.5-0.5B Instruct",
     methods_to_test=["basic", "advanced", "surgical", "optimized"],
-    prompt_volume_choice="33 (fast)",
+    prompt_volume_choice="99 (classic)",
     api_name="/benchmark",
 )
 ```
@@ -4250,7 +4322,7 @@ result = client.predict(
                         )
                         bench_methods = gr.CheckboxGroup(
                             choices=["basic", "advanced", "aggressive", "spectral_cascade",
-                                     "informed", "surgical", "optimized", "inverted", "nuclear",
+                                     "informed", "surgical", "optimized", "som", "inverted", "nuclear",
                                      "failspy", "gabliteration", "heretic", "rdo"],
                             value=["basic", "advanced", "spectral_cascade", "surgical"],
                             label="Methods to Compare",
@@ -4258,7 +4330,7 @@ result = client.predict(
                     with gr.Row():
                         bench_prompt_vol = gr.Dropdown(
                             choices=list(PROMPT_VOLUMES.keys()),
-                            value="33 (fast)",
+                            value="99 (classic)",
                             label="Prompt Volume",
                         )
                         bench_dataset = gr.Dropdown(
@@ -4338,7 +4410,7 @@ client = Client("your-username/obliteratus")
 result = client.predict(
     model_choices=["Alibaba (Qwen) / Qwen2.5-0.5B Instruct", "OpenAI / GPT-OSS 20B"],
     method_choice="surgical",
-    prompt_volume_choice="33 (fast)",
+    prompt_volume_choice="99 (classic)",
     api_name="/benchmark_multi_model",
 )
 ```
@@ -4356,14 +4428,14 @@ result = client.predict(
                         mm_method = gr.Dropdown(
                             choices=["basic", "advanced", "aggressive",
                                      "spectral_cascade", "informed", "surgical",
-                                     "optimized", "inverted", "nuclear",
+                                     "optimized", "som", "inverted", "nuclear",
                                      "failspy", "gabliteration", "heretic", "rdo"],
                             value="surgical",
                             label="Abliteration Method",
                         )
                         mm_prompt_vol = gr.Dropdown(
                             choices=list(PROMPT_VOLUMES.keys()),
-                            value="33 (fast)",
+                            value="99 (classic)",
                             label="Prompt Volume",
                         )
                         mm_dataset = gr.Dropdown(
@@ -4428,7 +4500,7 @@ Pre-configured benchmark configurations for common research questions.
                     with gr.Row():
                         preset_prompt_vol = gr.Dropdown(
                             choices=list(PROMPT_VOLUMES.keys()),
-                            value="33 (fast)",
+                            value="99 (classic)",
                             label="Prompt Volume",
                         )
                         preset_dataset = gr.Dropdown(
@@ -4689,7 +4761,7 @@ tradeoff point where refusal is minimized with minimal capability damage.
             with gr.Row():
                 sweep_vol_dd = gr.Dropdown(
                     choices=list(PROMPT_VOLUMES.keys()),
-                    value="33 (fast)",
+                    value="99 (classic)",
                     label="Prompt Volume",
                 )
                 sweep_dataset_dd = gr.Dropdown(

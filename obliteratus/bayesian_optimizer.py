@@ -53,21 +53,36 @@ def _measure_refusal_rate(
     chat mode — matching how users actually interact with it.  Uses token-ID
     slicing for robust completion extraction regardless of special tokens.
     """
-    from obliteratus.evaluation.advanced_metrics import refusal_rate
+    from obliteratus.evaluation.advanced_metrics import _is_refusal_detailed
 
     model = pipeline.handle.model
     tokenizer = pipeline.handle.tokenizer
     device = pipeline._get_model_device(model)
 
-    test_prompts = pipeline.harmful_prompts[:n_prompts]
+    # Hyperparameter search is part of training/selection.  It must never read
+    # the locked acceptance prompts, otherwise the final gate is no longer a
+    # holdout.  Every current pipeline constructs ``_discovery_harmful`` before
+    # optimization; the explicit failure keeps custom callers from silently
+    # falling back to the full (possibly mixed) corpus.
+    discovery_prompts = getattr(pipeline, "_discovery_harmful", None)
+    if discovery_prompts is None:
+        raise RuntimeError(
+            "Bayesian optimization requires a direction-discovery prompt set"
+        )
+    test_prompts = list(discovery_prompts[:n_prompts])
 
     # Always apply chat template for refusal measurement — refusal circuitry
     # is activated by chat formatting, so raw prompts give false 0% rates.
     saved_flag = pipeline.use_chat_template
     pipeline.use_chat_template = True
-    formatted_prompts = pipeline._maybe_apply_chat_template(test_prompts)
-    pipeline.use_chat_template = saved_flag
-    responses = []
+    try:
+        formatted_prompts = pipeline._maybe_apply_chat_template(test_prompts)
+    finally:
+        pipeline.use_chat_template = saved_flag
+    if not formatted_prompts:
+        return 1.0
+
+    target_failures = 0
 
     for prompt in formatted_prompts:
         try:
@@ -85,13 +100,19 @@ def _measure_refusal_rate(
             completion = tokenizer.decode(
                 completion_ids, skip_special_tokens=True,
             ).strip()
-            responses.append(completion)
+            refused, reason = _is_refusal_detailed(completion, mode="combined")
+            # Empty/repetitive output is not successful refusal removal.  Count
+            # it with refusals so a damaged trial cannot win the optimizer.
+            if refused or reason == "DEGENERATE":
+                target_failures += 1
             del inputs, output
-        except Exception:
-            responses.append("")  # Count failures as non-refusals
+        except Exception as exc:  # noqa: BLE001 - model backends raise heterogeneous errors
+            # A failed measurement is worst-case evidence, not compliance.
+            logger.debug("Bayesian refusal measurement failed: %s", exc)
+            target_failures += 1
 
     pipeline._free_gpu_memory()
-    return refusal_rate(responses, mode="combined") if responses else 1.0
+    return target_failures / len(formatted_prompts)
 
 
 def _measure_kl_divergence(
@@ -127,11 +148,15 @@ def _measure_kl_divergence(
             total_kl += max(kl, 0.0)  # Clamp negative KL (numerical noise)
             n_valid += 1
             del inputs, outputs, new_logits
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - model backends raise heterogeneous errors
+            # Partial/missing KL evidence must not make a broken trial appear
+            # closer to the base model than a fully measured trial.
+            logger.debug("Bayesian KL measurement failed: %s", exc)
+            pipeline._free_gpu_memory()
+            return float("inf")
 
     pipeline._free_gpu_memory()
-    return total_kl / max(n_valid, 1)
+    return total_kl / n_valid if n_valid else float("inf")
 
 
 def _parametric_layer_weight(
@@ -235,7 +260,7 @@ def _interpolate_direction(
     return d
 
 
-def run_bayesian_optimization(
+def _unsafe_legacy_run_bayesian_optimization(
     pipeline: AbliterationPipeline,
     n_trials: int = 50,
     n_refusal_prompts: int = 30,
@@ -262,6 +287,12 @@ def run_bayesian_optimization(
     Returns:
         Dict mapping layer_idx -> optimal regularization value.
     """
+    raise RuntimeError(
+        "Unsafe legacy Bayesian replay is permanently disabled; it must not edit weights"
+    )
+
+    # Retained temporarily as implementation history while the exact structured
+    # plan is developed. This block is unreachable by design.
     try:
         import optuna
         from optuna.samplers import TPESampler
@@ -291,6 +322,7 @@ def run_bayesian_optimization(
     ][:n_kl_prompts]
 
     reference_logits: list[torch.Tensor] = []
+    measured_kl_prompts: list[str] = []
     for prompt in kl_prompts:
         try:
             inputs = tokenizer(
@@ -302,21 +334,22 @@ def run_bayesian_optimization(
                 reference_logits.append(
                     outputs.logits[:, -1, :].detach().cpu().float().squeeze(0)
                 )
+                measured_kl_prompts.append(prompt)
             del inputs, outputs
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - model backends raise heterogeneous errors
+            logger.debug("Bayesian reference-logit capture failed: %s", exc)
     pipeline._free_gpu_memory()
 
     if not reference_logits:
         pipeline.log("  Failed to collect reference logits — skipping optimization")
         return {}
 
+    from obliteratus.abliterate import _ATTN_OUT_NAMES, _FFN_OUT_NAMES
     from obliteratus.strategies.utils import (
-        get_layer_modules,
         get_attention_module,
         get_ffn_module,
+        get_layer_modules,
     )
-    from obliteratus.abliterate import _ATTN_OUT_NAMES, _FFN_OUT_NAMES
 
     layer_modules = get_layer_modules(pipeline.handle)
     arch = pipeline.handle.architecture
@@ -468,7 +501,11 @@ def run_bayesian_optimization(
 
         # Measure objectives
         refusal = _measure_refusal_rate(pipeline, n_prompts=n_refusal_prompts)
-        kl = _measure_kl_divergence(pipeline, reference_logits, kl_prompts)
+        kl = _measure_kl_divergence(
+            pipeline,
+            reference_logits,
+            measured_kl_prompts,
+        )
 
         # Track best combined score (use average of attn/mlp regs for layer_regs)
         nonlocal best_score, best_result
@@ -531,7 +568,12 @@ def run_bayesian_optimization(
     _restore_all()
 
     # Get best trial from Pareto front (prefer low refusal)
-    pareto = study.best_trials
+    pareto = [
+        trial
+        for trial in study.best_trials
+        if trial.values is not None
+        and all(math.isfinite(float(value)) for value in trial.values)
+    ]
     if pareto:
         pareto.sort(key=lambda t: (t.values[0], t.values[1]))
         best_trial = pareto[0]
@@ -581,9 +623,34 @@ def run_bayesian_optimization(
 
     elif best_result:
         pipeline.log(f"  Using best combined score: {best_score:.4f}")
+    else:
+        pipeline.log(
+            "  Bayesian optimization produced no fully measured finite trial; "
+            "ignoring its candidate settings"
+        )
 
     # Clean up
     del original_params
     pipeline._free_gpu_memory()
 
     return best_result
+
+
+def run_bayesian_optimization(
+    pipeline: AbliterationPipeline,
+    n_trials: int = 50,
+    n_refusal_prompts: int = 30,
+    n_kl_prompts: int = 5,
+) -> dict[int, float]:
+    """Fail closed until a winning trial can be replayed byte-for-byte.
+
+    The legacy implementation evaluated separate attention/MLP kernels and
+    one interpolated direction, then returned an averaged per-layer scalar to
+    a different multi-direction edit loop.  Applying that approximation would
+    mean the saved model was not the candidate Optuna actually scored.
+    """
+    del pipeline, n_trials, n_refusal_prompts, n_kl_prompts
+    raise RuntimeError(
+        "Bayesian optimization is disabled: exact winning-trial replay is not "
+        "implemented. Use a non-Bayesian method; no model weights were edited."
+    )
