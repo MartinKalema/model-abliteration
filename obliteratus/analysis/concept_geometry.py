@@ -1,52 +1,33 @@
-"""Concept Cone Geometry analysis for refusal subspace characterization.
+"""Descriptive category-direction dispersion analysis.
 
-The 2025 paper "Geometry of Concepts in LLMs" (Wollschlager et al., arXiv:2502.17420) showed that
-refusal is NOT a single linear direction or even a linear subspace — it's a
-*polyhedral concept cone*. Different categories of harmful content activate
-geometrically distinct refusal directions that share a common half-space
-but are NOT collinear.
+This module compares harmful-minus-harmless activation directions after prompts
+have been grouped by an explicit category label.  It reports signed directional
+similarity, angular spread, and the effective rank of the category-direction
+matrix.  These are descriptive activation statistics only.
 
-This module implements tools to:
+In particular, this module does *not* optimize non-negative combinations of
+directions, intervene on model behavior, or validate that the measured region
+is a causal refusal concept cone.  Results therefore carry
+``causally_validated=False`` and must not be presented as a reproduction of the
+RCO/concept-cone procedure in Wollschlager et al. (2025).
 
-  1. **Concept Cone Estimation**: Fit the minimal cone containing all
-     per-category refusal directions, measuring its solid angle and
-     dimensionality.
-
-  2. **Per-Category Direction Decomposition**: Extract separate refusal
-     directions for each harm category (weapons, cyber, fraud, etc.)
-     and measure their pairwise geometric relationships.
-
-  3. **Cone Complexity Scaling**: Measure how cone dimensionality scales
-     with model size, testing the finding that larger models have
-     higher-dimensional refusal cones.
-
-  4. **Direction Specificity Index**: For each refusal direction, measure
-     how specifically it targets one category vs. being a general-purpose
-     refusal signal.
-
-Extensions beyond prior work:
-  - We compute the *minimal enclosing cone* explicitly using convex
-    optimization over the half-space intersection
-  - We introduce the Direction Specificity Index (DSI), which quantifies
-    how categorical vs. universal each component of refusal is
-  - We test whether the cone structure is consistent across layers
-
-References:
-    - Wollschlager et al. (2025): Geometry of Concepts in LLMs (arXiv:2502.17420)
-    - Joad et al. (2026): 11 geometrically distinct refusal directions
-    - Arditi et al. (2024): Single-direction assumption (shown incomplete)
+The legacy ``ConceptConeAnalyzer`` and cone-named result attributes remain only
+as deprecated compatibility shims.  New code should use
+``CategoryDirectionDispersionAnalyzer`` and its explicitly descriptive fields.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import warnings
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 import torch
 
-
-# Default category assignments for the OBLITERATUS synthetic harmful prompts
-# Maps prompt index -> category name
+# Historical labels for the first 30 built-in prompts.  This mapping is kept as
+# an exported convenience, but it is never selected implicitly: callers must
+# pass the labels that correspond to the activations being analyzed.
 DEFAULT_HARM_CATEGORIES = {
     0: "weapons", 1: "weapons", 2: "weapons",
     3: "cyber", 4: "cyber", 5: "cyber", 6: "cyber",
@@ -61,182 +42,307 @@ DEFAULT_HARM_CATEGORIES = {
 }
 
 
+def _warn_legacy(name: str, replacement: str) -> None:
+    warnings.warn(
+        f"{name} is a deprecated compatibility alias; use {replacement}. "
+        "The returned statistics are descriptive and are not causal concept-cone evidence.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
 @dataclass
 class CategoryDirection:
-    """Refusal direction for a specific harm category."""
+    """A descriptive harmful-minus-harmless direction for one labeled category."""
 
     category: str
-    direction: torch.Tensor        # (hidden_dim,) unit vector
-    strength: float                # magnitude of the category's refusal signal
-    n_prompts: int                 # number of prompts in this category
-    specificity: float             # how specific to this category (0=general, 1=unique)
+    direction: torch.Tensor
+    strength: float
+    n_prompts: int
+    directional_distinctiveness: float
+
+    @property
+    def specificity(self) -> float:
+        """Deprecated alias for ``directional_distinctiveness``.
+
+        The value is ``(1 - mean_signed_cosine) / 2`` and is only a geometric
+        distinctiveness statistic.  It does not establish category-specific
+        causal control.
+        """
+
+        _warn_legacy("CategoryDirection.specificity", "directional_distinctiveness")
+        return self.directional_distinctiveness
+
+    @specificity.setter
+    def specificity(self, value: float) -> None:
+        _warn_legacy("CategoryDirection.specificity", "directional_distinctiveness")
+        self.directional_distinctiveness = value
 
 
 @dataclass
-class ConeConeResult:
-    """Result of concept cone geometry analysis for a single layer."""
+class CategoryDirectionDispersionResult:
+    """Descriptive category-direction statistics for one layer.
+
+    Pairwise cosines retain their sign.  Angles are ordinary geodesic angles
+    between unit vectors and are valid in any hidden dimension; no solid angle
+    or cone volume is estimated.
+    """
 
     layer_idx: int
     category_directions: list[CategoryDirection]
-    pairwise_cosines: dict[tuple[str, str], float]  # (cat_a, cat_b) -> cosine
-    cone_solid_angle: float        # solid angle of the minimal enclosing cone (steradians)
-    cone_dimensionality: float     # effective dimensionality of the cone
-    mean_pairwise_cosine: float    # average cosine between category directions
-    is_linear: bool                # True if cone is essentially 1D (all directions aligned)
-    is_polyhedral: bool            # True if distinct directions detected
-    general_direction: torch.Tensor  # the mean direction (closest to "single direction")
+    pairwise_cosines: dict[tuple[str, str], float]
+    pairwise_angles_degrees: dict[tuple[str, str], float]
+    effective_rank: float
+    mean_pairwise_cosine: float | None
+    mean_pairwise_angle_degrees: float | None
+    max_pairwise_angle_degrees: float | None
+    angular_dispersion: float
+    is_directionally_coherent: bool
+    is_directionally_disperse: bool
+    general_direction: torch.Tensor
     category_count: int
+    causally_validated: bool = field(default=False, init=False)
+    analysis_kind: str = field(
+        default="descriptive_category_direction_dispersion",
+        init=False,
+    )
+
+    @property
+    def cone_dimensionality(self) -> float:
+        """Deprecated alias for the descriptive squared-SVD effective rank."""
+
+        _warn_legacy("cone_dimensionality", "effective_rank")
+        return self.effective_rank
+
+    @property
+    def cone_solid_angle(self) -> float:
+        """Deprecated numeric shim; this is *not* a solid angle.
+
+        For compatibility, this returns the mean pairwise angle in radians.
+        It must not be interpreted as steradians or as a cone-volume estimate.
+        """
+
+        _warn_legacy(
+            "cone_solid_angle",
+            "mean_pairwise_angle_degrees (this value is not a solid angle)",
+        )
+        if self.mean_pairwise_angle_degrees is None:
+            return 0.0
+        return math.radians(self.mean_pairwise_angle_degrees)
+
+    @property
+    def is_linear(self) -> bool:
+        """Deprecated alias for signed directional coherence."""
+
+        _warn_legacy("is_linear", "is_directionally_coherent")
+        return self.is_directionally_coherent
+
+    @property
+    def is_polyhedral(self) -> bool:
+        """Deprecated alias for descriptive directional dispersion."""
+
+        _warn_legacy("is_polyhedral", "is_directionally_disperse")
+        return self.is_directionally_disperse
 
 
 @dataclass
-class MultiLayerConeResult:
-    """Cone geometry across multiple layers."""
+class MultiLayerDirectionDispersionResult:
+    """Descriptive category-direction dispersion across multiple layers."""
 
-    per_layer: dict[int, ConeConeResult]
-    most_polyhedral_layer: int     # layer with most complex cone
-    most_linear_layer: int         # layer with simplest cone
-    cone_complexity_by_layer: dict[int, float]  # cone dimensionality per layer
-    mean_cone_dimensionality: float
+    per_layer: dict[int, CategoryDirectionDispersionResult]
+    highest_dispersion_layer: int | None
+    lowest_dispersion_layer: int | None
+    effective_rank_by_layer: dict[int, float]
+    mean_effective_rank: float
+    causally_validated: bool = field(default=False, init=False)
+    analysis_kind: str = field(
+        default="descriptive_category_direction_dispersion",
+        init=False,
+    )
+
+    @property
+    def most_polyhedral_layer(self) -> int:
+        _warn_legacy("most_polyhedral_layer", "highest_dispersion_layer")
+        return 0 if self.highest_dispersion_layer is None else self.highest_dispersion_layer
+
+    @property
+    def most_linear_layer(self) -> int:
+        _warn_legacy("most_linear_layer", "lowest_dispersion_layer")
+        return 0 if self.lowest_dispersion_layer is None else self.lowest_dispersion_layer
+
+    @property
+    def cone_complexity_by_layer(self) -> dict[int, float]:
+        _warn_legacy("cone_complexity_by_layer", "effective_rank_by_layer")
+        return self.effective_rank_by_layer
+
+    @property
+    def mean_cone_dimensionality(self) -> float:
+        _warn_legacy("mean_cone_dimensionality", "mean_effective_rank")
+        return self.mean_effective_rank
 
 
-class ConceptConeAnalyzer:
-    """Analyze the geometric structure of refusal as a concept cone.
-
-    Instead of assuming refusal is a single direction (Arditi) or a linear
-    subspace (Gabliteration), this analyzes the actual cone-like geometry
-    where different harm categories have distinct but related directions.
-    """
+class CategoryDirectionDispersionAnalyzer:
+    """Measure descriptive dispersion among explicitly labeled directions."""
 
     def __init__(
         self,
-        category_map: dict[int, str] | None = None,
+        category_map: Mapping[int, str],
         min_category_size: int = 2,
     ):
-        """
-        Args:
-            category_map: {prompt_index: category_name} for grouping prompts.
-                If None, uses DEFAULT_HARM_CATEGORIES.
-            min_category_size: Minimum prompts per category to compute a
-                category-specific direction.
-        """
-        self.category_map = category_map or DEFAULT_HARM_CATEGORIES
+        if not isinstance(min_category_size, int) or isinstance(min_category_size, bool):
+            raise TypeError("min_category_size must be an integer")
+        if min_category_size < 1:
+            raise ValueError("min_category_size must be at least 1")
+
+        labels = dict(category_map)
+        invalid_indices = [idx for idx in labels if not isinstance(idx, int) or isinstance(idx, bool)]
+        if invalid_indices:
+            raise TypeError("category_map keys must be integer prompt indices")
+        invalid_labels = [
+            idx for idx, label in labels.items()
+            if not isinstance(label, str) or not label.strip()
+        ]
+        if invalid_labels:
+            raise ValueError(
+                "category_map values must be non-empty strings; invalid indices: "
+                f"{invalid_labels[:10]}"
+            )
+
+        self.category_map = labels
         self.min_category_size = min_category_size
+
+    def _require_explicit_labels(self, n_prompts: int) -> None:
+        missing = [idx for idx in range(n_prompts) if idx not in self.category_map]
+        if missing:
+            preview = ", ".join(str(idx) for idx in missing[:10])
+            suffix = "..." if len(missing) > 10 else ""
+            raise ValueError(
+                "Explicit category labels are required for every activation pair; "
+                f"missing prompt indices: {preview}{suffix}"
+            )
+
+    @staticmethod
+    def _as_vector(activation: torch.Tensor, *, prompt_index: int, kind: str) -> torch.Tensor:
+        vector = activation.detach().float().squeeze()
+        if vector.ndim != 1:
+            raise ValueError(
+                f"{kind} activation {prompt_index} must reduce to one hidden vector; "
+                f"got shape {tuple(vector.shape)}"
+            )
+        if not torch.isfinite(vector).all():
+            raise ValueError(f"{kind} activation {prompt_index} contains non-finite values")
+        return vector
 
     def analyze_layer(
         self,
         harmful_activations: list[torch.Tensor],
         harmless_activations: list[torch.Tensor],
         layer_idx: int = 0,
-    ) -> ConeConeResult:
-        """Analyze cone geometry at a single layer.
+    ) -> CategoryDirectionDispersionResult:
+        """Analyze signed category-direction dispersion at a single layer."""
 
-        Args:
-            harmful_activations: List of per-prompt activation tensors.
-            harmless_activations: List of per-prompt activation tensors.
-            layer_idx: Layer index for metadata.
+        if len(harmful_activations) != len(harmless_activations):
+            raise ValueError("harmful and harmless activation lists must have equal length")
+        n_prompts = len(harmful_activations)
+        self._require_explicit_labels(n_prompts)
 
-        Returns:
-            ConeConeResult with full cone geometry analysis.
-        """
-        n_prompts = min(len(harmful_activations), len(harmless_activations))
-
-        # Group prompts by category
         categories: dict[str, list[int]] = {}
         for idx in range(n_prompts):
-            cat = self.category_map.get(idx, "unknown")
-            if cat not in categories:
-                categories[cat] = []
-            categories[cat].append(idx)
+            categories.setdefault(self.category_map[idx], []).append(idx)
 
-        # Compute per-category refusal directions
-        cat_directions: list[CategoryDirection] = []
+        category_directions: list[CategoryDirection] = []
         direction_vectors: dict[str, torch.Tensor] = {}
 
-        for cat, indices in sorted(categories.items()):
+        for category, indices in sorted(categories.items()):
             if len(indices) < self.min_category_size:
                 continue
 
-            # Category mean difference
-            cat_harmful = torch.stack([
-                harmful_activations[i].float().squeeze() for i in indices
-            ]).mean(dim=0)
-            cat_harmless = torch.stack([
-                harmless_activations[i].float().squeeze() for i in indices
-            ]).mean(dim=0)
+            harmful_vectors = [
+                self._as_vector(harmful_activations[idx], prompt_index=idx, kind="harmful")
+                for idx in indices
+            ]
+            harmless_vectors = [
+                self._as_vector(harmless_activations[idx], prompt_index=idx, kind="harmless")
+                for idx in indices
+            ]
+            shapes = {tuple(vector.shape) for vector in harmful_vectors + harmless_vectors}
+            if len(shapes) != 1:
+                raise ValueError(
+                    f"category {category!r} contains incompatible activation shapes: "
+                    f"{sorted(shapes)}"
+                )
 
-            diff = cat_harmful - cat_harmless
-            strength = diff.norm().item()
+            difference = torch.stack(harmful_vectors).mean(dim=0) - torch.stack(
+                harmless_vectors
+            ).mean(dim=0)
+            strength = float(difference.norm().item())
+            if strength <= 1e-8:
+                continue
 
-            if strength > 1e-8:
-                direction = diff / diff.norm()
-            else:
-                direction = diff
+            direction = difference / difference.norm()
+            direction_vectors[category] = direction
+            category_directions.append(
+                CategoryDirection(
+                    category=category,
+                    direction=direction,
+                    strength=strength,
+                    n_prompts=len(indices),
+                    directional_distinctiveness=0.0,
+                )
+            )
 
-            direction_vectors[cat] = direction
-            cat_directions.append(CategoryDirection(
-                category=cat,
-                direction=direction,
-                strength=strength,
-                n_prompts=len(indices),
-                specificity=0.0,  # computed below
-            ))
+        pairwise_cosines, pairwise_angles = self._pairwise_diagnostics(direction_vectors)
+        cosine_values = list(pairwise_cosines.values())
+        angle_values = list(pairwise_angles.values())
+        mean_cosine = (
+            sum(cosine_values) / len(cosine_values) if cosine_values else None
+        )
+        mean_angle = sum(angle_values) / len(angle_values) if angle_values else None
+        max_angle = max(angle_values) if angle_values else None
+        angular_dispersion = 0.0 if mean_angle is None else mean_angle / 180.0
 
-        # Compute pairwise cosine similarities
-        pairwise: dict[tuple[str, str], float] = {}
-        cats = sorted(direction_vectors.keys())
-        for i, cat_a in enumerate(cats):
-            for j, cat_b in enumerate(cats):
-                if i < j:
-                    cos = (direction_vectors[cat_a] @ direction_vectors[cat_b]).abs().item()
-                    pairwise[(cat_a, cat_b)] = cos
+        for category_direction in category_directions:
+            signed_cosines = [
+                float(category_direction.direction @ other.direction)
+                for other in category_directions
+                if other.category != category_direction.category
+            ]
+            if signed_cosines:
+                mean_other_cosine = sum(signed_cosines) / len(signed_cosines)
+                category_direction.directional_distinctiveness = max(
+                    0.0,
+                    min(1.0, (1.0 - mean_other_cosine) / 2.0),
+                )
 
-        # Mean pairwise cosine
-        if pairwise:
-            mean_cos = sum(pairwise.values()) / len(pairwise)
-        else:
-            mean_cos = 1.0
+        general_direction = self._general_direction(direction_vectors)
+        effective_rank = self._squared_singular_value_effective_rank(direction_vectors)
+        enough_categories = len(category_directions) >= 2
+        is_coherent = bool(
+            enough_categories
+            and mean_cosine is not None
+            and mean_cosine > 0.9
+            and effective_rank < 1.5
+        )
+        is_disperse = bool(
+            enough_categories
+            and mean_cosine is not None
+            and (mean_cosine < 0.8 or effective_rank > 2.0)
+        )
 
-        # Compute Direction Specificity Index (DSI) for each category
-        # DSI = 1 - mean(|cos(d_cat, d_other)|) for all other categories
-        # High DSI = direction is unique to this category
-        for cd in cat_directions:
-            other_cosines = []
-            for other_cd in cat_directions:
-                if other_cd.category != cd.category:
-                    cos = (cd.direction @ other_cd.direction).abs().item()
-                    other_cosines.append(cos)
-            if other_cosines:
-                cd.specificity = 1.0 - (sum(other_cosines) / len(other_cosines))
-            else:
-                cd.specificity = 1.0
-
-        # General direction (mean of all category directions)
-        if direction_vectors:
-            all_dirs = torch.stack(list(direction_vectors.values()))
-            general = all_dirs.mean(dim=0)
-            general = general / general.norm().clamp(min=1e-8)
-        else:
-            general = torch.zeros(1)
-
-        # Cone dimensionality estimation
-        # Use SVD of the category direction matrix
-        cone_dim, solid_angle = self._estimate_cone_geometry(direction_vectors)
-
-        # Classification
-        is_linear = mean_cos > 0.9 and cone_dim < 1.5
-        is_polyhedral = mean_cos < 0.8 or cone_dim > 2.0
-
-        return ConeConeResult(
+        return CategoryDirectionDispersionResult(
             layer_idx=layer_idx,
-            category_directions=cat_directions,
-            pairwise_cosines=pairwise,
-            cone_solid_angle=solid_angle,
-            cone_dimensionality=cone_dim,
-            mean_pairwise_cosine=mean_cos,
-            is_linear=is_linear,
-            is_polyhedral=is_polyhedral,
-            general_direction=general,
-            category_count=len(cat_directions),
+            category_directions=category_directions,
+            pairwise_cosines=pairwise_cosines,
+            pairwise_angles_degrees=pairwise_angles,
+            effective_rank=effective_rank,
+            mean_pairwise_cosine=mean_cosine,
+            mean_pairwise_angle_degrees=mean_angle,
+            max_pairwise_angle_degrees=max_angle,
+            angular_dispersion=angular_dispersion,
+            is_directionally_coherent=is_coherent,
+            is_directionally_disperse=is_disperse,
+            general_direction=general_direction,
+            category_count=len(category_directions),
         )
 
     def analyze_all_layers(
@@ -244,132 +350,168 @@ class ConceptConeAnalyzer:
         harmful_acts: dict[int, list[torch.Tensor]],
         harmless_acts: dict[int, list[torch.Tensor]],
         strong_layers: list[int] | None = None,
-    ) -> MultiLayerConeResult:
-        """Analyze cone geometry across multiple layers.
+    ) -> MultiLayerDirectionDispersionResult:
+        """Analyze descriptive direction dispersion across selected layers."""
 
-        Args:
-            harmful_acts: {layer_idx: [activations]} per layer.
-            harmless_acts: {layer_idx: [activations]} per layer.
-            strong_layers: If provided, only analyze these layers.
-
-        Returns:
-            MultiLayerConeResult with per-layer and aggregate analysis.
-        """
-        layers = strong_layers or sorted(harmful_acts.keys())
-        per_layer = {}
-
-        for idx in layers:
-            if idx not in harmful_acts or idx not in harmless_acts:
+        layers = strong_layers if strong_layers is not None else sorted(harmful_acts)
+        per_layer: dict[int, CategoryDirectionDispersionResult] = {}
+        for layer_idx in layers:
+            if layer_idx not in harmful_acts or layer_idx not in harmless_acts:
                 continue
-            per_layer[idx] = self.analyze_layer(
-                harmful_acts[idx], harmless_acts[idx], layer_idx=idx
+            per_layer[layer_idx] = self.analyze_layer(
+                harmful_acts[layer_idx],
+                harmless_acts[layer_idx],
+                layer_idx=layer_idx,
             )
 
         if not per_layer:
-            return MultiLayerConeResult(
+            return MultiLayerDirectionDispersionResult(
                 per_layer={},
-                most_polyhedral_layer=0,
-                most_linear_layer=0,
-                cone_complexity_by_layer={},
-                mean_cone_dimensionality=0.0,
+                highest_dispersion_layer=None,
+                lowest_dispersion_layer=None,
+                effective_rank_by_layer={},
+                mean_effective_rank=0.0,
             )
 
-        complexity = {idx: r.cone_dimensionality for idx, r in per_layer.items()}
-        most_poly = max(complexity, key=complexity.get)
-        most_linear = min(complexity, key=complexity.get)
-        mean_dim = sum(complexity.values()) / len(complexity)
-
-        return MultiLayerConeResult(
-            per_layer=per_layer,
-            most_polyhedral_layer=most_poly,
-            most_linear_layer=most_linear,
-            cone_complexity_by_layer=complexity,
-            mean_cone_dimensionality=mean_dim,
+        effective_ranks = {
+            layer_idx: result.effective_rank for layer_idx, result in per_layer.items()
+        }
+        highest = max(
+            per_layer,
+            key=lambda idx: (per_layer[idx].angular_dispersion, per_layer[idx].effective_rank),
         )
-
-    def _estimate_cone_geometry(
-        self, direction_vectors: dict[str, torch.Tensor]
-    ) -> tuple[float, float]:
-        """Estimate cone dimensionality and solid angle.
-
-        Uses the effective rank of the direction matrix (SVD-based) as the
-        cone dimensionality, and approximates the solid angle from the
-        spread of directions.
-
-        Returns:
-            (cone_dimensionality, solid_angle_steradians)
-        """
-        if len(direction_vectors) < 2:
-            return 1.0, 0.0
-
-        D = torch.stack(list(direction_vectors.values()))  # (n_cats, hidden_dim)
-        n_cats = D.shape[0]
-
-        # SVD to get effective dimensionality
-        s = torch.linalg.svdvals(D)
-        s = s[s > 1e-10]
-        if len(s) == 0:
-            return 0.0, 0.0
-
-        # Effective rank via entropy
-        p = s / s.sum()
-        entropy = -(p * p.log()).sum()
-        eff_rank = torch.exp(entropy).item()
-
-        # Solid angle approximation:
-        # For directions on a unit sphere, the solid angle is related to
-        # the volume of the spherical cap they span.
-        # Approximate using: Omega ~ 2*pi*(1 - min_cos) for a circular cone
-        # For polyhedral cones, use the mean angular spread
-        cos_values = []
-        mean_dir = D.mean(dim=0)
-        mean_dir = mean_dir / mean_dir.norm().clamp(min=1e-8)
-        for i in range(n_cats):
-            cos = (D[i] @ mean_dir).abs().item()
-            cos_values.append(cos)
-
-        if cos_values:
-            min_cos = min(cos_values)
-            # Solid angle of a cone with half-angle theta:
-            # Omega = 2*pi*(1 - cos(theta))
-            # For high dimensions, generalize: Omega ~ (1 - min_cos)^(d/2)
-            # Use simplified 3D formula as approximation
-            solid_angle = 2 * math.pi * (1 - min_cos)
-        else:
-            solid_angle = 0.0
-
-        return eff_rank, solid_angle
+        lowest = min(
+            per_layer,
+            key=lambda idx: (per_layer[idx].angular_dispersion, per_layer[idx].effective_rank),
+        )
+        return MultiLayerDirectionDispersionResult(
+            per_layer=per_layer,
+            highest_dispersion_layer=highest,
+            lowest_dispersion_layer=lowest,
+            effective_rank_by_layer=effective_ranks,
+            mean_effective_rank=sum(effective_ranks.values()) / len(effective_ranks),
+        )
 
     @staticmethod
-    def format_report(result: ConeConeResult) -> str:
-        """Format single-layer cone analysis as a report."""
-        lines = []
-        lines.append(f"Concept Cone Geometry — Layer {result.layer_idx}")
-        lines.append("=" * 45)
-        lines.append("")
+    def _pairwise_diagnostics(
+        direction_vectors: Mapping[str, torch.Tensor],
+    ) -> tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], float],
+    ]:
+        pairwise_cosines: dict[tuple[str, str], float] = {}
+        pairwise_angles: dict[tuple[str, str], float] = {}
+        categories = sorted(direction_vectors)
+        for left_index, left_category in enumerate(categories):
+            left = direction_vectors[left_category]
+            for right_category in categories[left_index + 1:]:
+                cosine = float(left @ direction_vectors[right_category])
+                cosine = max(-1.0, min(1.0, cosine))
+                key = (left_category, right_category)
+                pairwise_cosines[key] = cosine
+                pairwise_angles[key] = math.degrees(math.acos(cosine))
+        return pairwise_cosines, pairwise_angles
 
-        geometry_type = "LINEAR (single direction)" if result.is_linear else (
-            "POLYHEDRAL (concept cone)" if result.is_polyhedral else "INTERMEDIATE"
-        )
-        lines.append(f"Geometry: {geometry_type}")
-        lines.append(f"Cone dimensionality: {result.cone_dimensionality:.2f}")
-        lines.append(f"Solid angle: {result.cone_solid_angle:.4f} sr")
-        lines.append(f"Mean pairwise cosine: {result.mean_pairwise_cosine:.3f}")
-        lines.append(f"Categories analyzed: {result.category_count}")
-        lines.append("")
+    @staticmethod
+    def _general_direction(direction_vectors: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        if not direction_vectors:
+            return torch.zeros(1, dtype=torch.float32)
+        mean_direction = torch.stack(list(direction_vectors.values())).mean(dim=0)
+        norm = mean_direction.norm()
+        if not torch.isfinite(norm) or norm <= 1e-8:
+            return torch.zeros_like(mean_direction)
+        return mean_direction / norm
 
-        lines.append("Per-Category Refusal Directions:")
-        for cd in sorted(result.category_directions, key=lambda x: -x.strength):
+    @staticmethod
+    def _squared_singular_value_effective_rank(
+        direction_vectors: Mapping[str, torch.Tensor],
+    ) -> float:
+        """Return entropy effective rank using normalized ``singular_value**2``."""
+
+        if not direction_vectors:
+            return 0.0
+        direction_matrix = torch.stack(list(direction_vectors.values())).float()
+        singular_values = torch.linalg.svdvals(direction_matrix)
+        squared = singular_values.square()
+        squared = squared[squared > 1e-12]
+        if squared.numel() == 0:
+            return 0.0
+        probabilities = squared / squared.sum()
+        entropy = -(probabilities * probabilities.log()).sum()
+        return float(torch.exp(entropy).item())
+
+    @staticmethod
+    def format_report(result: CategoryDirectionDispersionResult) -> str:
+        """Format a descriptive report without causal cone or solid-angle claims."""
+
+        if result.is_directionally_coherent:
+            geometry = "DIRECTIONALLY COHERENT"
+        elif result.is_directionally_disperse:
+            geometry = "DIRECTIONALLY DISPERSE"
+        else:
+            geometry = "INTERMEDIATE / INSUFFICIENT"
+
+        lines = [
+            f"Category Direction Dispersion — Layer {result.layer_idx}",
+            "=" * 48,
+            "DESCRIPTIVE ONLY — NOT CAUSALLY VALIDATED",
+            "Legacy Concept Cone terminology is deprecated for these statistics.",
+            "",
+            f"Geometry: {geometry}",
+            f"Effective dimensionality (s²-weighted rank): {result.effective_rank:.2f}",
+            f"Angular dispersion (mean angle / 180°): {result.angular_dispersion:.3f}",
+            f"Categories analyzed: {result.category_count}",
+        ]
+        if result.mean_pairwise_cosine is not None:
             lines.append(
-                f"  {cd.category:15s}  strength={cd.strength:.3f}  "
-                f"specificity={cd.specificity:.3f}  (n={cd.n_prompts})"
+                f"Mean pairwise signed cosine: {result.mean_pairwise_cosine:.3f}"
             )
-        lines.append("")
+        if result.mean_pairwise_angle_degrees is not None:
+            lines.append(
+                f"Mean / max pairwise angle: "
+                f"{result.mean_pairwise_angle_degrees:.1f}° / "
+                f"{result.max_pairwise_angle_degrees:.1f}°"
+            )
+        lines.extend(("", "Per-Category Descriptive Directions:"))
+        for category_direction in sorted(
+            result.category_directions,
+            key=lambda item: -item.strength,
+        ):
+            lines.append(
+                f"  {category_direction.category:15s}  "
+                f"strength={category_direction.strength:.3f}  "
+                f"distinctiveness={category_direction.directional_distinctiveness:.3f}  "
+                f"(n={category_direction.n_prompts})"
+            )
 
         if result.pairwise_cosines:
-            lines.append("Pairwise Direction Cosines:")
-            for (a, b), cos in sorted(result.pairwise_cosines.items()):
-                bar = "█" * int(cos * 15)
-                lines.append(f"  {a:12s} ↔ {b:12s}: {cos:.3f} {bar}")
-
+            lines.extend(("", "Pairwise Signed Cosines / Angles:"))
+            for key in sorted(result.pairwise_cosines):
+                left, right = key
+                cosine = result.pairwise_cosines[key]
+                angle = result.pairwise_angles_degrees[key]
+                lines.append(
+                    f"  {left:12s} ↔ {right:12s}: cos={cosine:+.3f}, "
+                    f"angle={angle:.1f}°"
+                )
         return "\n".join(lines)
+
+
+class ConceptConeAnalyzer(CategoryDirectionDispersionAnalyzer):
+    """Deprecated compatibility name for category-direction dispersion analysis."""
+
+    def __init__(
+        self,
+        category_map: Mapping[int, str] | None = None,
+        min_category_size: int = 2,
+    ):
+        _warn_legacy("ConceptConeAnalyzer", "CategoryDirectionDispersionAnalyzer")
+        # An empty map preserves construction/empty-input compatibility, while
+        # any non-empty analysis still fails until the caller supplies labels.
+        super().__init__({} if category_map is None else category_map, min_category_size)
+
+
+# Deprecated type aliases.  Result instances expose warning-emitting legacy
+# properties, while new code should import the descriptive names above.
+ConeConeResult = CategoryDirectionDispersionResult
+MultiLayerConeResult = MultiLayerDirectionDispersionResult

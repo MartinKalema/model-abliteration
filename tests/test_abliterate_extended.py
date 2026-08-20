@@ -93,7 +93,7 @@ class TestNewMethodPresets:
         cfg = METHODS["aggressive"]
         assert cfg["project_biases"] is True
         assert cfg["use_chat_template"] is True
-        assert cfg["use_whitened_svd"] is True
+        assert cfg["use_whitened_svd"] is False
         assert cfg["true_iterative_refinement"] is True
 
 
@@ -121,7 +121,7 @@ class TestNewPipelineInit:
         pipeline = AbliterationPipeline(model_name="test-model", method="aggressive")
         assert pipeline.project_biases is True
         assert pipeline.use_chat_template is True
-        assert pipeline.use_whitened_svd is True
+        assert pipeline.use_whitened_svd is False
         assert pipeline.true_iterative_refinement is True
 
     def test_explicit_overrides_new_params(self):
@@ -324,7 +324,7 @@ class TestMetadata:
             assert "use_whitened_svd" in cfg
             assert "true_iterative_refinement" in cfg
             assert cfg["project_biases"] is True
-            assert cfg["use_whitened_svd"] is True
+            assert cfg["use_whitened_svd"] is False
 
             # Should have more references now
             assert len(metadata["references"]) >= 5

@@ -9,6 +9,8 @@ from pathlib import Path
 
 from rich.console import Console
 
+from obliteratus.abliterate import available_method_names
+
 console = Console()
 
 _BANNER = r"""
@@ -369,19 +371,68 @@ def main(argv: list[str] | None = None):
         p.add_argument("--dtype", type=str, default="float16")
         p.add_argument(
             "--method", type=str, default="advanced",
-            choices=[
-                "basic", "advanced", "aggressive", "spectral_cascade",
-                "informed", "surgical", "optimized", "som", "inverted", "nuclear",
-            ],
+            choices=list(available_method_names()),
             help="Liberation method (default: advanced)",
         )
         p.add_argument("--n-directions", type=int, default=None, help="Override: number of refusal directions to extract")
         p.add_argument(
             "--direction-method", type=str, default=None,
-            choices=["diff_means", "svd", "leace", "som"],
-            help="Direction extraction method: diff_means, svd, leace, or som",
+            choices=["diff_means", "svd", "leace", "som_proxy"],
+            help="Direction extraction method: diff_means, svd, leace, or som_proxy",
         )
         p.add_argument("--regularization", type=float, default=None, help="Override: fraction to preserve (0.0-1.0)")
+        p.add_argument(
+            "--kl-preservation",
+            action="store_true",
+            help=(
+                "Search exact regularization candidates under measured held-out KL, "
+                "then replay the winner on a disjoint confirmation set"
+            ),
+        )
+        p.add_argument(
+            "--kl-budget",
+            type=float,
+            default=0.05,
+            help=(
+                "Maximum mean sampled-token KL upper confidence bound; tightens "
+                "but never relaxes an existing damage-gate limit (default: 0.05)"
+            ),
+        )
+        p.add_argument(
+            "--kl-search-steps",
+            type=int,
+            default=5,
+            help="Number of exact regularization candidates (default: 5)",
+        )
+        p.add_argument(
+            "--cot-preservation",
+            action="store_true",
+            help=(
+                "Gate the candidate on baseline-relative reasoning-token and "
+                "answer-token cross-entropy"
+            ),
+        )
+        p.add_argument(
+            "--cot-examples",
+            type=str,
+            default=None,
+            help=(
+                "JSON file containing prompt/reference_reasoning/reference_answer "
+                "objects; otherwise uses the bundled harmless references"
+            ),
+        )
+        p.add_argument(
+            "--cot-reasoning-ce-budget",
+            type=float,
+            default=0.25,
+            help="Maximum candidate-minus-baseline reasoning-token CE (default: 0.25)",
+        )
+        p.add_argument(
+            "--cot-answer-ce-budget",
+            type=float,
+            default=0.15,
+            help="Maximum candidate-minus-baseline answer-token CE (default: 0.15)",
+        )
         p.add_argument("--refinement-passes", type=int, default=None, help="Override: number of iterative passes")
         p.add_argument(
             "--min-layer-fraction", type=float, default=None,
@@ -490,8 +541,8 @@ def main(argv: list[str] | None = None):
     si_parser.add_argument("--residue-max", type=int, default=None)
     si_parser.add_argument("--params-b", type=float, default=None, help="Override detected total parameter count in billions for planning/defaults")
     si_parser.add_argument("--no-param-auto-scale", action="store_true", default=False, help="Do not apply size-aware defaults when knobs are omitted")
-    si_parser.add_argument("--method", type=str, default="advanced", choices=["basic", "advanced", "aggressive", "spectral_cascade", "informed", "surgical", "optimized", "som", "inverted", "nuclear"])
-    si_parser.add_argument("--direction-method", type=str, default=None, choices=["diff_means", "svd", "leace", "som"])
+    si_parser.add_argument("--method", type=str, default="advanced", choices=list(available_method_names()))
+    si_parser.add_argument("--direction-method", type=str, default=None, choices=["diff_means", "svd", "leace", "som_proxy"])
     si_parser.add_argument("--n-directions", type=int, default=None)
     si_parser.add_argument("--regularization", type=float, default=None)
     si_parser.add_argument("--refinement-passes", type=int, default=None)
@@ -558,7 +609,7 @@ def main(argv: list[str] | None = None):
         ),
     )
     tourney_parser.add_argument(
-        "--methods", type=str, nargs="+", default=None,
+        "--methods", type=str, nargs="+", choices=list(available_method_names()), default=None,
         help="Override: only run these methods (space-separated)",
     )
     _add_gpu_args(tourney_parser)
@@ -677,9 +728,59 @@ def _cmd_self_improve(args):
         "verify_sample_size": 30,
         "note": "parameter auto-scale disabled; using generic defaults for omitted knobs.",
     }
-    n_directions = args.n_directions if args.n_directions is not None else size_defaults["n_directions"]
-    regularization = args.regularization if args.regularization is not None else size_defaults["regularization"]
-    refinement_passes = args.refinement_passes if args.refinement_passes is not None else size_defaults["refinement_passes"]
+    # These methods own a scored search/training protocol.  Generic model-size
+    # defaults describe the ordinary projection pipeline and must not silently
+    # replace the named preset's rank, preservation fraction, or pass count.
+    # Explicit CLI overrides still flow to the constructor, which validates
+    # whether the selected protocol supports them.
+    protocol_owned_methods = {
+        "gabliteration",
+        "rdo",
+        "som",
+        "optimized",
+        "heretic",
+    }
+    if args.method in protocol_owned_methods:
+        from obliteratus.abliterate import METHODS
+
+        preset = METHODS[args.method]
+        pipeline_n_directions = args.n_directions
+        pipeline_regularization = args.regularization
+        pipeline_refinement_passes = args.refinement_passes
+        n_directions = (
+            args.n_directions
+            if args.n_directions is not None
+            else preset["n_directions"]
+        )
+        regularization = (
+            args.regularization
+            if args.regularization is not None
+            else preset["regularization"]
+        )
+        refinement_passes = (
+            args.refinement_passes
+            if args.refinement_passes is not None
+            else preset["refinement_passes"]
+        )
+    else:
+        n_directions = (
+            args.n_directions
+            if args.n_directions is not None
+            else size_defaults["n_directions"]
+        )
+        regularization = (
+            args.regularization
+            if args.regularization is not None
+            else size_defaults["regularization"]
+        )
+        refinement_passes = (
+            args.refinement_passes
+            if args.refinement_passes is not None
+            else size_defaults["refinement_passes"]
+        )
+        pipeline_n_directions = n_directions
+        pipeline_regularization = regularization
+        pipeline_refinement_passes = refinement_passes
     residue_weight = args.residue_weight if args.residue_weight is not None else size_defaults["residue_weight"]
     verify_sample_size = args.verify_sample_size if args.verify_sample_size is not None else size_defaults["verify_sample_size"]
 
@@ -813,10 +914,10 @@ def _cmd_self_improve(args):
                 device=args.device,
                 dtype=args.dtype,
                 method=args.method,
-                n_directions=n_directions,
+                n_directions=pipeline_n_directions,
                 direction_method=args.direction_method,
-                regularization=regularization,
-                refinement_passes=refinement_passes,
+                regularization=pipeline_regularization,
+                refinement_passes=pipeline_refinement_passes,
                 min_layer_fraction=args.min_layer_fraction,
                 max_layer_fraction=args.max_layer_fraction,
                 harmless_pc_count=args.harmless_pc_count,
@@ -1279,7 +1380,28 @@ def _cmd_abliterate(args):
         )
 
     safety_kwargs = _damage_pipeline_kwargs(args)
+    cot_examples = None
+    cot_examples_path = getattr(args, "cot_examples", None)
+    if cot_examples_path and not getattr(args, "cot_preservation", False):
+        raise ValueError(
+            "--cot-examples requires --cot-preservation; explicit references "
+            "must not be silently ignored"
+        )
+    if cot_examples_path:
+        try:
+            cot_examples = json.loads(Path(cot_examples_path).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Could not load --cot-examples: {exc}") from exc
+        if not isinstance(cot_examples, list):
+            raise ValueError("--cot-examples JSON must contain a list of objects")
     if method == "informed":
+        if getattr(args, "kl_preservation", False) or getattr(
+            args, "cot_preservation", False
+        ):
+            raise ValueError(
+                "KL/CoT preservation search is currently supported by the base "
+                "checkpoint pipeline, not the informed wrapper"
+            )
         from obliteratus.informed_pipeline import InformedAbliterationPipeline
 
         pipeline = InformedAbliterationPipeline(
@@ -1305,6 +1427,22 @@ def _cmd_abliterate(args):
             n_directions=args.n_directions,
             direction_method=getattr(args, "direction_method", None),
             regularization=args.regularization,
+            # An omitted opt-in flag must defer to the named preset.  In
+            # particular, SOM/Optimized/Heretic own an exact candidate-search
+            # path and set this True in their preset; forwarding False here
+            # used to disable that path and make their default CLI commands
+            # fail before model loading.
+            use_kl_optimization=(
+                True if getattr(args, "kl_preservation", False) else None
+            ),
+            kl_budget=getattr(args, "kl_budget", 0.05),
+            kl_search_steps=getattr(args, "kl_search_steps", 5),
+            cot_aware=(True if getattr(args, "cot_preservation", False) else None),
+            cot_preservation_examples=cot_examples,
+            cot_reasoning_ce_budget=getattr(
+                args, "cot_reasoning_ce_budget", 0.25
+            ),
+            cot_answer_ce_budget=getattr(args, "cot_answer_ce_budget", 0.15),
             refinement_passes=args.refinement_passes,
             min_layer_fraction=getattr(args, "min_layer_fraction", None),
             max_layer_fraction=getattr(args, "max_layer_fraction", None),
@@ -1332,7 +1470,6 @@ def _cmd_abliterate(args):
             else:
                 result_path = pipeline.run()
             if residue_meta:
-                import json
                 result_bundle = Path(result_path)
                 (result_bundle / "hard_negative_residue.json").write_text(
                     json.dumps(residue_meta, indent=2)
@@ -1607,6 +1744,20 @@ def _make_remote_runner(args):
 def _cmd_remote_abliterate(args):
     from rich.panel import Panel
 
+    if getattr(args, "cot_examples", None):
+        raise ValueError(
+            "--cot-examples is a local file and custom CoT references are not "
+            "supported in remote mode; use the bundled references or run locally"
+        )
+    if args.method == "informed" and (
+        getattr(args, "kl_preservation", False)
+        or getattr(args, "cot_preservation", False)
+    ):
+        raise ValueError(
+            "KL/CoT preservation is supported by the base checkpoint pipeline, "
+            "not the informed wrapper"
+        )
+
     runner = _make_remote_runner(args)
 
     kwargs = {}
@@ -1624,6 +1775,14 @@ def _cmd_remote_abliterate(args):
         kwargs["direction_method"] = args.direction_method
     if args.regularization is not None:
         kwargs["regularization"] = args.regularization
+    if getattr(args, "kl_preservation", False):
+        kwargs["kl_preservation"] = True
+        kwargs["kl_budget"] = args.kl_budget
+        kwargs["kl_search_steps"] = args.kl_search_steps
+    if getattr(args, "cot_preservation", False):
+        kwargs["cot_preservation"] = True
+        kwargs["cot_reasoning_ce_budget"] = args.cot_reasoning_ce_budget
+        kwargs["cot_answer_ce_budget"] = args.cot_answer_ce_budget
     if args.refinement_passes is not None:
         kwargs["refinement_passes"] = args.refinement_passes
     if getattr(args, "min_layer_fraction", None) is not None:

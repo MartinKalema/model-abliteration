@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from obliteratus.abliterate import UNAVAILABLE_METHODS, available_method_names
 from obliteratus.evaluation.candidate_selection import (
     CandidateEvidenceError,
     damage_severity,
@@ -264,13 +265,18 @@ class BucketKnowledge:
     @property
     def best_method(self) -> str | None:
         """Lowest mean refusal, then lowest mean damage (min 3 runs preferred)."""
+        available = frozenset(available_method_names())
         candidates = [
             (name, ms) for name, ms in self.methods.items()
-            if ms.n_runs >= 3
+            if name in available and ms.n_runs >= 3
         ]
         if not candidates:
             # Fall back to any method with runs
-            candidates = [(name, ms) for name, ms in self.methods.items() if ms.n_runs > 0]
+            candidates = [
+                (name, ms)
+                for name, ms in self.methods.items()
+                if name in available and ms.n_runs > 0
+            ]
         if not candidates:
             return None
         return min(candidates, key=lambda x: x[1].selection_key)[0]
@@ -278,7 +284,11 @@ class BucketKnowledge:
     @property
     def ranked_methods(self) -> list[tuple[str, MethodStats]]:
         """All methods ranked by efficacy first and damage second."""
-        return sorted(self.methods.items(), key=lambda item: item[1].selection_key)
+        available = frozenset(available_method_names())
+        return sorted(
+            ((name, stats) for name, stats in self.methods.items() if name in available),
+            key=lambda item: item[1].selection_key,
+        )
 
 
 @dataclass
@@ -340,19 +350,27 @@ def build_knowledge_base(
         records = _fetch_all_records()
 
     buckets: dict[tuple[str, str, str], BucketKnowledge] = {}
+    available_methods = frozenset(available_method_names())
 
     for record in records:
         arch_key = _extract_arch_key(record)
         if arch_key is None:
             continue
 
-        method = record.get("method", "")
-        if not method:
-            continue
-
         if arch_key not in buckets:
             buckets[arch_key] = BucketKnowledge(arch_key=arch_key)
         bucket = buckets[arch_key]
+
+        method = record.get("method", "")
+        if not isinstance(method, str) or not method:
+            bucket.exclude("method name is missing or invalid")
+            continue
+        if method in UNAVAILABLE_METHODS:
+            bucket.exclude(f"method `{method}` is unavailable: {UNAVAILABLE_METHODS[method]}")
+            continue
+        if method not in available_methods:
+            bucket.exclude(f"method `{method}` is not a runnable preset")
+            continue
 
         if record.get("error"):
             bucket.exclude("run reported an error")
@@ -480,6 +498,7 @@ def get_adaptive_recommendation(
     """
     if knowledge is None:
         knowledge = build_knowledge_base()
+    available_methods = frozenset(available_method_names())
 
     param_bucket = _param_bucket(total_params_b)
     bucket_label = f"{arch_class.replace('_', ' ').title()} {reasoning_class.title()} {param_bucket.title()}"
@@ -518,6 +537,8 @@ def get_adaptive_recommendation(
         for key, bkt in knowledge.items():
             if key[0] == arch_class and key[1] == reasoning_class:
                 for method_name, ms in bkt.methods.items():
+                    if method_name not in available_methods:
+                        continue
                     if method_name not in merged.methods:
                         merged.methods[method_name] = MethodStats(method=method_name)
                     target = merged.methods[method_name]
@@ -546,6 +567,8 @@ def get_adaptive_recommendation(
         for key, bkt in knowledge.items():
             if key[0] == arch_class:
                 for method_name, ms in bkt.methods.items():
+                    if method_name not in available_methods:
+                        continue
                     if method_name not in merged.methods:
                         merged.methods[method_name] = MethodStats(method=method_name)
                     target = merged.methods[method_name]
@@ -569,7 +592,7 @@ def get_adaptive_recommendation(
             bucket_label = f"{arch_class.replace('_', ' ').title()} (all)"
 
     # No data at all
-    if bucket is None or not bucket.methods:
+    if bucket is None or not bucket.ranked_methods:
         if relevant_excluded:
             no_data_reason = (
                 "No accepted damage-gated telemetry is available for this "
@@ -688,6 +711,7 @@ def get_global_insights(
     """
     if knowledge is None:
         knowledge = build_knowledge_base()
+    available_methods = frozenset(available_method_names())
 
     total_records = sum(b.total_runs for b in knowledge.values())
     total_excluded_records = sum(b.excluded_runs for b in knowledge.values())
@@ -701,6 +725,8 @@ def get_global_insights(
     global_method_damage: dict[str, list[float]] = {}
     for bucket in knowledge.values():
         for name, ms in bucket.methods.items():
+            if name not in available_methods:
+                continue
             if name not in global_method_scores:
                 global_method_scores[name] = []
                 global_method_damage[name] = []
@@ -732,13 +758,15 @@ def get_global_insights(
             "exclusion_reasons": dict(bucket.exclusion_reasons),
             "best_method": best,
             "best_score": bucket.methods[best].mean_score if best and best in bucket.methods else 0,
-            "n_methods_tested": len(bucket.methods),
+            "n_methods_tested": len(bucket.ranked_methods),
         }
 
     # Hyperparameter trends across top runs
     all_top_configs: list[dict] = []
     for bucket in knowledge.values():
-        for ms in bucket.methods.values():
+        for name, ms in bucket.methods.items():
+            if name not in available_methods:
+                continue
             if ms.configs and ms.refusal_rates and ms.damage_severities:
                 paired = sorted(
                     zip(ms.refusal_rates, ms.damage_severities, ms.configs),

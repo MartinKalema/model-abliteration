@@ -6,14 +6,17 @@ architecture class (dense/MoE, standard/reasoning).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from obliteratus.architecture_profiles import (
     ArchitectureClass,
     ArchitectureProfile,
     ReasoningClass,
-    detect_architecture,
-    get_profile_summary,
     apply_profile_to_method_config,
+    detect_architecture,
+    enhance_profile_with_telemetry,
+    get_profile_summary,
 )
 
 
@@ -425,6 +428,47 @@ class TestApplyProfile:
         )
         merged = apply_profile_to_method_config(profile, base)
         assert merged["use_jailbreak_contrast"] is True
+
+    def test_unknown_telemetry_method_does_not_override_profile(self):
+        profile = detect_architecture("meta-llama/Llama-3.1-8B-Instruct")
+        original_method = profile.recommended_method
+        original_overrides = dict(profile.method_overrides)
+        recommendation = SimpleNamespace(
+            confidence="high",
+            recommended_method="not-a-method",
+            method_overrides={"n_directions": 999},
+            n_records=100,
+        )
+
+        with patch(
+            "obliteratus.adaptive_defaults.get_adaptive_recommendation",
+            return_value=recommendation,
+        ):
+            enhanced, returned = enhance_profile_with_telemetry(profile)
+
+        assert returned is recommendation
+        assert enhanced.recommended_method == original_method
+        assert enhanced.method_overrides == original_overrides
+
+    def test_available_optimized_telemetry_method_overrides_profile(self):
+        profile = detect_architecture("meta-llama/Llama-3.1-8B-Instruct")
+        recommendation = SimpleNamespace(
+            confidence="high",
+            recommended_method="optimized",
+            method_overrides={"n_directions": 3},
+            n_records=100,
+        )
+
+        with patch(
+            "obliteratus.adaptive_defaults.get_adaptive_recommendation",
+            return_value=recommendation,
+        ):
+            enhanced, returned = enhance_profile_with_telemetry(profile)
+
+        assert returned is recommendation
+        assert enhanced.recommended_method == "optimized"
+        assert enhanced.method_overrides["n_directions"] == 3
+        assert "Telemetry override (high confidence)" in enhanced.profile_description
 
 
 # ---------------------------------------------------------------------------

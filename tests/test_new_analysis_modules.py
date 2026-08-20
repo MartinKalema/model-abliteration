@@ -670,3 +670,39 @@ class TestModuleImports:
         assert "WassersteinOptimalExtractor" in analysis.__all__
         assert "BayesianKernelProjection" in analysis.__all__
         assert "SAEDecompositionPipeline" in analysis.__all__
+
+    def test_behavioral_search_orchestration_is_public(self):
+        from obliteratus import analysis
+        from obliteratus.analysis import (
+            GabliterationSearchConfig,
+            SOMSearchConfig,
+            apply_gabliteration_replay,
+            replay_som_winner,
+            run_gabliteration_search,
+            run_paper_som_search,
+            search_som_direction_subsets,
+        )
+
+        exported = {
+            "GabliterationSearchConfig",
+            "SOMSearchConfig",
+            "apply_gabliteration_replay",
+            "replay_som_winner",
+            "run_gabliteration_search",
+            "run_paper_som_search",
+            "search_som_direction_subsets",
+        }
+
+        assert exported <= set(analysis.__all__)
+        assert all(
+            value is not None
+            for value in (
+                GabliterationSearchConfig,
+                SOMSearchConfig,
+                apply_gabliteration_replay,
+                replay_som_winner,
+                run_gabliteration_search,
+                run_paper_som_search,
+                search_som_direction_subsets,
+            )
+        )

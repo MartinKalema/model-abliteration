@@ -77,6 +77,29 @@ def test_remote_obliterate_emits_fail_closed_defaults():
     assert "--overwrite-output" not in argv
 
 
+def test_remote_obliterate_forwards_preservation_search_flags():
+    runner = RemoteRunner(RemoteConfig(host="gpu.example"))
+
+    argv = shlex.split(
+        runner.build_obliterate_command(
+            "org/model",
+            kl_preservation=True,
+            kl_budget=0.03,
+            kl_search_steps=7,
+            cot_preservation=True,
+            cot_reasoning_ce_budget=0.12,
+            cot_answer_ce_budget=0.08,
+        )
+    )
+
+    assert "--kl-preservation" in argv
+    assert argv[argv.index("--kl-budget") + 1] == "0.03"
+    assert argv[argv.index("--kl-search-steps") + 1] == "7"
+    assert "--cot-preservation" in argv
+    assert argv[argv.index("--cot-reasoning-ce-budget") + 1] == "0.12"
+    assert argv[argv.index("--cot-answer-ce-budget") + 1] == "0.08"
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -99,6 +122,12 @@ def test_remote_obliterate_emits_fail_closed_defaults():
         {"projection_row_fraction": 0.0},
         {"projection_target": "auto", "quantization": "4bit"},
         {"projection_target": "auto", "damage_eval_size": 63},
+        {"kl_preservation": True, "projection_target": "auto"},
+        {"kl_preservation": True, "damage_eval_size": 63},
+        {"kl_preservation": True, "quantization": "4bit"},
+        {"cot_preservation": True, "quantization": "8bit"},
+        {"kl_search_steps": 1},
+        {"kl_budget": True},
         {"overwrite_output": 1},
     ],
 )

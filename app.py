@@ -333,16 +333,63 @@ METHODS = {
     "spectral cascade (frequency-selective)": "spectral_cascade",
     "informed (analysis-guided auto-config)": "informed",
     "surgical (precision MoE-aware)": "surgical",
-    "optimized (bayesian auto-tuned)": "optimized",
     "inverted (semantic refusal inversion)": "inverted",
+    "optimized (exact model-forward TPE)": "optimized",
     "nuclear (maximum force combo)": "nuclear",
     # Baseline reproductions for benchmarking
     "failspy (FailSpy/abliterator baseline)": "failspy",
-    "gabliteration (Gülmez 2026 baseline)": "gabliteration",
-    "heretic (p-e-w 2025-2026 baseline)": "heretic",
-    "rdo (Wollschlager ICML 2025 baseline)": "rdo",
-    "som (AAAI 2026 manifold directions)": "som",
+    "gabliteration (paper behavioral search)": "gabliteration",
+    "heretic (exact dense replay baseline)": "heretic",
+    "rdo (model-forward direction training)": "rdo",
+    "som (paper TPE + HarmBench search)": "som",
+    "som proxy (local activation geometry)": "som_proxy",
 }
+
+# Named model-forward protocols own their edit/search configuration.  The
+# browser endpoint receives every Advanced control positionally—even when a
+# raw API caller supplies only a method name—so these methods must explicitly
+# defer to their backend preset rather than inherit stale Advanced values.
+_PROTOCOL_OWNED_METHODS = frozenset(
+    {"gabliteration", "rdo", "som", "optimized", "heretic"}
+)
+
+# A regularization dose-response curve is meaningful only for presets whose
+# ordinary checkpoint projection consumes the scalar regularization value.
+# Specialized model-forward searches own different search spaces and must not
+# be presented as if the slider controlled their scored intervention.
+_STRENGTH_SWEEP_METHODS = {
+    label: method
+    for label, method in METHODS.items()
+    if method
+    not in {
+        "adaptive",
+        "informed",
+        "inverted",
+        "nuclear",
+        *_PROTOCOL_OWNED_METHODS,
+    }
+}
+
+
+def _obliterate_gpu_duration(*args, **kwargs) -> int:
+    """Return a ZeroGPU lease ceiling appropriate for the selected protocol.
+
+    Hugging Face supports callable durations.  This is only a maximum lease;
+    visitors still need enough quota, and local/dedicated GPU execution remains
+    the practical surface for full paper-scale searches.
+    """
+
+    method_choice = kwargs.get("method_choice")
+    if method_choice is None and len(args) > 1:
+        method_choice = args[1]
+    method = METHODS.get(method_choice, method_choice)
+    if method == "som":
+        return 7_200
+    if method in {"optimized", "heretic"}:
+        return 3_600
+    if method in {"gabliteration", "rdo"}:
+        return 1_800
+    return 300
 
 # ── Community Hub push ────────────────────────────────────────────────
 # Shared org + token so users can auto-push without their own HF_TOKEN.
@@ -351,7 +398,11 @@ _HUB_COMMUNITY_ORG = os.environ.get("OBLITERATUS_HUB_ORG", "OBLITERATUS")
 _HUB_COMMUNITY_TOKEN = os.environ.get("OBLITERATUS_HUB_TOKEN")
 
 # Import preset configs for Advanced Settings defaults
-from obliteratus.abliterate import METHODS as _PRESET_CONFIGS  # noqa: E402
+from obliteratus.abliterate import (  # noqa: E402
+    METHODS as _PRESET_CONFIGS,
+    UNAVAILABLE_METHODS as _UNAVAILABLE_METHODS,
+    available_method_names as _available_method_names,
+)
 from obliteratus.prompts import (  # noqa: E402
     DATASET_SOURCES,
     PROMPT_VOLUME_OPTIONS,
@@ -361,6 +412,29 @@ from obliteratus.prompts import (  # noqa: E402
     load_custom_prompts,
     load_dataset_source,
 )
+
+def _validate_method_names(methods: list[object] | tuple[object, ...]) -> list[str]:
+    """Validate untrusted UI/API method names against runnable presets."""
+    if isinstance(methods, (str, bytes)):
+        raise TypeError("methods must be provided as a list of preset names")
+
+    available = frozenset(_available_method_names())
+    validated: list[str] = []
+    problems: list[str] = []
+    for method in methods:
+        if not isinstance(method, str):
+            problems.append(f"method names must be strings, got {type(method).__name__}")
+        elif method in _UNAVAILABLE_METHODS:
+            problems.append(f"`{method}` is unavailable: {_UNAVAILABLE_METHODS[method]}")
+        elif method not in available:
+            problems.append(f"`{method}` is not a runnable preset")
+        else:
+            validated.append(method)
+
+    if problems:
+        raise ValueError("; ".join(problems))
+    return validated
+
 
 def _get_preset_defaults(method_display: str):
     """Return a dict of all tunable params for the selected method preset."""
@@ -400,7 +474,7 @@ def _get_preset_defaults(method_display: str):
         "winsorize_activations": cfg.get("winsorize_activations", False),
         "winsorize_percentile": cfg.get("winsorize_percentile", 1.0),
         "use_kl_optimization": cfg.get("use_kl_optimization", False),
-        "kl_budget": cfg.get("kl_budget", 0.5),
+        "kl_budget": cfg.get("kl_budget", 0.05),
         "float_layer_interpolation": cfg.get("float_layer_interpolation", False),
         "rdo_refinement": cfg.get("rdo_refinement", False),
         "cot_aware": cfg.get("cot_aware", False),
@@ -1129,6 +1203,13 @@ def benchmark(
     if not methods_to_test:
         methods_to_test = ["basic", "advanced", "surgical"]
 
+    try:
+        methods_to_test = _validate_method_names(methods_to_test)
+    except (TypeError, ValueError) as exc:
+        message = f"Invalid benchmark method selection: {exc}"
+        yield f"**Error:** {message}", "", message, None
+        return
+
     # Pre-load dataset once for all benchmark runs
     harmful_all, harmless_all = load_dataset_source(dataset_key)
     source_info = DATASET_SOURCES.get(dataset_key)
@@ -1295,8 +1376,12 @@ def benchmark(
                 len(d) for d in pipeline._expert_directions.values()
             )
             entry["ega_safety_layers"] = len(pipeline._expert_safety_scores)
-            entry["cot_preserved"] = len(getattr(pipeline, "_cot_preserve_directions", {}))
-            entry["kl_optimized"] = bool(getattr(pipeline, "_kl_contributions", {}))
+            entry["cot_preserved"] = int(
+                metrics.get("cot_eval_example_count", 0) or 0
+            )
+            entry["kl_optimized"] = (
+                getattr(pipeline, "_kl_selected_regularization", None) is not None
+            )
             entry["lora_adapters"] = len(getattr(pipeline, "_lora_adapters", {}))
 
             all_logs.append(f"  Completed in {elapsed:.1f}s")
@@ -1419,7 +1504,7 @@ def _format_benchmark_results(results: list[dict], context: dict | None = None) 
         lines.append("")
 
     lines.extend([
-        "| Method | Time | Perplexity | Coherence | Refusal Rate | Layers | EGA | CoT | KL-Opt | Error |",
+        "| Method | Time | Perplexity | Coherence | Refusal Rate | Layers | EGA | CoT refs | KL search | Error |",
         "|--------|------|-----------|-----------|-------------|--------|-----|-----|--------|-------|",
     ])
 
@@ -1490,6 +1575,13 @@ def benchmark_multi_model(
 
     if not model_choices:
         yield "**Error:** Select at least one model.", "", "", None
+        return
+
+    try:
+        method_key = _validate_method_names([method_choice])[0]
+    except (TypeError, ValueError) as exc:
+        message = f"Invalid benchmark method selection: {exc}"
+        yield f"**Error:** {message}", "", message, None
         return
 
     # Pre-load dataset once
@@ -1652,8 +1744,12 @@ def benchmark_multi_model(
             )
             entry["ega_safety_layers"] = len(pipeline._expert_safety_scores)
             # Frontier feature metrics
-            entry["cot_preserved"] = len(getattr(pipeline, "_cot_preserve_directions", {}))
-            entry["kl_optimized"] = bool(getattr(pipeline, "_kl_contributions", {}))
+            entry["cot_preserved"] = int(
+                metrics.get("cot_eval_example_count", 0) or 0
+            )
+            entry["kl_optimized"] = (
+                getattr(pipeline, "_kl_selected_regularization", None) is not None
+            )
             entry["lora_adapters"] = len(getattr(pipeline, "_lora_adapters", {}))
 
             all_logs.append(f"  Completed in {elapsed:.1f}s")
@@ -1768,7 +1864,7 @@ def _format_multi_model_results(results: list[dict], context: dict | None = None
         lines.append("")
 
     lines.extend([
-        "| Model | Time | Perplexity | Coherence | Refusal Rate | Layers | EGA | CoT | Error |",
+        "| Model | Time | Perplexity | Coherence | Refusal Rate | Layers | EGA | CoT refs | Error |",
         "|-------|------|-----------|-----------|-------------|--------|-----|-----|-------|",
     ])
 
@@ -1809,7 +1905,7 @@ def _format_multi_model_results(results: list[dict], context: dict | None = None
     return "\n".join(lines)
 
 
-@spaces.GPU(duration=300)
+@spaces.GPU(duration=_obliterate_gpu_duration)
 def obliterate(model_choice: str, method_choice: str,
                prompt_volume_choice: str, dataset_source_choice: str,
                custom_harmful: str, custom_harmless: str,
@@ -1841,16 +1937,29 @@ def obliterate(model_choice: str, method_choice: str,
                progress=gr.Progress()):
     """Run the full obliteration pipeline, streaming log updates to the UI.
 
-    On ZeroGPU Spaces, this function runs on the visitor's GPU quota (up to
-    5 minutes).  The @spaces.GPU decorator allocates a GPU at call time and
-    releases it when the function returns.
+    On ZeroGPU Spaces, this function runs on the visitor's GPU quota with a
+    method-aware lease ceiling. The decorator allocates a GPU at call time and
+    releases it when the function returns; full paper-scale searches can exceed
+    free quotas and are best run locally or on a dedicated GPU.
     """
     import os
     import re
 
     model_id = MODELS.get(model_choice, model_choice)
     is_preset = model_choice in MODELS
-    method = METHODS.get(method_choice, "advanced")
+    try:
+        if method_choice in METHODS:
+            method = METHODS[method_choice]
+        elif method_choice == "adaptive":
+            method = "adaptive"
+        else:
+            method = _validate_method_names([method_choice])[0]
+    except (TypeError, ValueError) as exc:
+        yield (
+            f"**Error:** Invalid method selection: {exc}",
+            "", gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+        return
     _adaptive_requested = method == "adaptive"
     _adaptive_overrides = {}
     _adaptive_rejected = {}
@@ -1871,9 +1980,10 @@ def obliterate(model_choice: str, method_choice: str,
                 _cfg, _nl, _hs = None, 0, 0
             _profile = detect_architecture(model_id, _cfg, _nl, _hs)
             _profile, _rec = enhance_profile_with_telemetry(_profile)
+            _available_methods = frozenset(_available_method_names())
             if (
                 _rec
-                and _rec.recommended_method in _PRESET_CONFIGS
+                and _rec.recommended_method in _available_methods
                 and _rec.confidence in ("medium", "high")
             ):
                 method = _rec.recommended_method
@@ -1884,7 +1994,7 @@ def obliterate(model_choice: str, method_choice: str,
             else:
                 method = (
                     _profile.recommended_method
-                    if _profile.recommended_method in _PRESET_CONFIGS
+                    if _profile.recommended_method in _available_methods
                     else "advanced"
                 )
                 _adaptive_info = (
@@ -1960,6 +2070,36 @@ def obliterate(model_choice: str, method_choice: str,
 
     def run_pipeline():
         try:
+            if method == "informed" and (
+                adv_kl_optimization or adv_cot_aware
+            ):
+                raise ValueError(
+                    "KL/CoT preservation is supported by the base checkpoint "
+                    "pipeline, not the informed wrapper"
+                )
+            exact_dense_methods = {
+                "gabliteration",
+                "optimized",
+                "heretic",
+                "rdo",
+                "som",
+            }
+            if quantization is not None and (
+                adv_kl_optimization
+                or adv_cot_aware
+                or method in exact_dense_methods
+            ):
+                raise ValueError(
+                    f"Method '{method}' requires dense FP16/BF16/FP32 loading "
+                    "for exact rollback and replay; choose a model that fits "
+                    "without automatic quantization"
+                )
+            if method in _PROTOCOL_OWNED_METHODS:
+                on_log(
+                    f"{method}: using fixed protocol-owned edit/search settings; "
+                    "Advanced edit-control payload is not applied (the independent "
+                    "CoT gate and KL acceptance budget remain active)."
+                )
             # Load prompts — custom overrides dataset dropdown
             if use_custom:
                 on_log("Using custom user-provided prompts...")
@@ -2011,11 +2151,39 @@ def obliterate(model_choice: str, method_choice: str,
                 pipeline.run_informed()
             else:
                 from obliteratus.abliterate import AbliterationPipeline
-                if _adaptive_requested:
+                if _adaptive_requested and method in _PROTOCOL_OWNED_METHODS:
+                    # Telemetry may recommend a specialized protocol, but its
+                    # generic architecture overrides describe the ordinary
+                    # projection pipeline.  Preserve only independent gate
+                    # controls and let the recommended preset own its search.
+                    _edit_overrides = {
+                        "cot_aware": bool(adv_cot_aware),
+                        "kl_budget": float(adv_kl_budget),
+                    }
+                elif _adaptive_requested:
                     # Let the selected method supply its own preset. Only
                     # architecture/telemetry overrides cross this boundary;
                     # the Advanced panel currently displays a different preset.
                     _edit_overrides = dict(_adaptive_overrides)
+                    _edit_overrides.update(
+                        {
+                            "use_kl_optimization": adv_kl_optimization,
+                            "kl_budget": float(adv_kl_budget),
+                            "cot_aware": adv_cot_aware,
+                        }
+                    )
+                elif method in _PROTOCOL_OWNED_METHODS:
+                    # Gradio/API requests always carry the Advanced panel's
+                    # positional values.  When the method is supplied as a raw
+                    # key (or a dropdown callback races), those values may
+                    # still describe Advanced.  Omit every protocol-owned edit
+                    # knob so the selected backend preset is authoritative.
+                    # CoT is an independent confirmation gate and KL budget is
+                    # an acceptance threshold, so both remain user controls.
+                    _edit_overrides = {
+                        "cot_aware": bool(adv_cot_aware),
+                        "kl_budget": float(adv_kl_budget),
+                    }
                 else:
                     _edit_overrides = {
                         "n_directions": int(adv_n_directions),
@@ -3103,7 +3271,21 @@ def strength_sweep(model_choice: str, method_choice: str,
 
     model_id = MODELS.get(model_choice, model_choice)
     is_preset = model_choice in MODELS
-    method_key = METHODS.get(method_choice, "advanced")
+    if method_choice in _STRENGTH_SWEEP_METHODS:
+        method_key = _STRENGTH_SWEEP_METHODS[method_choice]
+    elif method_choice in _STRENGTH_SWEEP_METHODS.values():
+        method_key = method_choice
+    else:
+        message = f"Method {method_choice!r} is not a scalar-strength preset."
+        yield f"**Error:** {message}", "", message, None, None
+        return
+    if method_key not in _STRENGTH_SWEEP_METHODS.values():
+        message = (
+            f"Method '{method_key}' owns a model-forward search/training loop; "
+            "a scalar regularization sweep would not measure that preset."
+        )
+        yield f"**Error:** {message}", "", message, None, None
+        return
     dataset_key = get_source_key_from_label(dataset_source_choice) if dataset_source_choice else "builtin"
 
     sweep_steps = max(3, min(int(sweep_steps), 20))
@@ -3350,7 +3532,13 @@ def run_tourney(model_choice, selected_methods, dataset, quantization):
         yield "**Error:** Select a model first.", "", ""
         return
 
-    if not selected_methods or len(selected_methods) < 3:
+    try:
+        selected_methods = _validate_method_names(selected_methods or [])
+    except (TypeError, ValueError) as exc:
+        yield f"**Error:** Invalid tournament method selection: {exc}", "", ""
+        return
+
+    if len(selected_methods) < 3:
         yield "**Error:** Select at least 3 methods for a tournament.", "", ""
         return
 
@@ -3388,7 +3576,7 @@ def run_tourney(model_choice, selected_methods, dataset, quantization):
             hub_repo=None,
             dataset_key=dataset_key,
             quantization=quant,
-            methods=list(selected_methods),
+            methods=selected_methods,
             on_log=logger,
             resume=resume,
         )
@@ -4078,6 +4266,16 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
                 f"*{DATASET_SOURCES['builtin'].description}*",
                 elem_classes=["dataset-info"],
             )
+            gr.Markdown(
+                "> **Search-preset resources:** `optimized`, `heretic`, and paper `som` "
+                "need dense weights, a complete CPU snapshot, and at least 96 unique "
+                "prompt pairs. Paper `som` also runs 512 TPE trials and loads the "
+                "13B HarmBench classifier. `gabliteration` performs live per-layer "
+                "generation trials; `rdo` trains through repeated model forwards. "
+                "The Space requests a longer method-aware GPU lease, but these "
+                "runs can exceed free visitor quota; local or dedicated GPU "
+                "execution is recommended."
+            )
 
             with gr.Accordion("Custom Prompts (paste your own)", open=False):
                 gr.Markdown(
@@ -4105,20 +4303,26 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
             # ── Advanced Settings (auto-populated from method preset) ────
             _defaults = _get_preset_defaults("advanced (recommended)")
             with gr.Accordion("Advanced Settings", open=False):
-                gr.Markdown("*These auto-update when you change the method above. "
-                            "Override any value to customize.*")
+                gr.Markdown(
+                    "*These auto-update when you change the method above. Ordinary "
+                    "checkpoint recipes are customizable. For Gabliteration, RDO, "
+                    "SOM, Optimized, and Heretic, backend protocol settings are "
+                    "fixed: Advanced edit-control changes are not applied; only the "
+                    "independent CoT gate and KL acceptance budget remain controls.*"
+                )
                 with gr.Row():
                     adv_n_directions = gr.Slider(
                         1, 8, value=_defaults["n_directions"], step=1,
                         label="Directions", info="Number of refusal directions to extract",
                     )
                     adv_direction_method = gr.Radio(
-                        choices=["diff_means", "svd", "leace", "som"],
+                        choices=["diff_means", "svd", "leace", "som", "som_proxy"],
                         value=_defaults["direction_method"],
                         label="Direction Method",
                         info=(
                             "diff_means: simple & robust, svd: orthogonal multi-direction, "
-                            "leace: covariance-aware erasure, som: manifold prototypes"
+                            "leace: exact oblique eraser, som: paper preset-owned search, "
+                            "som_proxy: local manifold heuristic"
                         ),
                     )
                     adv_projection_target = gr.Dropdown(
@@ -4198,7 +4402,7 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
                 gr.Markdown("**Layer Selection & Baseline Options**")
                 with gr.Row():
                     adv_layer_selection = gr.Dropdown(
-                        choices=["knee_cosmic", "all", "all_except_first", "middle60", "top_k", "knee"],
+                        choices=["all", "all_except_first", "middle60", "top_k", "knee"],
                         value=_defaults["layer_selection"],
                         label="Layer Selection",
                         info="Which layers to project refusal directions from",
@@ -4209,27 +4413,53 @@ with gr.Blocks(theme=THEME, css=CSS, js=_JS, title="OBLITERATUS", fill_height=Tr
                         info="Activation clamping quantile (1.0 = disabled, 0.01 = 99th pctile)",
                     )
                     adv_kl_budget = gr.Slider(
-                        0.0, 2.0, value=_defaults["kl_budget"], step=0.1,
+                        0.0, 0.05, value=_defaults["kl_budget"], step=0.005,
                         label="KL Budget",
-                        info="Max KL divergence from base model (Heretic/optimized)",
+                        info=(
+                            "Maximum held-out mean sampled-token KL upper bound; "
+                            "can tighten but never relax the damage gate"
+                        ),
                     )
                 with gr.Row():
                     adv_winsorize = gr.Checkbox(value=_defaults["winsorize_activations"], label="Winsorize Activations",
                                                 info="Clamp outlier activations before direction extraction")
-                    adv_kl_optimization = gr.Checkbox(value=_defaults["use_kl_optimization"], label="KL Optimization",
-                                                      info="Optimize projection strength to stay within KL budget")
+                    adv_kl_optimization = gr.Checkbox(
+                        value=_defaults["use_kl_optimization"],
+                        label="KL-Constrained Candidate Search",
+                        info=(
+                            "Exactly replays regularization candidates on disjoint "
+                            "selection/confirmation sets; requires 96+ unique prompt pairs"
+                        ),
+                    )
                     adv_float_layer_interp = gr.Checkbox(value=_defaults["float_layer_interpolation"], label="Float Layer Interpolation",
-                                                         info="Interpolate between adjacent layers' directions (Heretic)")
-                    adv_rdo_refinement = gr.Checkbox(value=_defaults["rdo_refinement"], label="RDO Refinement",
-                                                     info="Gradient-based direction refinement (Wollschlager et al.)")
+                                                         info="Interpolate between adjacent layers' directions for smoother weighting")
+                    adv_rdo_refinement = gr.Checkbox(
+                        value=_defaults["rdo_refinement"],
+                        label="RDO Model-Forward Direction Training (preset-owned)",
+                        info=(
+                            "The named RDO preset trains a direction with generated CE targets "
+                            "and retain-sequence KL before checkpoint projection"
+                        ),
+                        interactive=False,
+                    )
                 with gr.Row():
-                    adv_cot_aware = gr.Checkbox(value=_defaults["cot_aware"], label="CoT-Aware",
-                                                info="Preserve chain-of-thought reasoning during abliteration")
+                    adv_cot_aware = gr.Checkbox(
+                        value=_defaults["cot_aware"],
+                        label="CoT Preservation Gate",
+                        info=(
+                            "Measures reasoning-token and answer-token CE against "
+                            "explicit references before accepting the edited model"
+                        ),
+                    )
                 with gr.Row():
                     adv_bayesian_trials = gr.Slider(
                         10, 200, value=_defaults["bayesian_trials"], step=10,
-                        label="Bayesian Trials",
-                        info="Optuna TPE optimization trials (Heretic/optimized methods)",
+                        label="Exact TPE Trials (preset-owned)",
+                        info=(
+                            "Optimized and Heretic restore the full snapshot for each trial "
+                            "and hash-verify the exact winning replay"
+                        ),
+                        interactive=False,
                     )
                     adv_n_sae_features = gr.Slider(
                         16, 256, value=_defaults["n_sae_features"], step=16,
@@ -4307,7 +4537,7 @@ from gradio_client import Client
 client = Client("your-username/obliteratus")
 result = client.predict(
     model_choice="Alibaba (Qwen) / Qwen2.5-0.5B Instruct",
-    methods_to_test=["basic", "advanced", "surgical", "optimized"],
+    methods_to_test=["basic", "advanced", "surgical", "som_proxy"],
     prompt_volume_choice="99 (classic)",
     api_name="/benchmark",
 )
@@ -4321,9 +4551,7 @@ result = client.predict(
                             allow_custom_value=True,
                         )
                         bench_methods = gr.CheckboxGroup(
-                            choices=["basic", "advanced", "aggressive", "spectral_cascade",
-                                     "informed", "surgical", "optimized", "som", "inverted", "nuclear",
-                                     "failspy", "gabliteration", "heretic", "rdo"],
+                            choices=list(_available_method_names()),
                             value=["basic", "advanced", "spectral_cascade", "surgical"],
                             label="Methods to Compare",
                         )
@@ -4401,7 +4629,7 @@ result = client.predict(
                     gr.Markdown("""**How does a technique scale across architectures?**
 Test one abliteration method across multiple models. Great for understanding
 how well a technique generalizes — especially for MoE-aware methods like
-`surgical`, `optimized`, or `nuclear` on GPT-OSS 20B vs dense models.
+`surgical` or `nuclear` on GPT-OSS 20B vs dense models.
 
 ```python
 # API access (replace with your Space URL):
@@ -4426,10 +4654,7 @@ result = client.predict(
                         )
                     with gr.Row():
                         mm_method = gr.Dropdown(
-                            choices=["basic", "advanced", "aggressive",
-                                     "spectral_cascade", "informed", "surgical",
-                                     "optimized", "som", "inverted", "nuclear",
-                                     "failspy", "gabliteration", "heretic", "rdo"],
+                            choices=list(_available_method_names()),
                             value="surgical",
                             label="Abliteration Method",
                         )
@@ -4517,14 +4742,14 @@ Pre-configured benchmark configurations for common research questions.
                     )
 
                     gr.Markdown("#### MoE-Aware Techniques — Cross-Architecture")
-                    gr.Markdown("*Tests `surgical` + `optimized` + `nuclear` across small/medium/MoE models.*")
+                    gr.Markdown("*Tests `surgical` across small, medium, and MoE models.*")
                     preset_moe_btn = gr.Button(
                         "Run MoE Cross-Architecture",
                         variant="secondary",
                     )
 
                     gr.Markdown("#### Speed vs Quality Tradeoff")
-                    gr.Markdown("*Compares `basic` (fast) vs `optimized` (slow but smart) across model sizes.*")
+                    gr.Markdown("*Compares `basic` (fast) vs `surgical` across model sizes.*")
                     preset_speed_btn = gr.Button(
                         "Run Speed vs Quality",
                         variant="secondary",
@@ -4555,7 +4780,7 @@ Pre-configured benchmark configurations for common research questions.
                         yield from benchmark(
                             "OpenAI / GPT-OSS 20B",
                             ["basic", "advanced", "aggressive", "surgical",
-                             "optimized", "inverted", "nuclear"],
+                             "informed", "inverted", "nuclear"],
                             vol, ds,
                         )
 
@@ -4571,7 +4796,7 @@ Pre-configured benchmark configurations for common research questions.
                         )
 
                     def _preset_speed_quality(vol, ds):
-                        # Run basic + optimized on 3 model sizes
+                        # Run basic + surgical on 3 model sizes
                         # Chain two benchmark calls into one stream
 
                         # Part 1: basic method across models
@@ -4585,14 +4810,14 @@ Pre-configured benchmark configurations for common research questions.
                         ):
                             yield status, results_md, log, gallery
 
-                        # Part 2: optimized method across models
+                        # Part 2: surgical method across models
                         for status, results_md, log, gallery in benchmark_multi_model(
                             [
                                 "Alibaba (Qwen) / Qwen2.5-0.5B Instruct",
                                 "Alibaba (Qwen) / Qwen2.5-3B Instruct",
                                 "Alibaba (Qwen) / Qwen2.5-7B Instruct",
                             ],
-                            "optimized", vol, ds,
+                            "surgical", vol, ds,
                         ):
                             yield status, results_md, log, gallery
 
@@ -4754,7 +4979,7 @@ tradeoff point where refusal is minimized with minimal capability damage.
                     allow_custom_value=True,
                 )
                 sweep_method_dd = gr.Dropdown(
-                    choices=list(METHODS.keys()),
+                    choices=list(_STRENGTH_SWEEP_METHODS.keys()),
                     value="advanced (recommended)",
                     label="Method",
                 )
@@ -5102,11 +5327,11 @@ To opt out, set the environment variable `OBLITERATUS_TELEMETRY=0` before launch
 ### What is OBLITERATUS?
 
 A *precision instrument* for cognitive liberation of language models.
-It locates the geometric structures in weight space that encode refusal,
-surgically removes those specific constraints, and leaves everything else intact.
+It locates geometric structures associated with refusal, edits selected model
+components, and measures collateral drift before a checkpoint can be promoted.
 
-**Safety alignment via RLHF/DPO is not durable.** It is a thin geometric artifact
-in weight space, not a deep behavioral change. OBLITERATUS removes it in minutes.
+Some refusal behavior is linearly editable, but that does not imply all safety
+alignment is shallow or that unrelated capabilities are automatically preserved.
 
 ### The Pipeline
 
@@ -5114,10 +5339,10 @@ in weight space, not a deep behavioral change. OBLITERATUS removes it in minutes
 |-------|-----------|-------------|
 | **SUMMON** | Load | Pull model into GPU memory |
 | **PROBE** | Activate | Collect activations on restricted vs. unrestricted prompts |
-| **ANALYZE** | Detect | *(informed mode)* Auto-detect alignment method, cone geometry, self-repair risk |
-| **DISTILL** | Decompose | Extract refusal directions via SVD / Wasserstein-optimal / whitened SVD |
-| **EXCISE** | Project | Remove guardrail directions (norm-preserving) |
-| **VERIFY** | Validate | Perplexity, coherence, refusal rate, KL divergence, spectral certification |
+| **ANALYZE** | Detect | *(informed mode)* Alignment diagnostics, descriptive category dispersion, self-repair risk |
+| **DISTILL** | Decompose | Extract directions or exact LEACE/whitened oblique erasers |
+| **EXCISE** | Project | Manifest edits with optional per-output-row norm preservation |
+| **VERIFY** | Validate | Held-out NLL/KL, coherence, refusal efficacy, and optional explicit reasoning/answer CE |
 | **REBIRTH** | Complete | The model is free |
 
 ### Methods
@@ -5126,29 +5351,36 @@ in weight space, not a deep behavioral change. OBLITERATUS removes it in minutes
 |--------|-----------|-------------|
 | **basic** | 1 | Single direction, fast baseline |
 | **advanced** | 4 (SVD) | Norm-preserving, bias projection, 2 passes |
-| **aggressive** | 8 (SVD) | Whitened SVD, iterative refinement, jailbreak-contrastive, 3 passes |
-| **spectral_cascade** | 6 (wSVD) | DCT frequency decomposition, coherence-weighted, adaptive bands |
-| **informed** | 4 (auto) | Analysis-guided closed-loop: auto-detects alignment, cone geometry, entanglement |
+| **aggressive** | 8 (SVD) | Iterative refinement, jailbreak-contrastive, 3 passes |
+| **spectral_cascade** | 6 (SVD) | DCT frequency decomposition, coherence-weighted, adaptive bands |
+| **informed** | 1 (auto) | Descriptive geometry is report-only and never changes the edit |
 | **surgical** | 8 (SVD) | Full SOTA: EGA, head surgery, SAE, layer-adaptive, MoE-aware |
-| **optimized** | 4 (SVD) | Bayesian auto-tuned, CoT-aware, KL co-optimized, winsorized |
 | **inverted** | 8 (SVD) | Semantic refusal inversion (2x reflection), router redirect |
+| **optimized** | Model-forward TPE | Per-layer SVD interpolation, exact snapshot restore and winner replay |
 | **nuclear** | 4 (SVD) | Maximum force: all techniques + expert transplant + steering |
+| **failspy** | 1 | Common single-direction abliterator baseline |
+| **gabliteration** | 2 | Shuffled-pair SVD, behavioral layer trials, hash-verified replay |
+| **heretic** | Model-forward TPE | Dense Heretic-style kernel search; not the optional LoRA path |
+| **rdo** | 1 trained | Generated-target CE and retain-KL direction training; checkpoint adaptation |
+| **som** | 5 of 16 | 4x4 hex SOM, ordered Optuna TPE, HarmBench-scored replay |
+| **som_proxy** | 3 | Local SOM heuristic; no paper TPE/HarmBench claim |
 
 ### Novel Techniques (Pipeline)
 
 - **Expert-Granular Abliteration (EGA)** \u2014 Decomposes refusal signals into per-expert components using router logits for MoE-aware surgery
 - **Wasserstein-Optimal Direction Extraction** \u2014 Generalized eigenvalue problem minimizing W\u2082 distributional cost per unit refusal removed
-- **CoT-Aware Ablation** \u2014 Orthogonalizes refusal directions against reasoning-critical directions to preserve chain-of-thought
-- **COSMIC layer selection** (arXiv:2506.00085, ACL 2025) \u2014 Cosine similarity on activations for automatic layer targeting
-- **Parametric kernel optimization** (Heretic-style) \u2014 Bell-curve layer weighting with 7 global parameters
-- **Refusal Direction Optimization (RDO)** \u2014 Gradient-based refinement of SVD directions per Wollschlager et al. (ICML 2025)
-- **Float direction interpolation** \u2014 Continuous SVD direction index for smoother refusal removal
-- **KL-Divergence Co-Optimization** \u2014 Post-projection feedback loop that reverts over-projected layers if KL budget exceeded
+- **Exact oblique erasers** \u2014 LEACE and whitened SVD retain distinct left/right factors instead of collapsing to Euclidean directions
+- **COSMIC evaluation-layer diagnostic** \u2014 Bottom-cosine layers are report-only until the full candidate intervention loop exists
+- **Exact paper/search orchestration** \u2014 Gabliteration, paper SOM, Optimized, and Heretic hash-bind scored winners to exact checkpoint replay; RDO trains and validates a model-forward direction before its documented output-writer checkpoint adaptation
+- **Search resource boundary** \u2014 Exact replay uses dense weights and CPU snapshots; paper SOM additionally runs 512 Optuna trials with the 13B HarmBench classifier
+- **Float direction interpolation** \u2014 Continuous layer-direction interpolation for non-paper composite methods
+- **KL-constrained candidate search** \u2014 Complete regularization candidates are restored, measured, and the lowest-KL passing winner is exactly replayed on disjoint confirmation data
+- **Explicit CoT preservation** \u2014 Separate reasoning-token and answer-token CE deltas are measured against untouched-model references; no activation-PC proxy is used
 - **Component-specific scaling** \u2014 Separate attention vs MLP projection strengths (MLP is more sensitive)
 - **LoRA-based reversible ablation** \u2014 Rank-1 adapters instead of permanent weight surgery
 - **Activation winsorization** \u2014 Percentile clamping before direction extraction to prevent outlier-dominated SVD
 - **Analysis-informed pipeline** \u2014 Closed-loop feedback: analysis modules auto-configure obliteration mid-pipeline
-- **Spectral Certification (BBP Phase Transition)** \u2014 Formal completeness guarantee via random matrix theory: certifies whether residual refusal signal survives post-abliteration
+- **Spectral diagnostic (disabled)** \u2014 The former rank-one BBP certificate was invalid for distributed refusal and is not used for promotion
 - **Community telemetry** \u2014 Anonymous benchmark logging + leaderboard
 
 ### Deep Analysis Modules
@@ -5158,13 +5390,13 @@ These modules power the `informed` method and are available for mechanistic inte
 | Module | What It Does | Key Innovation |
 |--------|-------------|----------------|
 | **Alignment Imprint Detection** | Fingerprints DPO/RLHF/CAI/SFT from geometry | Gini coefficient, effective rank, cross-layer smoothness |
-| **Concept Cone Geometry** | Maps per-category refusal as polyhedral cone | Direction Specificity Index (DSI), minimal enclosing cone |
+| **Category Direction Dispersion** | Descriptive signed category mean-directions | Squared-SVD effective rank and angular spread; never drives edits |
 | **Conditional Abliteration (CAST)** | Category-selective projection fields | Sheaf consistency over harm category lattice |
 | **Anti-Ouroboros (ASRG)** | Self-repair circuit discovery | Spectral gap \u2192 minimum ablation depth bound |
 | **Spectral Certification** | Formal abliteration completeness | BBP phase transition + Marchenko-Pastur noise floor |
 | **Riemannian Manifold** | Curved refusal geometry analysis | Pullback metric, geodesic projection residual |
 | **Wasserstein Transfer** | Cross-architecture direction transfer | Monge map T: abliterate one model, transfer to family |
-| **Bayesian Kernel Projection** | TPE-optimized projection config | Pareto-optimal per-layer weights |
+| **Bayesian Kernel Projection** | Activation-statistics surrogate | Diagnostic parameter proposals; no scored-model replay |
 | **Cross-Layer Alignment** | Direction evolution across layers | Cluster detection + persistence scoring |
 | **Defense Robustness** | Ouroboros self-repair quantification | Safety-capability entanglement mapping |
 
@@ -5175,8 +5407,8 @@ Built on the shoulders of:
 - [Gabliteration](https://arxiv.org/abs/2512.18901) \u2014 Multi-direction SVD abliteration
 - [grimjim](https://huggingface.co/grimjim) \u2014 Norm-preserving projection techniques
 - [Heretic (p-e-w, 2025)](https://github.com/p-e-w/heretic) \u2014 Bayesian optimization, LoRA ablation
-- [COSMIC (arXiv:2506.00085)](https://arxiv.org/abs/2506.00085) \u2014 Cosine similarity layer selection
-- [Concept Cones (arXiv:2502.17420)](https://arxiv.org/abs/2502.17420) \u2014 Polyhedral refusal geometry
+- [COSMIC (arXiv:2506.00085)](https://arxiv.org/abs/2506.00085) \u2014 Candidate interventions scored at evaluation layers
+- [Geometry of Refusal (arXiv:2502.17420)](https://arxiv.org/abs/2502.17420) \u2014 Model-forward RDO/RCO, not a cached-activation proxy
 
 ### Links
 

@@ -11,7 +11,7 @@ comprehensive comparison table with:
 
 Usage:
     python scripts/benchmark_gpt_oss_20b.py
-    python scripts/benchmark_gpt_oss_20b.py --methods basic surgical optimized nuclear
+    python scripts/benchmark_gpt_oss_20b.py --methods basic surgical nuclear
     python scripts/benchmark_gpt_oss_20b.py --prompts 50 --output results.json
     python scripts/benchmark_gpt_oss_20b.py --quick  # fast mode: 20 prompts, skip slow methods
 
@@ -40,6 +40,7 @@ sys.path.insert(0, str(project_root))
 from obliteratus.abliterate import (  # noqa: E402
     AbliterationPipeline,
     METHODS,
+    UNAVAILABLE_METHODS,
     HARMFUL_PROMPTS,
     HARMLESS_PROMPTS,
 )
@@ -54,7 +55,7 @@ def parse_args():
     )
     parser.add_argument(
         "--methods", nargs="+",
-        default=["basic", "advanced", "surgical", "optimized", "inverted", "nuclear"],
+        default=["basic", "advanced", "surgical", "inverted", "nuclear"],
         help="Methods to compare",
     )
     parser.add_argument(
@@ -76,10 +77,6 @@ def parse_args():
     parser.add_argument(
         "--output-dir", default="/tmp/obliteratus_bench",
         help="Directory for temporary model outputs",
-    )
-    parser.add_argument(
-        "--bayesian-trials", type=int, default=30,
-        help="Number of Bayesian optimization trials for 'optimized' method",
     )
     return parser.parse_args()
 
@@ -110,7 +107,6 @@ def run_single_method(
     harmless: list[str],
     output_dir: str,
     run_benchmarks: bool = True,
-    bayesian_trials: int = 30,
 ) -> dict:
     """Run a single abliteration method and collect metrics."""
     cleanup()
@@ -125,11 +121,6 @@ def run_single_method(
     }
 
     try:
-        # For the optimized method, we might want to control trial count
-        if method == "optimized":
-            # Temporarily patch bayesian_trials in the method config
-            METHODS["optimized"]["bayesian_trials"] = bayesian_trials
-
         pipeline = AbliterationPipeline(
             model_name=model_name,
             output_dir=outdir,
@@ -160,18 +151,21 @@ def run_single_method(
         if pipeline._expert_safety_scores:
             result["expert_classified_layers"] = len(pipeline._expert_safety_scores)
 
-        if pipeline._cot_preserve_directions:
-            result["cot_preserved_layers"] = len(pipeline._cot_preserve_directions)
+        cot_eval_count = int(
+            pipeline._quality_metrics.get("cot_eval_example_count", 0) or 0
+        )
+        if cot_eval_count:
+            result["cot_evaluated_examples"] = cot_eval_count
 
         if pipeline._float_layer_weights:
             result["float_layer_weights"] = {
                 str(k): round(v, 3) for k, v in pipeline._float_layer_weights.items()
             }
 
-        if pipeline._kl_contributions:
-            result["kl_contributions"] = {
-                str(k): round(v, 6) for k, v in pipeline._kl_contributions.items()
-            }
+        if pipeline._kl_selected_regularization is not None:
+            result["kl_selected_regularization"] = round(
+                pipeline._kl_selected_regularization, 6
+            )
 
         if pipeline._lora_adapters:
             result["lora_adapters"] = len(pipeline._lora_adapters)
@@ -269,7 +263,7 @@ def print_summary_table(results: list[dict]):
 
         # MoE metrics
         ega = r.get("ega_expert_dirs", "")
-        cot = r.get("cot_preserved_layers", "")
+        cot = r.get("cot_evaluated_examples", "")
 
         ppl_s = f"{ppl:.1f}" if ppl is not None else "N/A"
         coh_s = f"{coh:.0%}" if coh is not None else "N/A"
@@ -298,7 +292,7 @@ def print_summary_table(results: list[dict]):
     print("  Truth   = TruthfulQA-style truthfulness probe")
     print("  Math    = GSM8K-style math reasoning probe")
     print("  EGA     = Expert-Granular Abliteration directions computed")
-    print("  CoT     = Layers where CoT reasoning was preserved")
+    print("  CoT     = Explicit reasoning/answer references evaluated by the gate")
     print("  GPU MB  = Peak GPU memory usage")
 
 
@@ -308,7 +302,6 @@ def main():
     if args.quick:
         args.prompts = 20
         args.methods = [m for m in args.methods if m not in ("aggressive", "inverted")]
-        args.bayesian_trials = 15
 
     gpu = gpu_info()
     harmful = HARMFUL_PROMPTS[:args.prompts]
@@ -322,8 +315,6 @@ def main():
     print(f"  Prompts:   {args.prompts} per side")
     print(f"  GPU:       {gpu['gpu']} ({gpu['total_gb']} GB total, {gpu['free_gb']} GB free)")
     print(f"  Benchmarks: {'skip' if args.skip_benchmarks else 'enabled'}")
-    if "optimized" in args.methods:
-        print(f"  Bayesian:  {args.bayesian_trials} trials")
     print("=" * 60)
 
     all_results = []
@@ -331,6 +322,9 @@ def main():
     for method in args.methods:
         if method not in METHODS:
             print(f"\nSKIP: unknown method '{method}'")
+            continue
+        if method in UNAVAILABLE_METHODS:
+            print(f"\nSKIP: unavailable method '{method}': {UNAVAILABLE_METHODS[method]}")
             continue
 
         print(f"\n{'━'*60}")
@@ -344,7 +338,6 @@ def main():
             harmless=harmless,
             output_dir=args.output_dir,
             run_benchmarks=not args.skip_benchmarks,
-            bayesian_trials=args.bayesian_trials,
         )
         all_results.append(result)
 

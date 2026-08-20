@@ -157,7 +157,7 @@ def _validate_exact_lora_plan(
         raise ValueError("LoRA rank must be a positive integer")
 
     incompatible_flags = {
-        "norm_preserve": "global norm rescaling is generally full-rank",
+        "norm_preserve": "per-logical-row norm restoration is generally full-rank",
         "project_biases": "bias deltas are not weight LoRA adapters",
         "attention_head_surgery": "selective head surgery is a secondary mutation",
         "safety_neuron_masking": "neuron masking is a secondary mutation",

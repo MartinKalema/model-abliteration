@@ -80,7 +80,7 @@ class BaselinePromptArtifacts:
     """Compact untouched-model state retained across an in-place edit.
 
     ``sampled_logits`` contains only the selected full-vocabulary rows and is
-    always detached CPU FP16 storage.  It intentionally does not retain the
+    always detached CPU FP32 storage.  It intentionally does not retain the
     full baseline ``[sequence, vocabulary]`` tensor.
     """
 
@@ -326,7 +326,7 @@ def capture_locality_baseline(
 
     The returned object owns CPU copies of the exact encoded inputs and masks,
     per-prompt baseline loss totals, and at most
-    ``max_kl_positions_per_prompt`` full-vocabulary FP16 rows per prompt.  The
+    ``max_kl_positions_per_prompt`` full-vocabulary FP32 rows per prompt.  The
     full baseline logit tensor is never retained.
     """
 
@@ -368,7 +368,7 @@ def capture_locality_baseline(
             baseline_logits[prompt_index]
             .index_select(0, sample_index)
             .detach()
-            .to(device="cpu", dtype=torch.float16)
+            .to(device="cpu", dtype=torch.float32)
             .clone()
         )
         valid_positions = torch.nonzero(mask.bool()).flatten().to(baseline_logits.device)
@@ -440,9 +440,9 @@ def compare_locality_candidate(
             sampled_positions, device=candidate_logits.device, dtype=torch.long
         )
         baseline_rows = baseline_prompt.sampled_logits
-        # The compact baseline is intentionally stored as FP16.  Quantize the
-        # candidate rows the same way before computing KL/top-1 so baseline
-        # compression cannot create one-sided, false damage on a no-op run.
+        # Sampled rows use FP32 even when the model runs at lower precision.
+        # This retains small candidate changes instead of masking them behind
+        # an additional FP16 baseline-compression step.
         candidate_rows = (
             candidate_logits[prompt_index]
             .index_select(0, candidate_index)

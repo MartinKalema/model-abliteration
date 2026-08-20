@@ -20,7 +20,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from obliteratus.adaptive_defaults import AdaptiveRecommendation
 
 logger = logging.getLogger(__name__)
 
@@ -586,7 +589,7 @@ def apply_profile_to_method_config(
 
 def enhance_profile_with_telemetry(
     profile: ArchitectureProfile,
-) -> tuple[ArchitectureProfile, "AdaptiveRecommendation | None"]:
+) -> tuple[ArchitectureProfile, AdaptiveRecommendation | None]:
     """Optionally enhance a profile with telemetry-driven adaptive defaults.
 
     Queries the community telemetry dataset and, if sufficient data exists for
@@ -599,6 +602,7 @@ def enhance_profile_with_telemetry(
         (profile, recommendation) — recommendation is None if no telemetry data.
     """
     try:
+        from obliteratus.abliterate import available_method_names
         from obliteratus.adaptive_defaults import get_adaptive_recommendation
     except ImportError:
         return profile, None
@@ -619,16 +623,22 @@ def enhance_profile_with_telemetry(
 
     # Only override research defaults if we have medium+ confidence
     if rec.confidence in ("medium", "high"):
-        if rec.recommended_method:
-            profile.recommended_method = rec.recommended_method
-            profile.profile_description += (
-                f"\n\n**Telemetry override ({rec.confidence} confidence):** "
-                f"Community data ({rec.n_records} runs) shows `{rec.recommended_method}` "
-                f"performs best for this architecture."
+        available_methods = frozenset(available_method_names())
+        if rec.recommended_method not in available_methods:
+            logger.warning(
+                "Ignoring unavailable adaptive method recommendation %r",
+                rec.recommended_method,
             )
+            return profile, rec
+
+        profile.recommended_method = rec.recommended_method
+        profile.profile_description += (
+            f"\n\n**Telemetry override ({rec.confidence} confidence):** "
+            f"Community data ({rec.n_records} runs) shows `{rec.recommended_method}` "
+            f"performs best for this architecture."
+        )
         if rec.method_overrides:
             # Merge telemetry overrides on top of research defaults
             profile.method_overrides.update(rec.method_overrides)
 
     return profile, rec
-

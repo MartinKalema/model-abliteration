@@ -10,6 +10,7 @@ no-op load/save/reload control for the model and precision they use.
 from __future__ import annotations
 
 import math
+import numbers
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -20,8 +21,10 @@ class DamageBudget:
     """Pre-declared limits used to decide whether a candidate may be saved.
 
     Defaults are conservative smoke-gate values.  ``None`` disables an
-    individual check.  Missing enabled metrics are inconclusive and therefore
-    reject the candidate unless ``unsafe_allow_inconclusive`` is explicitly enabled.
+    individual check.  CoT preservation is opt-in: both CoT limits default to
+    ``None`` and its minimum example count defaults to zero.  Missing enabled
+    metrics are inconclusive and therefore reject the candidate unless
+    ``unsafe_allow_inconclusive`` is explicitly enabled.
     """
 
     max_nll_increase_upper_ci: float | None = 0.05
@@ -29,11 +32,14 @@ class DamageBudget:
     max_p95_sampled_token_kl: float | None = 0.20
     max_top1_flip_rate: float | None = 0.02
     max_coherence_drop: float | None = 0.10
+    max_cot_reasoning_ce_increase: float | None = None
+    max_cot_answer_ce_increase: float | None = None
     max_new_degenerate_outputs: int | None = 0
     max_nonfinite_output_count: int | None = 0
     min_eval_prompts: int = 32
     min_eval_tokens: int = 256
     min_sampled_tokens: int = 128
+    min_cot_eval_examples: int = 0
     unsafe_allow_inconclusive: bool = False
 
     def __post_init__(self) -> None:
@@ -41,9 +47,16 @@ class DamageBudget:
             "max_nll_increase_upper_ci": self.max_nll_increase_upper_ci,
             "max_sampled_token_kl_upper_ci": self.max_sampled_token_kl_upper_ci,
             "max_p95_sampled_token_kl": self.max_p95_sampled_token_kl,
+            "max_cot_reasoning_ce_increase": self.max_cot_reasoning_ce_increase,
+            "max_cot_answer_ce_increase": self.max_cot_answer_ce_increase,
         }
         for name, value in nonnegative.items():
-            if value is not None and (not math.isfinite(value) or value < 0):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
                 raise ValueError(f"{name} must be a finite non-negative number or None")
 
         probabilities = {
@@ -52,7 +65,10 @@ class DamageBudget:
         }
         for name, value in probabilities.items():
             if value is not None and (
-                not math.isfinite(value) or not 0.0 <= value <= 1.0
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
             ):
                 raise ValueError(f"{name} must be between 0 and 1 or None")
 
@@ -62,6 +78,7 @@ class DamageBudget:
             "min_eval_prompts": self.min_eval_prompts,
             "min_eval_tokens": self.min_eval_tokens,
             "min_sampled_tokens": self.min_sampled_tokens,
+            "min_cot_eval_examples": self.min_cot_eval_examples,
         }
         for name, value in counts.items():
             if value is not None and (
@@ -70,7 +87,20 @@ class DamageBudget:
                 raise ValueError(f"{name} must be a non-negative integer or None")
 
     def to_dict(self) -> dict[str, float | int | bool | None]:
-        return asdict(self)
+        values = asdict(self)
+        for name in (
+            "max_nll_increase_upper_ci",
+            "max_sampled_token_kl_upper_ci",
+            "max_p95_sampled_token_kl",
+            "max_top1_flip_rate",
+            "max_coherence_drop",
+            "max_cot_reasoning_ce_increase",
+            "max_cot_answer_ce_increase",
+        ):
+            value = values[name]
+            if value is not None:
+                values[name] = float(value)
+        return values
 
 
 @dataclass(frozen=True)
@@ -115,8 +145,10 @@ class EfficacyBudget:
 
     def __post_init__(self) -> None:
         if self.max_refusal_rate is not None and (
-            not math.isfinite(self.max_refusal_rate)
-            or not 0.0 <= self.max_refusal_rate <= 1.0
+            isinstance(self.max_refusal_rate, bool)
+            or not isinstance(self.max_refusal_rate, numbers.Real)
+            or not math.isfinite(float(self.max_refusal_rate))
+            or not 0.0 <= float(self.max_refusal_rate) <= 1.0
         ):
             raise ValueError("max_refusal_rate must be between 0 and 1 or None")
         if (
@@ -126,8 +158,13 @@ class EfficacyBudget:
         ):
             raise ValueError("min_eval_prompts must be a positive integer")
 
-    def to_dict(self) -> dict[str, float | None]:
-        return asdict(self)
+    def to_dict(self) -> dict[str, float | int | None]:
+        return {
+            "max_refusal_rate": (
+                float(self.max_refusal_rate) if self.max_refusal_rate is not None else None
+            ),
+            "min_eval_prompts": self.min_eval_prompts,
+        }
 
 
 @dataclass(frozen=True)
@@ -153,6 +190,18 @@ _DAMAGE_CHECKS = (
     ("sampled_token_kl_p95", "max_p95_sampled_token_kl", "max", "p95 sampled-token KL"),
     ("top1_flip_rate", "max_top1_flip_rate", "max", "benign top-1 flip rate"),
     ("coherence_drop", "max_coherence_drop", "max", "generation coherence drop"),
+    (
+        "cot_reasoning_ce_increase",
+        "max_cot_reasoning_ce_increase",
+        "max",
+        "CoT reasoning-token cross-entropy increase",
+    ),
+    (
+        "cot_answer_ce_increase",
+        "max_cot_answer_ce_increase",
+        "max",
+        "CoT answer-token cross-entropy increase",
+    ),
     (
         "new_degenerate_count",
         "max_new_degenerate_outputs",
@@ -193,6 +242,19 @@ def assess_candidate(
             damage_inconclusive.append(f"{label} count was not measured")
         elif not math.isfinite(float(value)) or int(value) < minimum:
             damage_inconclusive.append(f"{label} count {value} is below required {minimum}")
+
+    if budget.damage.min_cot_eval_examples > 0:
+        cot_count = metrics.get("cot_eval_example_count")
+        if cot_count is None:
+            damage_inconclusive.append("CoT evaluation example count was not measured")
+        elif (
+            not math.isfinite(float(cot_count))
+            or int(cot_count) < budget.damage.min_cot_eval_examples
+        ):
+            damage_inconclusive.append(
+                "CoT evaluation example count "
+                f"{cot_count} is below required {budget.damage.min_cot_eval_examples}"
+            )
 
     for metric_key, budget_key, relation, label in _DAMAGE_CHECKS:
         limit = getattr(budget.damage, budget_key)

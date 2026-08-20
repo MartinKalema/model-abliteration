@@ -31,4 +31,4 @@ Required architectural changes:
 - GPT-OSS reasoning effort changes generated analysis behavior, not its module layout. [Official model card](https://huggingface.co/openai/gpt-oss-20b)
 - Kimi K2 Thinking retains the same DeepSeek-V3-style MoE/MLA graph as Kimi K2. [Official model card](https://huggingface.co/moonshotai/Kimi-K2-Thinking)
 
-The current `cot_aware` implementation does not actually observe generated thinking. It disables Qwen thinking in the template and only processes prompt tokens. Its “reasoning direction” is PC1 of harmless-prompt activations, so it should be renamed as a heuristic rather than presented as validated reasoning preservation.
+The original `cot_aware` implementation did not observe generated thinking: it processed prompt tokens and mislabeled harmless-prompt PC1 as a reasoning direction. That edit heuristic has been removed. The current option is an explicit teacher-forced preservation gate over labeled reasoning and answer references. It is useful bounded evidence, but it is not generated-thinking benchmark evidence and does not identify a causal reasoning circuit.

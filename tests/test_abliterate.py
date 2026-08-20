@@ -160,7 +160,21 @@ class TestMethods:
             "rdo",
             "spectral_cascade",
             "som",
+            "som_proxy",
         }
+
+    def test_paper_named_methods_are_runnable_presets(self):
+        from obliteratus.abliterate import UNAVAILABLE_METHODS, available_method_names
+
+        paper_methods = {"optimized", "heretic", "gabliteration", "rdo", "som"}
+
+        assert paper_methods <= set(available_method_names())
+        assert paper_methods.isdisjoint(UNAVAILABLE_METHODS)
+        assert METHODS["gabliteration"]["gabliteration_shuffles"] == 5
+        assert METHODS["rdo"]["rdo_refinement"] is True
+        assert METHODS["som"]["direction_method"] == "som"
+        assert METHODS["optimized"]["bayesian_trials"] > 0
+        assert METHODS["heretic"]["bayesian_trials"] > 0
 
     def test_basic_single_direction(self):
         cfg = METHODS["basic"]
@@ -1124,10 +1138,9 @@ class TestAttentionHeadSurgery:
         ), "Non-targeted head 3 should be untouched"
 
     def test_head_surgery_norm_preserve(self):
-        """Head surgery with norm_preserve should maintain per-head norms."""
+        """Head surgery restores every logical output-neuron row norm."""
         hidden = 16
         n_heads = 4
-        head_dim = hidden // n_heads
 
         class FakeAttn(torch.nn.Module):
             def __init__(self):
@@ -1140,10 +1153,7 @@ class TestAttentionHeadSurgery:
         d = torch.randn(hidden, 1)
         d = d / d.norm()
 
-        orig_norms = [
-            attn.o_proj.weight.data[:, h*head_dim:(h+1)*head_dim].norm().item()
-            for h in range(n_heads)
-        ]
+        orig_norms = attn.o_proj.weight.data.norm(dim=1)
 
         head_scores = [(0, 5.0), (1, 3.0), (2, 1.0), (3, 0.5)]
         AbliterationPipeline._project_head_selective(
@@ -1151,11 +1161,8 @@ class TestAttentionHeadSurgery:
             head_fraction=0.5, norm_preserve=True,
         )
 
-        # Targeted heads should have preserved norms
-        for h in range(2):  # top 50% = 2 heads
-            new_norm = attn.o_proj.weight.data[:, h*head_dim:(h+1)*head_dim].norm().item()
-            assert abs(orig_norms[h] - new_norm) < 1e-3, \
-                f"Head {h} norm not preserved: {orig_norms[h]:.4f} vs {new_norm:.4f}"
+        new_norms = attn.o_proj.weight.data.norm(dim=1)
+        assert torch.allclose(orig_norms, new_norms, atol=1e-6)
 
     def test_head_surgery_non_square_gqa(self):
         """Head surgery should work for GQA models with non-square o_proj (attn_dim != hidden_dim)."""
@@ -1200,11 +1207,10 @@ class TestAttentionHeadSurgery:
         ), "Non-targeted head 3 should be untouched"
 
     def test_head_surgery_gqa_norm_preserve(self):
-        """Head surgery on GQA non-square o_proj with norm_preserve."""
+        """GQA head surgery restores every logical output-neuron row norm."""
         hidden_dim = 12
         attn_dim = 32
         n_heads = 4
-        head_dim_attn = attn_dim // n_heads
 
         class FakeAttnGQA(torch.nn.Module):
             def __init__(self):
@@ -1218,10 +1224,7 @@ class TestAttentionHeadSurgery:
         d = torch.randn(hidden_dim, 1)
         d = d / d.norm()
 
-        orig_norms = [
-            attn.o_proj.weight.data[:, h*head_dim_attn:(h+1)*head_dim_attn].norm().item()
-            for h in range(n_heads)
-        ]
+        orig_norms = attn.o_proj.weight.data.norm(dim=1)
 
         head_scores = [(0, 5.0), (1, 3.0), (2, 1.0), (3, 0.5)]
         AbliterationPipeline._project_head_selective(
@@ -1229,10 +1232,8 @@ class TestAttentionHeadSurgery:
             head_fraction=0.5, norm_preserve=True,
         )
 
-        for h in range(2):  # top 50% = 2 heads
-            new_norm = attn.o_proj.weight.data[:, h*head_dim_attn:(h+1)*head_dim_attn].norm().item()
-            assert abs(orig_norms[h] - new_norm) < 1e-3, \
-                f"GQA head {h} norm not preserved: {orig_norms[h]:.4f} vs {new_norm:.4f}"
+        new_norms = attn.o_proj.weight.data.norm(dim=1)
+        assert torch.allclose(orig_norms, new_norms, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

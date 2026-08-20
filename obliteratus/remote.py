@@ -238,6 +238,12 @@ class RemoteRunner:
         n_directions: int | None = None,
         direction_method: str | None = None,
         regularization: float | None = None,
+        kl_preservation: bool = False,
+        kl_budget: float = 0.05,
+        kl_search_steps: int = 5,
+        cot_preservation: bool = False,
+        cot_reasoning_ce_budget: float = 0.25,
+        cot_answer_ce_budget: float = 0.15,
         refinement_passes: int | None = None,
         min_layer_fraction: float | None = None,
         max_layer_fraction: float | None = None,
@@ -265,6 +271,16 @@ class RemoteRunner:
         """Build the remote obliteratus CLI command."""
         if not isinstance(damage_gate_enabled, bool):
             raise TypeError("damage_gate_enabled must be a boolean")
+        if not isinstance(kl_preservation, bool):
+            raise TypeError("kl_preservation must be a boolean")
+        if not isinstance(cot_preservation, bool):
+            raise TypeError("cot_preservation must be a boolean")
+        if (
+            not isinstance(kl_search_steps, int)
+            or isinstance(kl_search_steps, bool)
+            or kl_search_steps < 2
+        ):
+            raise ValueError("kl_search_steps must be an integer of at least 2")
         if not isinstance(damage_eval_size, int) or isinstance(damage_eval_size, bool):
             raise TypeError("damage_eval_size must be an integer")
         if damage_eval_size < 32:
@@ -273,7 +289,11 @@ class RemoteRunner:
         def _validate_finite(name: str, value: float | None, minimum: float) -> None:
             if value is None:
                 return
-            if not math.isfinite(float(value)) or float(value) < minimum:
+            if (
+                isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) < minimum
+            ):
                 raise ValueError(f"{name} must be finite and greater than or equal to {minimum}")
 
         def _validate_rate(name: str, value: float | None) -> None:
@@ -283,6 +303,9 @@ class RemoteRunner:
                 raise ValueError(f"{name} must be finite and between 0 and 1")
 
         _validate_finite("max_ppl_ratio", max_ppl_ratio, 1.0)
+        _validate_finite("kl_budget", kl_budget, 0.0)
+        _validate_finite("cot_reasoning_ce_budget", cot_reasoning_ce_budget, 0.0)
+        _validate_finite("cot_answer_ce_budget", cot_answer_ce_budget, 0.0)
         _validate_finite("max_sampled_token_kl", max_sampled_token_kl, 0.0)
         _validate_finite("max_p95_sampled_token_kl", max_p95_sampled_token_kl, 0.0)
         _validate_rate("max_top1_flip_rate", max_top1_flip_rate)
@@ -320,6 +343,14 @@ class RemoteRunner:
             raise ValueError("projection_target='auto' is not compatible with quantization")
         if projection_target == "auto" and damage_eval_size < 64:
             raise ValueError("projection_target='auto' requires damage_eval_size >= 64")
+        if kl_preservation and projection_target == "auto":
+            raise ValueError(
+                "kl_preservation cannot be combined with projection_target='auto'"
+            )
+        if (kl_preservation or cot_preservation) and quantization is not None:
+            raise ValueError("KL/CoT preservation is not compatible with quantization")
+        if kl_preservation and damage_eval_size < 64:
+            raise ValueError("kl_preservation requires damage_eval_size >= 64")
         for name, value in (
             ("project_lm_head", project_lm_head),
             ("project_embeddings", project_embeddings),
@@ -347,6 +378,26 @@ class RemoteRunner:
             parts.extend(["--direction-method", shlex.quote(direction_method)])
         if regularization is not None:
             parts.extend(["--regularization", shlex.quote(str(regularization))])
+        if kl_preservation:
+            parts.extend(
+                [
+                    "--kl-preservation",
+                    "--kl-budget",
+                    shlex.quote(str(kl_budget)),
+                    "--kl-search-steps",
+                    shlex.quote(str(kl_search_steps)),
+                ]
+            )
+        if cot_preservation:
+            parts.extend(
+                [
+                    "--cot-preservation",
+                    "--cot-reasoning-ce-budget",
+                    shlex.quote(str(cot_reasoning_ce_budget)),
+                    "--cot-answer-ce-budget",
+                    shlex.quote(str(cot_answer_ce_budget)),
+                ]
+            )
         if refinement_passes is not None:
             parts.extend(["--refinement-passes", shlex.quote(str(refinement_passes))])
         for flag, value in (

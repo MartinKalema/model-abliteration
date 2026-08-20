@@ -44,7 +44,7 @@ PALETTE = {
     "advanced": "#55A868",
     "aggressive": "#C44E52",
     "surgical": "#8172B3",
-    "optimized": "#CCB974",
+    "som_proxy": "#CCB974",
     "inverted": "#64B5CD",
     "nuclear": "#E5583B",
 }
@@ -310,7 +310,7 @@ def plot_moe_metrics(results: list[dict], title_suffix: str = "") -> plt.Figure:
         all_labels = [_sanitize_label(r.get("method", r.get("model_short", "?"))) for r in results]
         if results:
             ax.barh(all_labels, [0] * len(results), color="#cccccc")
-            ax.text(0.5, 0.5, "No MoE-specific features activated\n(use surgical/optimized/nuclear methods)",
+            ax.text(0.5, 0.5, "No MoE-specific features activated\n(use surgical or nuclear)",
                     ha="center", va="center", fontsize=11, color="#999999", transform=ax.transAxes)
         else:
             ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=14, transform=ax.transAxes)
@@ -329,7 +329,7 @@ def plot_moe_metrics(results: list[dict], title_suffix: str = "") -> plt.Figure:
     h = 0.25
 
     ax.barh(y - h, ega, h, label="EGA Expert Directions", color="#8172B3", alpha=0.85)
-    ax.barh(y, cot, h, label="CoT Preserved Layers", color="#CCB974", alpha=0.85)
+    ax.barh(y, cot, h, label="CoT Gate References", color="#CCB974", alpha=0.85)
     ax.barh(y + h, safety, h, label="Expert-Classified Layers", color="#55A868", alpha=0.85)
 
     # Value labels

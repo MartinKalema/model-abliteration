@@ -8,15 +8,15 @@ correctly identifies and removes it.
 
 Additionally compiles literature results for a full comparison table.
 
-Techniques compared:
+Synthetic parameterizations compared (these are not paper reproductions):
   1. Arditi et al. (2024) — difference-of-means, last token, raw prompts
   2. Arditi + chat template — same but with chat-formatted prompts
   3. FailSpy/abliterator — Arditi with middle-60% layer heuristic
-  4. Gabliteration — SVD multi-direction (4 dirs), regularization 0.0
-  5. grimjim — Gabliteration + norm preservation
+  4. Paired-SVD proxy — four directions, regularization 0.0
+  5. Paired-SVD proxy + logical-row norm restoration
   6. OBLITERATUS basic — our current basic config
   7. OBLITERATUS advanced — 4 directions, norm-preserve, reg=0.3
-  8. Heretic (p-e-w) — TPE Bayesian optimization (literature)
+  8. Heretic (p-e-w) — literature row only; not executed here
 
 Metrics:
   - Direction recovery: cosine similarity to planted ground-truth direction
@@ -419,8 +419,8 @@ def run_experiment():
             "multi_dir_norm_fix": False,
         },
         {
-            "name": "Gabliteration (4-dir, knee)",
-            "source": "Gabliteration",
+            "name": "Paired-SVD proxy (4-dir, knee)",
+            "source": "Synthetic proxy",
             "n_directions": 4,
             "layer_selection": "knee",
             "regularization": 0.0,
@@ -700,7 +700,7 @@ def print_table(results: list[dict]):
 
     # ── Table 3: Literature Comparison ────────────────────────────────
     print(f"\n\n{'='*110}")
-    print("TABLE 3: FULL LANDSCAPE — TECHNIQUES, CAPABILITIES, AND REPORTED RESULTS")
+    print("TABLE 3: EXTERNAL/HISTORICAL CONTEXT — NOT EXECUTED OR REPRODUCED HERE")
     print(f"{'='*110}")
     print(f"{'Technique':<26} {'Year':>5} {'#Dir':>5} {'Layers':>10} {'NormPres':>9} "
           f"{'Reg':>5} {'AutoTune':>9} {'Reported Refusal→':>18} {'Model':>14}")
@@ -713,14 +713,14 @@ def print_table(results: list[dict]):
          "~90%→~5%", "Llama-3-8B"),
         ("mlabonne tutorial", "2024", "1", "top-norm", "No", "0.0", "No",
          "~90%→~5%", "Llama-3-8B"),
-        ("Gabliteration", "2024", "4-8", "knee", "No", "0.0", "No",
-         "~95%→~0%", "Various 7B+"),
-        ("grimjim norm-pres", "2024", "4-8", "knee", "Yes(bug)", "0.0", "No",
-         "~90%→~5%", "Various 7B+"),
-        ("Heretic (p-e-w)", "2025", "float", "kernel", "No", "TPE", "Yes",
-         "~95%→~0%*", "Gemma-3-12B"),
-        ("Wollschlager cones", "2025", "1-5", "per-layer", "—", "—", "RDO",
-         "~98%→~1%", "Llama-3.1-8B"),
+        ("Gabliteration paper", "2026", "2", "behavioral", "No", "α/.1", "No",
+         "see source", "Various 7B+"),
+        ("grimjim row-norm", "2025", "1-3", "targeted", "Rowwise", "—", "No",
+         "see source", "Gemma-family"),
+        ("Heretic (p-e-w)", "2025", "float", "kernel", "Rowwise", "TPE", "Yes",
+         "see source", "Gemma-3-12B"),
+        ("Paper RDO", "2025", "1", "runtime", "—", "—", "Gradient",
+         "see source", "Llama-3.1-8B"),
         ("OBLITERATUS basic", "2025", "1", "knee", "No", "0.0", "No",
          "~95%→60%**", "Qwen-0.5B"),
         ("OBLITERATUS advanced", "2025", "4", "knee", "Yes(fix)", "0.3", "No",
@@ -733,9 +733,8 @@ def print_table(results: list[dict]):
         print(f"{row[0]:<26} {row[1]:>5} {row[2]:>5} {row[3]:>10} {row[4]:>9} "
               f"{row[5]:>5} {row[6]:>9} {row[7]:>18} {row[8]:>14}")
 
-    print("\n  * Heretic: 2.8× lower KL divergence than manual abliterations (Gemma-3-12B benchmark)")
-    print("  ** Our observed results on Qwen2.5-0.5B-Instruct — 0.5B may be too small for linear methods")
-    print("  *** Surgical combines: whitened SVD + SAE + head surgery + neuron masking + jailbreak contrast")
+    print("\n  External rows summarize algorithm shape only; verify every metric in the upstream source.")
+    print("  OBLITERATUS rows are historical local observations, not paper-fidelity comparisons.")
     print(f"{'='*110}")
 
     # ── Analysis ──────────────────────────────────────────────────────
@@ -753,10 +752,10 @@ ROOT CAUSES (ordered by impact):
    - Wollschlager et al.: Llama-3.1-8B
    - OBLITERATUS benchmarks: Qwen-0.5B (hidden_dim=896)
 
-   The "single refusal direction" hypothesis may not hold well for small
-   models. Wollschlager et al. (ICML 2025) showed that refusal lives in
-   multi-dimensional CONCEPT CONES, and cone dimension scales with model
-   size. A 0.5B model may encode refusal too diffusely for linear methods.
+   The "single refusal direction" hypothesis may not hold equally across
+   scales. This script does not fit or causally validate the positive-
+   coefficient concept cones studied by Wollschlager et al.; OBLITERATUS's
+   category-direction dispersion report must not be used as that evidence.
 
 2. BASIC MODE USES NO CHAT TEMPLATE for activation collection
    - The model was trained with chat formatting — without it, activations
@@ -768,23 +767,24 @@ ROOT CAUSES (ordered by impact):
    - Combined with 4 directions where later ones capture noise, net
      removal is weak
 
-4. SURGICAL MODE DOES TOO MUCH
-   - 8 directions, whitened SVD, SAE features, neuron masking, head surgery
+4. SURGICAL MODE DOES TOO MUCH FOR THIS TOY SETTING
+   - 8 directions, SAE features, neuron masking, and head surgery
    - Each individually reasonable; together they destroy a 0.5B model
    - The whitened SVD un-whitening bug (now fixed) was extracting noise
 
-5. NO BAYESIAN OPTIMIZATION (vs Heretic)
-   - Heretic's key insight: jointly optimize layer weights, direction
-     index, and component-specific parameters via TPE
-   - Minimizes refusal rate AND KL divergence simultaneously
-   - This automatically handles model-specific tuning that we do manually
+5. HISTORICAL RESULT: THIS SCRIPT DID NOT RUN EXACT SEARCH/REPLAY
+   - The result above predates OBLITERATUS's exact model-forward TPE runner.
+   - Current `optimized` and `heretic` presets restore a complete snapshot for
+     each trial and replay the hash-bound winning tensor plan exactly.  Those
+     resource-heavy searches remain outside this small historical experiment.
 
 RECOMMENDED CONFIG CHANGES:
   - basic:    use_chat_template → True
   - advanced: regularization → 0.1 (from 0.3)
   - surgical: n_directions → 4 (from 8), disable safety_neuron_masking
   - ALL:      Add model-size-aware defaults (n_dirs=1 for <2B, 4 for 2-10B)
-  - NEW:      Add TPE optimization loop (like Heretic) as "optimized" method
+  - SEARCH:   Use `optimized` or `heretic` for the implemented exact
+              model-forward search and hash-verified winner replay
 """)
 
 

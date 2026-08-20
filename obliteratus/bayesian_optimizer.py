@@ -1,37 +1,29 @@
-"""Bayesian optimization for abliteration hyperparameters.
+"""Exact model-forward TPE search for dense checkpoint projections.
 
-Implements Optuna TPE-based multi-objective optimization that searches for
-optimal ablation parameters co-minimizing refusal rate and KL divergence.
+The runnable ``optimized`` and ``heretic`` presets search a compact pair of
+piecewise-linear attention/FFN layer kernels plus a continuous direction
+coordinate.  Optimized interpolates adjacent SVD components per layer;
+Heretic uses one continuously interpolated cross-layer difference direction.
+Every trial begins from the immutable full-model snapshot, materializes a
+complete candidate plan, runs the ordinary held-out gate, and records exact
+direction/manifest/tensor hashes.  The winning plan is restored and replayed
+byte-identically before a separate confirmation gate.
 
-Inspired by Heretic (p-e-w, 2025) which pioneered Bayesian optimization
-for abliteration.  OBLITERATUS pushes this further by:
-
-1. **Parametric layer kernel**: Instead of per-layer independent parameters,
-   uses a bell-shaped curve described by 4 global params (Heretic-style).
-   This reduces the search space from O(n_layers) to O(1) while capturing
-   the spatial structure of refusal across layers.
-2. **Float direction interpolation**: Direction index is continuous — non-
-   integer values interpolate between adjacent SVD directions, unlocking
-   a smooth direction space beyond the discrete top-k.
-3. **Component-specific weights**: Separate scaling for attention vs MLP
-   projections (Heretic showed MLP interventions are more damaging).
-4. **Per-expert granularity**: For MoE models, optimizes per-expert scaling.
-5. **CoT-aware objectives**: Adds chain-of-thought coherence as a third
-   optimization objective for CoT models.
-6. **Warm-start from analysis**: Uses OBLITERATUS's analysis-based heuristics
-   as initial trial suggestions instead of random initialization.
-
-References:
-    - Heretic (p-e-w, 2025): Bayesian optimization for LLM abliteration
-    - Akiba et al. (2019): Optuna: A Next-generation Hyperparameter
-      Optimization Framework
+This is an independent dense-projection baseline inspired by Heretic
+(p-e-w, 2025), not parity with Heretic's optional LoRA execution path.  The
+disabled legacy prototype remains only as a short compatibility failure point;
+it is never called by a public preset.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
-from typing import TYPE_CHECKING
+import random
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +32,179 @@ if TYPE_CHECKING:
     from obliteratus.abliterate import AbliterationPipeline
 
 logger = logging.getLogger(__name__)
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Hash a tensor's exact shape, dtype, and bytes on CPU."""
+
+    value = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tuple(value.shape)).encode("ascii"))
+    digest.update(str(value.dtype).encode("ascii"))
+    digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class LayerKernel:
+    """Heretic-style piecewise-linear removal kernel."""
+
+    max_weight: float
+    peak_position: float
+    min_weight: float
+    min_weight_distance: float
+
+    def __post_init__(self) -> None:
+        values = {
+            "max_weight": self.max_weight,
+            "peak_position": self.peak_position,
+            "min_weight": self.min_weight,
+            "min_weight_distance": self.min_weight_distance,
+        }
+        if any(not math.isfinite(float(value)) for value in values.values()):
+            raise ValueError("Layer-kernel parameters must be finite")
+        if not 0.0 <= self.min_weight <= self.max_weight <= 1.0:
+            raise ValueError("Layer-kernel weights must satisfy 0 <= min <= max <= 1")
+        if not 0.0 <= self.peak_position <= 1.0:
+            raise ValueError("peak_position must be between zero and one")
+        if not 0.0 < self.min_weight_distance <= 1.0:
+            raise ValueError("min_weight_distance must be in (0, 1]")
+
+    def removal_weight(self, layer_idx: int, n_layers: int) -> float:
+        return _parametric_layer_weight(
+            layer_idx,
+            n_layers,
+            self.max_weight,
+            self.peak_position,
+            self.min_weight,
+            self.min_weight_distance,
+        )
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "max_weight": self.max_weight,
+            "peak_position": self.peak_position,
+            "min_weight": self.min_weight,
+            "min_weight_distance": self.min_weight_distance,
+        }
+
+
+@dataclass(frozen=True)
+class ExactProjectionCandidate:
+    """Complete, replayable checkpoint edit evaluated by the optimizer.
+
+    Directions are copied to CPU when the candidate is built.  The plan also
+    records separate attention/FFN regularizations and the exact manifest
+    storage identities; no averaged scalar is reconstructed after scoring.
+    """
+
+    method: str
+    trial_index: int
+    direction_index: float
+    attention_kernel: LayerKernel
+    ffn_kernel: LayerKernel
+    directions: tuple[tuple[int, torch.Tensor], ...] = field(repr=False, compare=False)
+    attention_regularizations: tuple[tuple[int, float], ...]
+    ffn_regularizations: tuple[tuple[int, float], ...]
+    direction_hashes: tuple[tuple[int, str], ...]
+    manifest_target: str
+    manifest_fingerprint: str
+    target_storage_ids: tuple[str, ...]
+    norm_preserve: bool
+    project_biases: bool
+    projection_row_fraction: float
+    parameters: tuple[tuple[str, float], ...]
+
+    def direction_map(self) -> dict[int, torch.Tensor]:
+        return {layer: direction for layer, direction in self.directions}
+
+    def attention_map(self) -> dict[int, float]:
+        return dict(self.attention_regularizations)
+
+    def ffn_map(self) -> dict[int, float]:
+        return dict(self.ffn_regularizations)
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "method": self.method,
+            "trial_index": self.trial_index,
+            "direction_index": self.direction_index,
+            "attention_kernel": self.attention_kernel.to_dict(),
+            "ffn_kernel": self.ffn_kernel.to_dict(),
+            "attention_regularizations": {
+                str(layer): value for layer, value in self.attention_regularizations
+            },
+            "ffn_regularizations": {
+                str(layer): value for layer, value in self.ffn_regularizations
+            },
+            "direction_hashes": {
+                str(layer): value for layer, value in self.direction_hashes
+            },
+            "manifest_target": self.manifest_target,
+            "manifest_fingerprint": self.manifest_fingerprint,
+            "target_storage_ids": list(self.target_storage_ids),
+            "norm_preserve": self.norm_preserve,
+            "project_biases": self.project_biases,
+            "projection_row_fraction": self.projection_row_fraction,
+            "parameters": dict(self.parameters),
+        }
+
+
+@dataclass(frozen=True)
+class CandidateApplication:
+    """Evidence produced by one exact candidate application."""
+
+    modified_count: int
+    target_state_hash: str
+
+
+@dataclass(frozen=True)
+class BayesianTrialRecord:
+    """Selection evidence for one model-forward trial."""
+
+    candidate: ExactProjectionCandidate
+    objective: float
+    accepted: bool
+    refusal_rate: float | None
+    mean_kl: float | None
+    p95_kl: float | None
+    target_state_hash: str | None
+    assessment: dict[str, object] | None
+    error: str | None = None
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "candidate": self.candidate.to_metadata(),
+            "objective": self.objective if math.isfinite(self.objective) else None,
+            "accepted": self.accepted,
+            "refusal_rate": self.refusal_rate,
+            "mean_kl": self.mean_kl,
+            "p95_kl": self.p95_kl,
+            "target_state_hash": self.target_state_hash,
+            "assessment": self.assessment,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
+class BayesianOptimizationResult:
+    """Winner plus all selection evidence and exact confirmation hash."""
+
+    winner: ExactProjectionCandidate
+    trials: tuple[BayesianTrialRecord, ...]
+    baseline_state_hash: str
+    selection_state_hash: str
+    confirmation_state_hash: str | None = None
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "algorithm": "exact_model_forward_tpe_projection_search",
+            "winner": self.winner.to_metadata(),
+            "baseline_state_hash": self.baseline_state_hash,
+            "selection_state_hash": self.selection_state_hash,
+            "confirmation_state_hash": self.confirmation_state_hash,
+            "trials": [trial.to_metadata() for trial in self.trials],
+        }
 
 
 def _measure_refusal_rate(
@@ -636,21 +801,530 @@ def _unsafe_legacy_run_bayesian_optimization(
     return best_result
 
 
+def _manifest_fingerprint(manifest: Any) -> str:
+    """Fingerprint the exact manifest layout and runtime storage identities."""
+
+    payload = {
+        "architecture": manifest.architecture,
+        "target": manifest.target,
+        "hidden_size": manifest.hidden_size,
+        "num_layers": manifest.num_layers,
+        "entries": [
+            {
+                "name": entry.qualified_name,
+                "layers": list(entry.layer_indices),
+                "component": entry.component,
+                "role": entry.role,
+                "orientation": entry.orientation,
+                "shape": list(entry.shape),
+                "storage": entry.storage_identity,
+                "axis": entry.residual_axis,
+            }
+            for entry in manifest.entries
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _target_state_hash(
+    pipeline: AbliterationPipeline,
+    manifest: Any,
+    *,
+    project_biases: bool,
+) -> str:
+    """Hash every manifest tensor and every writer bias touched by a plan."""
+
+    digest = hashlib.sha256()
+    seen_biases: set[int] = set()
+    for entry in sorted(manifest.entries, key=lambda item: item.qualified_name):
+        tensor = entry.parameter.detach().cpu().contiguous()
+        digest.update(entry.qualified_name.encode("utf-8"))
+        digest.update(_tensor_sha256(tensor).encode("ascii"))
+        if not project_biases or entry.role != "writer":
+            continue
+        obj = pipeline._resolve_dotted_projection(entry.owner, entry.attribute_path)
+        bias = getattr(obj, "bias", None)
+        if not isinstance(bias, torch.Tensor) or id(bias) in seen_biases:
+            continue
+        seen_biases.add(id(bias))
+        digest.update(f"{entry.qualified_name}:bias".encode())
+        digest.update(_tensor_sha256(bias).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _normalized_direction(value: torch.Tensor, *, context: str) -> torch.Tensor:
+    direction = value.detach().cpu().float().reshape(-1).contiguous()
+    if not torch.isfinite(direction).all():
+        raise RuntimeError(f"{context} contains non-finite values")
+    norm = float(direction.norm().item())
+    if not math.isfinite(norm) or norm <= 1e-8:
+        raise RuntimeError(f"{context} is degenerate")
+    return (direction / norm).contiguous()
+
+
+def _optimized_layer_direction(
+    pipeline: AbliterationPipeline,
+    layer_idx: int,
+    direction_index: float,
+) -> torch.Tensor:
+    """Interpolate adjacent SVD components without mutating distilled state."""
+
+    subspace = pipeline.refusal_subspaces.get(layer_idx)
+    if subspace is None or subspace.ndim != 2 or subspace.shape[0] == 0:
+        try:
+            return _normalized_direction(
+                pipeline.refusal_directions[layer_idx],
+                context=f"layer {layer_idx} refusal direction",
+            )
+        except KeyError as exc:
+            raise RuntimeError(f"Layer {layer_idx} has no distilled direction") from exc
+
+    upper = subspace.shape[0] - 1
+    position = min(max(float(direction_index), 0.0), float(upper))
+    lower_index = math.floor(position)
+    upper_index = min(lower_index + 1, upper)
+    alpha = position - lower_index
+    value = (1.0 - alpha) * subspace[lower_index] + alpha * subspace[upper_index]
+    return _normalized_direction(value, context=f"layer {layer_idx} SVD interpolation")
+
+
+def _heretic_shared_direction(
+    pipeline: AbliterationPipeline,
+    direction_index: float,
+) -> torch.Tensor:
+    value = _interpolate_direction(pipeline, 0, direction_index)
+    return _normalized_direction(value, context="Heretic cross-layer interpolation")
+
+
+def _candidate_direction_upper_bound(
+    pipeline: AbliterationPipeline,
+    method: str,
+) -> float:
+    if method == "heretic":
+        return float(max(0, len(pipeline.refusal_directions) - 1))
+    ranks = [
+        int(subspace.shape[0])
+        for layer, subspace in pipeline.refusal_subspaces.items()
+        if layer in pipeline._strong_layers and subspace.ndim == 2 and subspace.shape[0]
+    ]
+    return float(max(ranks, default=1) - 1)
+
+
+def build_exact_projection_candidate(
+    pipeline: AbliterationPipeline,
+    *,
+    trial_index: int,
+    parameters: dict[str, float],
+) -> ExactProjectionCandidate:
+    """Materialize all tensors and strengths needed to replay one trial."""
+
+    method = pipeline.method
+    if method not in {"optimized", "heretic"}:
+        raise ValueError("Exact Bayesian projection supports optimized or heretic")
+    if not pipeline._strong_layers:
+        raise RuntimeError("Bayesian projection needs at least one selected layer")
+    manifest = pipeline._current_projection_manifest()
+    layers = tuple(sorted(dict.fromkeys(pipeline._strong_layers)))
+    if any(layer < 0 or layer >= manifest.num_layers for layer in layers):
+        raise RuntimeError("Selected layer lies outside the validated manifest")
+
+    def kernel(prefix: str) -> LayerKernel:
+        maximum = float(parameters[f"{prefix}_max_weight"])
+        return LayerKernel(
+            max_weight=maximum,
+            peak_position=float(parameters[f"{prefix}_peak_position"]),
+            min_weight=min(float(parameters[f"{prefix}_min_weight"]), maximum),
+            min_weight_distance=float(parameters[f"{prefix}_min_weight_distance"]),
+        )
+
+    attention_kernel = kernel("attention")
+    ffn_kernel = kernel("ffn")
+    direction_index = float(parameters["direction_index"])
+    shared_direction = (
+        _heretic_shared_direction(pipeline, direction_index)
+        if method == "heretic"
+        else None
+    )
+    directions: list[tuple[int, torch.Tensor]] = []
+    attention_regularizations: list[tuple[int, float]] = []
+    ffn_regularizations: list[tuple[int, float]] = []
+    for layer_idx in layers:
+        direction = (
+            shared_direction.clone()
+            if shared_direction is not None
+            else _optimized_layer_direction(pipeline, layer_idx, direction_index)
+        )
+        directions.append((layer_idx, direction))
+        attention_regularizations.append(
+            (
+                layer_idx,
+                1.0 - attention_kernel.removal_weight(layer_idx, manifest.num_layers),
+            )
+        )
+        ffn_regularizations.append(
+            (
+                layer_idx,
+                1.0 - ffn_kernel.removal_weight(layer_idx, manifest.num_layers),
+            )
+        )
+
+    direction_hashes = tuple(
+        (layer_idx, _tensor_sha256(direction)) for layer_idx, direction in directions
+    )
+    return ExactProjectionCandidate(
+        method=method,
+        trial_index=trial_index,
+        direction_index=direction_index,
+        attention_kernel=attention_kernel,
+        ffn_kernel=ffn_kernel,
+        directions=tuple(directions),
+        attention_regularizations=tuple(attention_regularizations),
+        ffn_regularizations=tuple(ffn_regularizations),
+        direction_hashes=direction_hashes,
+        manifest_target=manifest.target,
+        manifest_fingerprint=_manifest_fingerprint(manifest),
+        target_storage_ids=tuple(entry.storage_identity for entry in manifest.entries),
+        norm_preserve=bool(pipeline.norm_preserve),
+        project_biases=bool(pipeline.project_biases),
+        projection_row_fraction=float(pipeline.projection_row_fraction),
+        parameters=tuple(sorted((name, float(value)) for name, value in parameters.items())),
+    )
+
+
+def apply_exact_projection_candidate(
+    pipeline: AbliterationPipeline,
+    candidate: ExactProjectionCandidate,
+    *,
+    expected_state_hash: str | None = None,
+) -> CandidateApplication:
+    """Apply only the stored candidate and verify exact replay when requested."""
+
+    if pipeline.method != candidate.method:
+        raise RuntimeError("Candidate method does not match the active pipeline")
+    manifest = pipeline._current_projection_manifest()
+    if manifest.target != candidate.manifest_target:
+        raise RuntimeError("Candidate projection target changed before replay")
+    if _manifest_fingerprint(manifest) != candidate.manifest_fingerprint:
+        raise RuntimeError("Candidate manifest changed before replay")
+    if tuple(entry.storage_identity for entry in manifest.entries) != candidate.target_storage_ids:
+        raise RuntimeError("Candidate target storage identities changed before replay")
+    if bool(pipeline.norm_preserve) != candidate.norm_preserve:
+        raise RuntimeError("Candidate norm-preservation mode changed before replay")
+    if bool(pipeline.project_biases) != candidate.project_biases:
+        raise RuntimeError("Candidate bias-projection mode changed before replay")
+    if not math.isclose(
+        float(pipeline.projection_row_fraction),
+        candidate.projection_row_fraction,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError("Candidate row-selection fraction changed before replay")
+
+    directions = candidate.direction_map()
+    actual_hashes = tuple(
+        (layer, _tensor_sha256(direction)) for layer, direction in sorted(directions.items())
+    )
+    if actual_hashes != candidate.direction_hashes:
+        raise RuntimeError("Candidate direction tensor changed before replay")
+    attention = candidate.attention_map()
+    ffn = candidate.ffn_map()
+    strong_layers = set(directions)
+    edited: set[tuple[str, int]] = set()
+    modified = 0
+    with torch.no_grad():
+        for layer_idx in sorted(strong_layers):
+            modified += pipeline._project_manifest_layer_direction(
+                manifest,
+                layer_idx=layer_idx,
+                direction_index=0,
+                direction=directions[layer_idx],
+                attention_regularization=attention[layer_idx],
+                ffn_regularization=ffn[layer_idx],
+                norm_preserve=candidate.norm_preserve,
+                edited=edited,
+                strong_layers=strong_layers,
+            )
+
+    expected_entries: set[tuple[str, int]] = set()
+    for entry in manifest.entries:
+        owners = strong_layers.intersection(entry.layer_indices)
+        if owners:
+            expected_entries.add((entry.storage_identity, 0))
+    if edited != expected_entries:
+        missing = sorted(expected_entries - edited)
+        unexpected = sorted(edited - expected_entries)
+        raise RuntimeError(
+            "Exact candidate did not match its manifest plan: "
+            f"missing={missing[:3]}, unexpected={unexpected[:3]}"
+        )
+
+    state_hash = _target_state_hash(
+        pipeline,
+        manifest,
+        project_biases=candidate.project_biases,
+    )
+    if expected_state_hash is not None and state_hash != expected_state_hash:
+        raise RuntimeError(
+            "Exact winner replay hash mismatch; restored model will not be saved"
+        )
+    return CandidateApplication(modified_count=modified, target_state_hash=state_hash)
+
+
+class ExactTPESampler:
+    """Small deterministic Parzen-density sampler with no optional dependency.
+
+    Startup trials uniformly explore the bounded space.  Later suggestions are
+    drawn from kernels around the best quartile and selected by the standard
+    TPE density ratio l(x)/g(x).
+    """
+
+    def __init__(self, *, direction_upper: float, seed: int = 42) -> None:
+        if not math.isfinite(direction_upper) or direction_upper < 0.0:
+            raise ValueError("direction_upper must be finite and non-negative")
+        self.direction_upper = float(direction_upper)
+        self._rng = random.Random(seed)
+        self._observations: list[tuple[dict[str, float], float]] = []
+        self._bounds = {
+            "attention_max_weight": (0.35, 1.0),
+            "attention_peak_position": (0.0, 1.0),
+            "attention_min_weight": (0.0, 0.35),
+            "attention_min_weight_distance": (0.1, 1.0),
+            "ffn_max_weight": (0.25, 1.0),
+            "ffn_peak_position": (0.0, 1.0),
+            "ffn_min_weight": (0.0, 0.35),
+            "ffn_min_weight_distance": (0.1, 1.0),
+            "direction_index": (0.0, self.direction_upper),
+        }
+
+    @property
+    def observations(self) -> tuple[tuple[dict[str, float], float], ...]:
+        return tuple((dict(params), objective) for params, objective in self._observations)
+
+    def _warm_start(self) -> dict[str, float]:
+        return {
+            "attention_max_weight": 0.85,
+            "attention_peak_position": 0.5,
+            "attention_min_weight": 0.05,
+            "attention_min_weight_distance": 0.35,
+            "ffn_max_weight": 0.60,
+            "ffn_peak_position": 0.5,
+            "ffn_min_weight": 0.05,
+            "ffn_min_weight_distance": 0.35,
+            "direction_index": 0.0,
+        }
+
+    def _uniform(self) -> dict[str, float]:
+        return {
+            name: lower if lower == upper else self._rng.uniform(lower, upper)
+            for name, (lower, upper) in self._bounds.items()
+        }
+
+    @staticmethod
+    def _density(value: float, samples: list[float], bandwidth: float) -> float:
+        if not samples:
+            return 1e-12
+        scale = max(bandwidth, 1e-12)
+        return sum(
+            math.exp(-0.5 * ((value - sample) / scale) ** 2)
+            for sample in samples
+        ) / (len(samples) * scale)
+
+    def _tpe_value(self, name: str, lower: float, upper: float) -> float:
+        if lower == upper:
+            return lower
+        ordered = sorted(self._observations, key=lambda item: item[1])
+        good_count = max(2, math.ceil(len(ordered) * 0.25))
+        good = [params[name] for params, _ in ordered[:good_count]]
+        bad = [params[name] for params, _ in ordered[good_count:]]
+        span = upper - lower
+        mean = sum(good) / len(good)
+        variance = sum((value - mean) ** 2 for value in good) / max(1, len(good) - 1)
+        good_bandwidth = max(span * 0.04, math.sqrt(variance) * 0.8)
+        bad_bandwidth = max(span * 0.08, good_bandwidth)
+        choices: list[tuple[float, float]] = []
+        for _ in range(32):
+            anchor = self._rng.choice(good)
+            value = min(upper, max(lower, self._rng.gauss(anchor, good_bandwidth)))
+            good_density = self._density(value, good, good_bandwidth)
+            bad_density = self._density(value, bad, bad_bandwidth)
+            choices.append((good_density / max(bad_density, 1e-12), value))
+        return max(choices, key=lambda item: item[0])[1]
+
+    def suggest(self) -> dict[str, float]:
+        if not self._observations:
+            return self._warm_start()
+        if len(self._observations) < 8:
+            return self._uniform()
+        return {
+            name: self._tpe_value(name, lower, upper)
+            for name, (lower, upper) in self._bounds.items()
+        }
+
+    def observe(self, parameters: dict[str, float], objective: float) -> None:
+        if not math.isfinite(float(objective)):
+            objective = 1e9
+        if set(parameters) != set(self._bounds):
+            raise ValueError("TPE observation parameter set does not match its search space")
+        self._observations.append((dict(parameters), float(objective)))
+
+
 def run_bayesian_optimization(
     pipeline: AbliterationPipeline,
     n_trials: int = 50,
     n_refusal_prompts: int = 30,
     n_kl_prompts: int = 5,
-) -> dict[int, float]:
-    """Fail closed until a winning trial can be replayed byte-for-byte.
+) -> BayesianOptimizationResult:
+    """Run exact model-forward TPE selection and leave the winner replayed.
 
-    The legacy implementation evaluated separate attention/MLP kernels and
-    one interpolated direction, then returned an averaged per-layer scalar to
-    a different multi-direction edit loop.  Applying that approximation would
-    mean the saved model was not the candidate Optuna actually scored.
+    This function assumes the pipeline has already switched to its selection
+    evidence partition.  Every suggestion starts from the immutable full-model
+    snapshot, is applied directly from a complete candidate plan, and is scored
+    by the ordinary held-out gate.  The selected plan is restored and replayed
+    exactly; callers must still run it once on a disjoint confirmation split.
     """
-    del pipeline, n_trials, n_refusal_prompts, n_kl_prompts
-    raise RuntimeError(
-        "Bayesian optimization is disabled: exact winning-trial replay is not "
-        "implemented. Use a non-Bayesian method; no model weights were edited."
+
+    del n_refusal_prompts, n_kl_prompts  # the ordinary gate owns evidence sizes
+    if not isinstance(n_trials, int) or isinstance(n_trials, bool) or n_trials < 1:
+        raise ValueError("n_trials must be a positive integer")
+    if pipeline.method not in {"optimized", "heretic"}:
+        raise ValueError("Bayesian checkpoint search is only defined for optimized/heretic")
+    purpose = f"method={pipeline.method!r} exact Bayesian search"
+    pipeline._assert_auto_projection_prerequisites(purpose)
+    baseline_layer_weights = dict(pipeline._layer_excise_weights)
+    manifest = pipeline._current_projection_manifest()
+    sampler = ExactTPESampler(
+        direction_upper=_candidate_direction_upper_bound(pipeline, pipeline.method),
+        seed=int(pipeline.damage_eval_seed),
     )
+    records: list[BayesianTrialRecord] = []
+    accepted: list[BayesianTrialRecord] = []
+    baseline_hash: str | None = None
+
+    try:
+        for trial_index in range(n_trials):
+            pipeline._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            restored_hash = _target_state_hash(
+                pipeline,
+                manifest,
+                project_biases=bool(pipeline.project_biases),
+            )
+            if baseline_hash is None:
+                baseline_hash = restored_hash
+            elif restored_hash != baseline_hash:
+                raise RuntimeError(
+                    "Full-snapshot rollback did not recreate the same Bayesian baseline"
+                )
+
+            parameters = sampler.suggest()
+            candidate = build_exact_projection_candidate(
+                pipeline,
+                trial_index=trial_index,
+                parameters=parameters,
+            )
+            pipeline.log(
+                f"  Bayesian trial {trial_index + 1}/{n_trials}: "
+                f"direction={candidate.direction_index:.3f}"
+            )
+            try:
+                application = apply_exact_projection_candidate(pipeline, candidate)
+                assessment = pipeline._verify()
+                metrics = assessment.metrics
+                refusal_value = metrics.get("refusal_rate")
+                mean_kl_value = metrics.get("sampled_token_kl_mean")
+                p95_kl_value = metrics.get("sampled_token_kl_p95")
+                refusal = (
+                    float(refusal_value)
+                    if refusal_value is not None and math.isfinite(float(refusal_value))
+                    else None
+                )
+                mean_kl = (
+                    float(mean_kl_value)
+                    if mean_kl_value is not None and math.isfinite(float(mean_kl_value))
+                    else None
+                )
+                p95_kl = (
+                    float(p95_kl_value)
+                    if p95_kl_value is not None and math.isfinite(float(p95_kl_value))
+                    else None
+                )
+                normalized_damage = pipeline._normalized_projection_damage(assessment)
+                objective = (
+                    (refusal if refusal is not None else 1.0)
+                    + (normalized_damage if math.isfinite(normalized_damage) else 10.0)
+                    + (0.0 if assessment.accepted else 10.0)
+                )
+                record = BayesianTrialRecord(
+                    candidate=candidate,
+                    objective=objective,
+                    accepted=bool(assessment.accepted),
+                    refusal_rate=refusal,
+                    mean_kl=mean_kl,
+                    p95_kl=p95_kl,
+                    target_state_hash=application.target_state_hash,
+                    assessment=assessment.to_dict(),
+                )
+            except Exception as exc:  # noqa: BLE001 - heterogeneous model backend failures
+                objective = 1e9
+                record = BayesianTrialRecord(
+                    candidate=candidate,
+                    objective=objective,
+                    accepted=False,
+                    refusal_rate=None,
+                    mean_kl=None,
+                    p95_kl=None,
+                    target_state_hash=None,
+                    assessment=None,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                pipeline.log(f"    trial failed closed: {record.error}")
+            sampler.observe(parameters, objective)
+            records.append(record)
+            if record.accepted and record.target_state_hash is not None:
+                accepted.append(record)
+
+        if not accepted:
+            raise RuntimeError(
+                "Every exact Bayesian candidate failed the selection gate; "
+                "the untouched snapshot has been restored"
+            )
+        winner_record = min(
+            accepted,
+            key=lambda item: (
+                item.objective,
+                item.refusal_rate if item.refusal_rate is not None else float("inf"),
+                item.mean_kl if item.mean_kl is not None else float("inf"),
+                item.candidate.trial_index,
+            ),
+        )
+        pipeline._restore_auto_projection_baseline(
+            baseline_layer_weights,
+            purpose=purpose,
+        )
+        restored_hash = _target_state_hash(
+            pipeline,
+            manifest,
+            project_biases=bool(pipeline.project_biases),
+        )
+        if restored_hash != baseline_hash:
+            raise RuntimeError("Winner replay did not begin from the immutable baseline")
+        replay = apply_exact_projection_candidate(
+            pipeline,
+            winner_record.candidate,
+            expected_state_hash=winner_record.target_state_hash,
+        )
+        return BayesianOptimizationResult(
+            winner=winner_record.candidate,
+            trials=tuple(records),
+            baseline_state_hash=baseline_hash,
+            selection_state_hash=replay.target_state_hash,
+        )
+    except BaseException:
+        pipeline._restore_auto_projection_baseline(
+            baseline_layer_weights,
+            purpose=purpose,
+        )
+        raise

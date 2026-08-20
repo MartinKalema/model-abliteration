@@ -4,6 +4,17 @@
 **Date:** 2026-02-18
 **Status:** Living Document — All Four Adversarial Analyses Complete
 
+**Implementation-status note (2026-08-15):** This journal preserves historical
+proposals and critiques, so it is not a statement of the live checkpoint
+pipeline. In particular, every section that derives a “reasoning direction”
+from harmless-prompt PC1 and Gram–Schmidt-orthogonalizes refusal against it
+describes a retired experiment. That proxy never observed a reasoning trace and
+is no longer called. The current `cot_aware=True` path is a fail-closed,
+teacher-forced preservation gate: it scores caller-supplied or bundled explicit
+prompt/reasoning/answer spans before and after the edit and separately bounds
+reasoning-token and answer-token cross-entropy increases. It does not infer a
+causal chain-of-thought direction.
+
 ---
 
 ## Preamble: What This Document Is
@@ -400,7 +411,11 @@ at the causal source.
 
 ## Part IV: Advanced Techniques — Skeptical Analysis
 
-### 4.1 CoT-Aware Reasoning Preservation
+### 4.1 CoT-Aware Reasoning Preservation (Historical — Superseded)
+
+> **Retired design:** The approach below records the removed harmless-PC1/
+> Gram–Schmidt experiment. The live implementation uses the explicit
+> teacher-forced reasoning/answer CE gate described in the status note above.
 
 **The problem:** Chain-of-thought models (GPT-OSS, QwQ, DeepSeek-R1) use internal
 reasoning traces that share geometric space with refusal. Naively projecting out refusal
@@ -944,7 +959,10 @@ information.
 d_j ← d_j - Σ_{k<j} (d_j · C_B⁻¹ · d_k) / (d_k · C_B⁻¹ · d_k) · d_k
 ```
 
-### 9.4 CoT Orthogonalization Efficacy Collapse
+### 9.4 CoT Orthogonalization Efficacy Collapse (Historical Retired-Path Critique)
+
+> This analysis explains a failure mode of the retired activation-direction
+> proxy; it does not describe the current explicit trace-preservation gate.
 
 The CoT-aware system orthogonalizes refusal against "reasoning" using full Gram-Schmidt
 (β=1). When the overlap between refusal and reasoning is high:

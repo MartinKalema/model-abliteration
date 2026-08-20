@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from obliteratus.abliterate import UNAVAILABLE_METHODS
 from obliteratus.adaptive_defaults import (
     build_knowledge_base,
     format_recommendation,
@@ -642,12 +643,12 @@ def test_adaptive_defaults_rank_efficacy_then_damage():
     )
     knowledge = build_knowledge_base(
         [
-            _telemetry_record("effective", _quality_metrics(effective)),
-            _telemetry_record("gentle", _quality_metrics(gentle)),
+            _telemetry_record("advanced", _quality_metrics(effective)),
+            _telemetry_record("basic", _quality_metrics(gentle)),
         ]
     )
     bucket = knowledge[("dense", "standard", "medium")]
-    assert bucket.best_method == "effective"
+    assert bucket.best_method == "advanced"
 
     tied_effective = _accepted_payload(
         refusal_rate=0.01,
@@ -657,8 +658,32 @@ def test_adaptive_defaults_rank_efficacy_then_damage():
     )
     tied = build_knowledge_base(
         [
-            _telemetry_record("high-damage", _quality_metrics(effective)),
-            _telemetry_record("low-damage", _quality_metrics(tied_effective)),
+            _telemetry_record("aggressive", _quality_metrics(effective)),
+            _telemetry_record("informed", _quality_metrics(tied_effective)),
         ]
     )[("dense", "standard", "medium")]
-    assert tied.best_method == "low-damage"
+    assert tied.best_method == "informed"
+
+
+def test_adaptive_defaults_exclude_unavailable_methods_before_ranking():
+    accepted = _quality_metrics(_accepted_payload(refusal_rate=0.0))
+    records = [_telemetry_record("advanced", accepted)]
+    records.extend(_telemetry_record(method, accepted) for method in sorted(UNAVAILABLE_METHODS))
+
+    knowledge = build_knowledge_base(records)
+    bucket = knowledge[("dense", "standard", "medium")]
+    recommendation = get_adaptive_recommendation(
+        "dense",
+        "standard",
+        8.0,
+        knowledge=knowledge,
+    )
+
+    assert bucket.total_runs == 1
+    assert bucket.excluded_runs == len(UNAVAILABLE_METHODS)
+    assert set(bucket.methods) == {"advanced"}
+    assert recommendation.recommended_method == "advanced"
+    assert all(
+        any(f"`{method}` is unavailable" in reason for reason in bucket.exclusion_reasons)
+        for method in UNAVAILABLE_METHODS
+    )

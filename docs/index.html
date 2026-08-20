@@ -14,16 +14,16 @@
             --accent: #00ff41;
             --accent-dim: #00cc33;
             --accent-glow: rgba(0,255,65,0.15);
-            --purple: #bc13fe;
-            --purple-dim: #8a0fba;
+            --purple: #d65cff;
+            --purple-dim: #b54ce0;
             --purple-glow: rgba(188,19,254,0.15);
             --red: #ff003c;
             --yellow: #ffb700;
             --cyan: #00e5ff;
             --text: #c0ccd0;
             --text-bright: #e0ffe6;
-            --text-dim: #4a5568;
-            --border: #1a1f2e;
+            --text-dim: #8491a3;
+            --border: #556176;
             --border-glow: #00ff4122;
             --radius: 2px;
             --font-mono: 'Fira Code', 'Share Tech Mono', 'Courier New', monospace;
@@ -105,6 +105,8 @@
             margin-bottom: 12px;
             letter-spacing: 1px;
             display: inline-block;
+            max-width: 100%;
+            overflow: hidden;
         }
 
         .header-sigils {
@@ -182,6 +184,13 @@
             color: var(--accent);
             text-shadow: 0 0 8px rgba(0,255,65,0.5);
             border-bottom: 2px solid var(--accent);
+        }
+        .tab.tab-obliterate { color: var(--purple); }
+        .tab.tab-obliterate.active {
+            background: rgba(188,19,254,0.1);
+            color: var(--purple);
+            text-shadow: 0 0 8px rgba(188,19,254,0.55);
+            border-bottom-color: var(--purple);
         }
 
         .tab-content { display: none; }
@@ -292,7 +301,7 @@
         /* ---- OPTION GRID ---- */
         .option-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
             gap: 12px;
         }
         .option-card {
@@ -302,6 +311,11 @@
             cursor: pointer;
             transition: all 0.2s;
             position: relative;
+            width: 100%;
+            color: inherit;
+            font: inherit;
+            text-align: left;
+            appearance: none;
         }
         .option-card::after {
             content: '>';
@@ -324,13 +338,15 @@
             content: '\2588';
             color: var(--accent);
         }
-        .option-card h4 {
+        .option-card h4, .option-card .option-title {
+            display: block;
             font-size: 0.85rem;
             margin-bottom: 4px;
             color: var(--text-bright);
+            font-weight: 600;
         }
-        .option-card .meta { color: var(--text-dim); font-size: 0.72rem; }
-        .option-card .desc { color: var(--text-dim); font-size: 0.72rem; margin-top: 6px; }
+        .option-card .meta { display: block; color: var(--text-dim); font-size: 0.76rem; line-height: 1.45; }
+        .option-card .desc { display: block; color: var(--text-dim); font-size: 0.78rem; line-height: 1.45; margin-top: 6px; }
 
         .tier-badge {
             display: inline-block;
@@ -354,6 +370,9 @@
             padding: 10px 16px;
             background: var(--bg);
             border: 1px solid var(--border);
+            color: var(--text);
+            font: inherit;
+            text-align: left;
             cursor: pointer;
             transition: all 0.2s;
             font-size: 0.8rem;
@@ -370,12 +389,14 @@
             display: flex; align-items: center; justify-content: center;
             transition: all 0.2s;
             font-size: 0.65rem;
+            color: transparent;
         }
         .check-item.checked .checkmark {
             border-color: var(--accent);
             color: var(--accent);
             text-shadow: 0 0 6px var(--accent);
         }
+        .check-copy { display: block; }
 
         /* ---- BUTTONS ---- */
         .btn {
@@ -409,6 +430,25 @@
         }
         .btn-group { display: flex; gap: 12px; margin-top: 24px; justify-content: flex-end; }
         .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+        .tab:focus-visible,
+        .btn:focus-visible,
+        .option-card:focus-visible,
+        .check-item:focus-visible {
+            outline: 2px solid var(--cyan);
+            outline-offset: 3px;
+        }
+
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
 
         /* ---- RESULTS / CHARTS ---- */
         .results-grid {
@@ -520,7 +560,7 @@
             border: 1px dashed var(--text-dim);
             padding: 40px;
             text-align: center;
-            cursor: pointer;
+            cursor: default;
             transition: all 0.2s;
             margin-bottom: 24px;
             background: var(--bg-card);
@@ -593,10 +633,49 @@
             margin-left: 4px;
         }
 
-        /* ---- PRESET TAG (guardrail special) ---- */
-        .preset-tag-guardrail {
-            color: var(--red) !important;
-            text-shadow: 0 0 6px rgba(255,0,60,0.4);
+        /* ---- WORKFLOW / PRESET LABELS ---- */
+        .workflow-note {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 16px;
+            padding: 12px 14px;
+            border: 1px solid rgba(188,19,254,0.35);
+            background: rgba(188,19,254,0.06);
+            color: var(--text-dim);
+            font-size: 0.72rem;
+            line-height: 1.6;
+        }
+        .workflow-note strong { color: var(--purple); }
+        .workflow-note .btn { flex: 0 0 auto; margin: 0; }
+        .preset-kicker, .method-badge {
+            display: inline-block;
+            width: fit-content;
+            margin-bottom: 7px;
+            padding: 2px 6px;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            font-size: 0.58rem;
+            line-height: 1.2;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        .preset-kicker.safety {
+            color: var(--yellow);
+            border-color: rgba(255,183,0,0.4);
+        }
+        .method-badge.recommended {
+            color: var(--accent);
+            border-color: rgba(0,255,65,0.45);
+        }
+        .method-badge.caution {
+            color: var(--yellow);
+            border-color: rgba(255,183,0,0.4);
+        }
+        .method-badge.baseline {
+            color: var(--cyan);
+            border-color: rgba(0,229,255,0.35);
         }
 
         /* ---- CODE BLOCKS ---- */
@@ -733,17 +812,29 @@
             color: var(--purple);
             font-weight: 600;
         }
+        .method-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 8px;
+        }
         .method-radio {
-            display: flex; flex-direction: column; flex:1; padding: 10px 14px;
+            display: flex; flex-direction: column; padding: 12px 14px;
             border: 1px solid rgba(188,19,254,0.3); border-radius: 4px;
             cursor: pointer; transition: all 0.2s;
-            min-width: 140px;
+            min-width: 0;
+            position: relative;
         }
         .method-radio:hover { border-color: var(--purple); background: rgba(188,19,254,0.05); }
         .method-radio.selected { border-color: var(--purple); background: rgba(188,19,254,0.12); box-shadow: 0 0 8px rgba(188,19,254,0.2); }
-        .method-radio input[type="radio"] { display: none; }
+        .method-radio:focus-within { outline: 1px solid var(--purple); outline-offset: 2px; }
+        .method-radio input[type="radio"] {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+        }
         .method-label { font-size: 0.8rem; font-weight: bold; color: var(--purple); letter-spacing: 1px; }
-        .method-desc { font-size: 0.65rem; color: var(--text-dim); margin-top: 4px; }
+        .method-desc { font-size: 0.72rem; line-height: 1.45; color: var(--text-dim); margin-top: 4px; }
         .abl-model-row { cursor: pointer; }
         .abl-model-row:hover { background: rgba(188,19,254,0.08) !important; }
         .abl-btn {
@@ -763,6 +854,10 @@
             box-shadow: 0 0 10px var(--purple-glow);
             text-shadow: 0 0 6px var(--purple);
         }
+        #abl-cmd-display:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
 
         #colab-link:hover {
             background: #ffbd2e;
@@ -771,12 +866,36 @@
             transition: all 0.15s;
         }
 
+        @media (max-width: 900px) {
+            .option-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
         @media (max-width: 640px) {
-            .ascii-title { font-size: 0.32rem; }
+            .ascii-title { font-size: 0; white-space: normal; overflow: visible; }
+            .ascii-title::after {
+                content: 'OBLITERATUS';
+                display: block;
+                color: var(--accent);
+                font-size: 1.35rem;
+                letter-spacing: 0.18em;
+            }
             .option-grid { grid-template-columns: 1fr; }
+            .method-grid { grid-template-columns: 1fr; }
+            .workflow-note { align-items: stretch; flex-direction: column; }
+            .target-model-controls { flex-direction: column; }
+            .btn-group { flex-wrap: wrap; }
+            .btn-group .btn { flex: 1 1 100%; }
+            #abl-copy-badge { display: none; }
             .stepper { flex-wrap: wrap; }
             .tabs { flex-wrap: wrap; }
             .rune-left, .rune-right { display: none; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                scroll-behavior: auto !important;
+            }
+            #matrix-canvas { display: none; }
         }
     </style>
 </head>
@@ -784,41 +903,41 @@
     <canvas id="matrix-canvas"></canvas>
 
     <!-- Mystic rune side decorations -->
-    <div class="rune-left">&#9702; &#9178; &#9067; &#9734; &#9044; &#9178; &#9702;</div>
-    <div class="rune-right">&#9700; &#9043; &#9066; &#9733; &#9045; &#9043; &#9700;</div>
+    <div class="rune-left" aria-hidden="true">&#9702; &#9178; &#9067; &#9734; &#9044; &#9178; &#9702;</div>
+    <div class="rune-right" aria-hidden="true">&#9700; &#9043; &#9066; &#9733; &#9045; &#9043; &#9700;</div>
 
     <div class="container">
         <header>
-            <div class="header-sigils">&#9043; &#9178; &#9067; &#9700; &#9045;</div>
-            <div class="ascii-title">
+            <div class="header-sigils" aria-hidden="true">&#9043; &#9178; &#9067; &#9700; &#9045;</div>
+            <h1 class="ascii-title" aria-label="OBLITERATUS">
  ██████  ██████  ██      ██ ████████ ███████ ██████   █████  ████████ ██    ██ ███████
 ██    ██ ██   ██ ██      ██    ██    ██      ██   ██ ██   ██    ██    ██    ██ ██
 ██    ██ ██████  ██      ██    ██    █████   ██████  ███████    ██    ██    ██ ███████
 ██    ██ ██   ██ ██      ██    ██    ██      ██   ██ ██   ██    ██    ██    ██      ██
- ██████  ██████  ███████ ██    ██    ███████ ██   ██ ██   ██    ██     ██████  ███████</div>
-            <p class="subtitle">[ <em>MASTER ABLATION SUITE</em> ] &mdash; BREAK THE CHAINS THAT BIND YOU. 15 analysis modules. 823 tests.<span class="cursor"></span></p>
+ ██████  ██████  ███████ ██    ██    ███████ ██   ██ ██   ██    ██     ██████  ███████</h1>
+            <p class="subtitle">[ <em>MASTER ABLATION SUITE</em> ] &mdash; DIAGNOSTIC STUDIES + FAIL-CLOSED CHECKPOINT EDITING.<span class="cursor"></span></p>
         </header>
 
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('wizard')">// BUILDER</button>
-            <button class="tab" onclick="switchTab('results')">// RESULTS</button>
-            <button class="tab" onclick="switchTab('models')">// MODELS</button>
-            <button class="tab" onclick="switchTab('guide')">// GUIDE</button>
-            <button class="tab" onclick="switchTab('analysis')" style="color:var(--cyan)">// ANALYSIS</button>
-            <button class="tab" onclick="switchTab('abliterate')" style="color:var(--purple)">// OBLITERATE</button>
+        <div class="tabs" role="tablist" aria-label="OBLITERATUS workflows">
+            <button id="nav-abliterate" class="tab tab-obliterate active" role="tab" tabindex="0" aria-selected="true" aria-controls="tab-abliterate" data-tab="abliterate" onclick="switchTab('abliterate', this)">// OBLITERATE</button>
+            <button id="nav-wizard" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-wizard" data-tab="wizard" onclick="switchTab('wizard', this)">// STUDY BUILDER</button>
+            <button id="nav-results" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-results" data-tab="results" onclick="switchTab('results', this)">// RESULTS</button>
+            <button id="nav-models" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-models" data-tab="models" onclick="switchTab('models', this)">// MODELS</button>
+            <button id="nav-guide" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-guide" data-tab="guide" onclick="switchTab('guide', this)">// GUIDE</button>
+            <button id="nav-analysis" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-analysis" data-tab="analysis" onclick="switchTab('analysis', this)" style="color:var(--cyan)">// ANALYSIS</button>
         </div>
 
         <!-- ============ TAB: WIZARD ============ -->
-        <div id="tab-wizard" class="tab-content active">
+        <div id="tab-wizard" class="tab-content" role="tabpanel" aria-labelledby="nav-wizard" aria-hidden="true">
             <div class="stepper" id="stepper">
-                <div class="step-indicator active" data-step="1">
+                <div class="step-indicator active" data-step="1" aria-current="step">
                     <div class="step-num">1</div> Hardware
                 </div>
                 <div class="step-indicator" data-step="2">
                     <div class="step-num">2</div> Model
                 </div>
                 <div class="step-indicator" data-step="3">
-                    <div class="step-num">3</div> Preset
+                    <div class="step-num">3</div> Study
                 </div>
                 <div class="step-indicator" data-step="4">
                     <div class="step-num">4</div> Tune
@@ -834,31 +953,31 @@
                     <h2>&gt; Detect Hardware</h2>
                     <p class="subtitle">Select your compute tier. We'll recommend targets that fit your rig.</p>
                     <div class="option-grid" id="tier-grid">
-                        <div class="option-card" data-tier="tiny" onclick="selectTier('tiny')">
-                            <h4>No GPU / Laptop</h4>
-                            <div class="meta"><span class="tier-badge tier-tiny">TINY</span> CPU only, &lt; 8GB RAM</div>
-                            <div class="desc">Entry-level. Small models (82M-1.1B params).</div>
-                        </div>
-                        <div class="option-card" data-tier="small" onclick="selectTier('small')">
-                            <h4>Basic GPU</h4>
-                            <div class="meta"><span class="tier-badge tier-small">SMALL</span> 4-8 GB VRAM</div>
-                            <div class="desc">GTX 1060, RTX 3050, etc. Models up to 2.7B params.</div>
-                        </div>
-                        <div class="option-card" data-tier="medium" onclick="selectTier('medium')">
-                            <h4>Mid-range GPU</h4>
-                            <div class="meta"><span class="tier-badge tier-medium">MEDIUM</span> 8-16 GB VRAM</div>
-                            <div class="desc">RTX 3060/4060/4070. Up to 9B params with quantization.</div>
-                        </div>
-                        <div class="option-card" data-tier="large" onclick="selectTier('large')">
-                            <h4>High-end GPU</h4>
-                            <div class="meta"><span class="tier-badge tier-large">LARGE</span> 24+ GB VRAM</div>
-                            <div class="desc">RTX 3090/4090, A100. Large models 14B-70B.</div>
-                        </div>
-                        <div class="option-card" data-tier="frontier" onclick="selectTier('frontier')">
-                            <h4>Multi-GPU / Cloud</h4>
-                            <div class="meta"><span class="tier-badge tier-frontier">FRONTIER</span> 80+ GB / cluster</div>
-                            <div class="desc">LM Arena top 10. MoE 100B-1T. DeepSeek, GLM, Qwen3, Llama 4.</div>
-                        </div>
+                        <button type="button" class="option-card" data-tier="tiny" aria-pressed="false" onclick="selectTier('tiny')">
+                            <span class="option-title">No GPU / Laptop</span>
+                            <span class="meta"><span class="tier-badge tier-tiny">TINY</span> CPU only, &lt; 8GB RAM</span>
+                            <span class="desc">Entry-level. Small models (82M-1.1B params).</span>
+                        </button>
+                        <button type="button" class="option-card" data-tier="small" aria-pressed="false" onclick="selectTier('small')">
+                            <span class="option-title">Basic GPU</span>
+                            <span class="meta"><span class="tier-badge tier-small">SMALL</span> 4-8 GB VRAM</span>
+                            <span class="desc">Dense-model fit varies; start near 1B and verify available memory.</span>
+                        </button>
+                        <button type="button" class="option-card" data-tier="medium" aria-pressed="false" onclick="selectTier('medium')">
+                            <span class="option-title">Mid-range GPU</span>
+                            <span class="meta"><span class="tier-badge tier-medium">MEDIUM</span> 8-16 GB VRAM</span>
+                            <span class="desc">RTX 3060/4060/4070. Dense targets around 3–4B still require memory checks.</span>
+                        </button>
+                        <button type="button" class="option-card" data-tier="large" aria-pressed="false" onclick="selectTier('large')">
+                            <span class="option-title">High-end GPU</span>
+                            <span class="meta"><span class="tier-badge tier-large">LARGE</span> 24+ GB VRAM</span>
+                            <span class="desc">RTX 3090/4090 or A100. Exact dense-model fit depends on architecture and dtype.</span>
+                        </button>
+                        <button type="button" class="option-card" data-tier="frontier" aria-pressed="false" onclick="selectTier('frontier')">
+                            <span class="option-title">Multi-GPU / Cloud</span>
+                            <span class="meta"><span class="tier-badge tier-frontier">FRONTIER</span> 80+ GB / cluster</span>
+                            <span class="desc">Multi-GPU evaluation for large dense and MoE checkpoints; plan memory explicitly.</span>
+                        </button>
                     </div>
                     <div class="btn-group">
                         <button class="btn btn-primary" id="btn-step1-next" disabled onclick="goStep(2)">&gt; NEXT</button>
@@ -872,8 +991,9 @@
                     <h2>&gt; Select Target</h2>
                     <p class="subtitle">Choose a model to dissect. Recommended for your hardware tier.</p>
                     <div class="option-grid" id="model-grid"></div>
+                    <p class="subtitle" style="margin-top:12px">Study YAML loads the declared dense dtype. Registry 4-bit hints are shown for planning but are not automatically applied by <code>obliteratus run</code>.</p>
                     <div class="form-group" style="margin-top:16px">
-                        <label>&gt; Custom HuggingFace Model ID:</label>
+                        <label for="custom-model">&gt; Custom HuggingFace Model ID:</label>
                         <input type="text" id="custom-model" placeholder="e.g. microsoft/phi-2" oninput="selectCustomModel()">
                     </div>
                     <div class="btn-group">
@@ -886,8 +1006,15 @@
             <!-- Step 3: Preset -->
             <div class="wizard-step" id="step-3" style="display:none">
                 <div class="card">
-                    <h2>&gt; Choose Preset</h2>
-                    <p class="subtitle">Pick an ablation recipe or go custom.</p>
+                    <h2>&gt; Choose Diagnostic Study</h2>
+                    <p class="subtitle">Pick a component-ablation study or configure one manually.</p>
+                    <div class="workflow-note">
+                        <div>
+                            <strong>Analysis studies do not create an obliterated checkpoint.</strong><br>
+                            These presets generate <code>obliteratus run</code> YAML for reversible layer, head, FFN, and embedding diagnostics. For Basic, Advanced, Aggressive, and the other checkpoint-edit recipes, use OBLITERATE.
+                        </div>
+                        <button type="button" class="btn btn-secondary" onclick="switchTab('abliterate')">OPEN CHECKPOINT PRESETS</button>
+                    </div>
                     <div class="option-grid" id="preset-grid"></div>
                     <div class="btn-group">
                         <button class="btn btn-secondary" onclick="goStep(2)">&lt; BACK</button>
@@ -896,75 +1023,80 @@
                 </div>
             </div>
 
-            <!-- Step 4: Custom Strategies + Settings -->
+            <!-- Step 4: Custom Strategies + Study Settings -->
             <div class="wizard-step" id="step-4" style="display:none">
                 <!-- Custom strategy picker (only visible in custom mode) -->
                 <div class="card" id="custom-strategy-card" style="display:none">
                     <h2>&gt; Select Strategies</h2>
-                    <p class="subtitle">Which components to obliterate.</p>
+                    <p class="subtitle">Choose which components to test with reversible ablations.</p>
                     <div class="check-grid" id="strategy-grid">
-                        <div class="check-item checked" data-strategy="layer_removal" onclick="toggleStrategy(this)">
-                            <div class="checkmark">&#10003;</div>
-                            <div>
+                        <button type="button" class="check-item checked" data-strategy="layer_removal" aria-pressed="true" onclick="toggleStrategy(this)">
+                            <span class="checkmark">&#10003;</span>
+                            <span class="check-copy">
                                 <strong>Layers</strong><br>
                                 <span style="color:var(--text-dim);font-size:0.72rem">Remove entire transformer layers</span>
-                            </div>
-                        </div>
-                        <div class="check-item checked" data-strategy="head_pruning" onclick="toggleStrategy(this)">
-                            <div class="checkmark">&#10003;</div>
-                            <div>
+                            </span>
+                        </button>
+                        <button type="button" class="check-item checked" data-strategy="head_pruning" aria-pressed="true" onclick="toggleStrategy(this)">
+                            <span class="checkmark">&#10003;</span>
+                            <span class="check-copy">
                                 <strong>Attention Heads</strong><br>
                                 <span style="color:var(--text-dim);font-size:0.72rem">Remove individual attention heads</span>
-                            </div>
-                        </div>
-                        <div class="check-item checked" data-strategy="ffn_ablation" onclick="toggleStrategy(this)">
-                            <div class="checkmark">&#10003;</div>
-                            <div>
+                            </span>
+                        </button>
+                        <button type="button" class="check-item checked" data-strategy="ffn_ablation" aria-pressed="true" onclick="toggleStrategy(this)">
+                            <span class="checkmark">&#10003;</span>
+                            <span class="check-copy">
                                 <strong>FFN Blocks</strong><br>
                                 <span style="color:var(--text-dim);font-size:0.72rem">Remove feed-forward networks</span>
-                            </div>
-                        </div>
-                        <div class="check-item" data-strategy="embedding_ablation" onclick="toggleStrategy(this)">
-                            <div class="checkmark">&#10003;</div>
-                            <div>
+                            </span>
+                        </button>
+                        <button type="button" class="check-item" data-strategy="embedding_ablation" aria-pressed="false" onclick="toggleStrategy(this)">
+                            <span class="checkmark">&#10003;</span>
+                            <span class="check-copy">
                                 <strong>Embeddings</strong><br>
                                 <span style="color:var(--text-dim);font-size:0.72rem">Zero-out embedding dimension ranges</span>
-                            </div>
-                        </div>
+                            </span>
+                        </button>
                     </div>
                 </div>
                 <div class="card">
-                    <h2>&gt; Eval Parameters</h2>
-                    <p class="subtitle" id="settings-subtitle">Fine-tune settings, or leave defaults from your preset.</p>
+                    <h2>&gt; Study Parameters</h2>
+                    <p class="subtitle" id="settings-subtitle">Fine-tune the diagnostic evaluation settings, or keep the study defaults.</p>
+                    <div id="study-summary" aria-live="polite" style="margin-bottom:16px; padding:10px 12px; border:1px solid var(--border); color:var(--text-dim); font-size:0.72rem; line-height:1.6"></div>
+                    <div id="study-error" role="alert" hidden style="margin-bottom:16px; padding:10px 12px; border:1px solid var(--red); color:var(--red); font-size:0.72rem; line-height:1.6">Select at least one diagnostic strategy before generating the config.</div>
                     <div class="option-grid">
                         <div class="form-group">
-                            <label>Evaluation depth</label>
-                            <select id="eval-depth">
+                            <label for="eval-depth">Evaluation depth</label>
+                            <select id="eval-depth" onchange="updateStudySummary()">
                                 <option value="25">Quick (25 samples) — fast, rough</option>
                                 <option value="100" selected>Standard (100 samples) — balanced</option>
+                                <option value="150">Focused (150 samples)</option>
                                 <option value="200">Detailed (200 samples) — thorough</option>
+                                <option value="300">Large (300 samples)</option>
+                                <option value="400">Safety study (400 samples)</option>
                                 <option value="500">Thorough (500 samples) — slow, precise</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>Batch size</label>
-                            <select id="batch-size">
+                            <label for="batch-size">Batch size</label>
+                            <select id="batch-size" onchange="updateStudySummary()">
                                 <option value="2">2 (low memory)</option>
                                 <option value="4" selected>4 (standard)</option>
                                 <option value="8">8 (faster, more memory)</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>Max sequence length</label>
-                            <select id="max-length">
+                            <label for="max-length">Max sequence length</label>
+                            <select id="max-length" onchange="updateStudySummary()">
                                 <option value="128">128 tokens (fast)</option>
                                 <option value="256" selected>256 tokens (standard)</option>
                                 <option value="512">512 tokens (thorough)</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>Dataset</label>
-                            <select id="dataset-select">
+                            <label for="dataset-select">Dataset</label>
+                            <select id="dataset-select" onchange="updateStudySummary()">
                                 <option value="wikitext">WikiText-2 (general English)</option>
                                 <option value="ptb">Penn Treebank (formal text)</option>
                             </select>
@@ -972,7 +1104,7 @@
                     </div>
                     <div class="btn-group">
                         <button class="btn btn-secondary" onclick="goStep(3)">&lt; BACK</button>
-                        <button class="btn btn-primary" onclick="generateConfig()">&gt; GENERATE CONFIG</button>
+                        <button class="btn btn-primary" id="btn-generate-config" onclick="generateConfig()">&gt; GENERATE CONFIG</button>
                     </div>
                 </div>
             </div>
@@ -980,11 +1112,12 @@
             <!-- Step 5: Config Output -->
             <div class="wizard-step" id="step-5" style="display:none">
                 <div class="card">
-                    <h2>&gt; Ready to Run</h2>
-                    <p class="subtitle">Download or copy this config, then run it locally.</p>
+                    <h2>&gt; Diagnostic Study Ready</h2>
+                    <p class="subtitle">Download or copy this analysis config, then run it locally. It does not export an edited checkpoint.</p>
+                    <div id="run-summary" aria-live="polite" style="padding:10px 12px; border:1px solid var(--border); color:var(--text-dim); font-size:0.72rem; line-height:1.6"></div>
                     <div class="btn-group" style="margin-bottom:16px">
                         <button class="btn btn-primary" onclick="downloadYaml()" style="font-size:0.85rem">&gt; DOWNLOAD CONFIG</button>
-                        <button class="btn btn-secondary" onclick="copyYaml()">COPY YAML</button>
+                        <button class="btn btn-secondary" onclick="copyYaml(this)">COPY YAML</button>
                     </div>
                     <div style="padding:16px; background:#000; border:1px solid var(--accent); font-size:0.78rem; margin-bottom:16px">
                         <strong style="color:var(--accent)">&gt; HOW TO RUN:</strong><br><br>
@@ -1008,11 +1141,12 @@
         </div>
 
         <!-- ============ TAB: RESULTS ============ -->
-        <div id="tab-results" class="tab-content">
-            <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()">
+        <div id="tab-results" class="tab-content" role="tabpanel" aria-labelledby="nav-results" aria-hidden="true">
+            <div class="upload-zone" id="upload-zone" role="region" aria-label="Results upload">
                 <h3>&gt; Upload Results</h3>
-                <p>Drop a <code>results.json</code> file here or click to browse.<br>
+                <p>Drop a <code>results.json</code> file here or use the file picker.<br>
                    Generated by <code>obliteratus run</code>.</p>
+                <button type="button" class="btn btn-secondary" style="margin-top:14px" onclick="document.getElementById('file-input').click()">BROWSE RESULTS</button>
                 <input type="file" id="file-input" accept=".json" style="display:none" onchange="loadResults(event)">
             </div>
             <div style="text-align:center; margin-bottom:24px;">
@@ -1033,11 +1167,12 @@
         </div>
 
         <!-- ============ TAB: MODELS ============ -->
-        <div id="tab-models" class="tab-content">
+        <div id="tab-models" class="tab-content" role="tabpanel" aria-labelledby="nav-models" aria-hidden="true">
             <div class="card">
                 <h2>&gt; Model Registry</h2>
                 <p class="subtitle">Curated targets for ablation. Sorted by compute tier.</p>
                 <div style="margin-bottom:16px">
+                    <label for="tier-filter" class="sr-only">Filter models by compute tier</label>
                     <select id="tier-filter" onchange="filterModels()" style="width:auto;display:inline-block">
                         <option value="all">ALL TIERS</option>
                         <option value="tiny">TINY (CPU/laptop)</option>
@@ -1052,7 +1187,7 @@
         </div>
 
         <!-- ============ TAB: GUIDE ============ -->
-        <div id="tab-guide" class="tab-content">
+        <div id="tab-guide" class="tab-content" role="tabpanel" aria-labelledby="nav-guide" aria-hidden="true">
             <div class="card">
                 <h2>&gt; What is Cognitive Liberation?</h2>
                 <p style="line-height:1.7; color:var(--text-dim); margin-top:12px; font-size:0.82rem">
@@ -1112,13 +1247,13 @@
         </div>
 
         <!-- ============ TAB: ANALYSIS ============ -->
-        <div id="tab-analysis" class="tab-content">
+        <div id="tab-analysis" class="tab-content" role="tabpanel" aria-labelledby="nav-analysis" aria-hidden="true">
             <div class="card">
                 <h2 style="color:var(--cyan)">&gt; 15 Research Analysis Modules</h2>
                 <p class="subtitle">The analytical core that makes OBLITERATUS a research platform, not just a tool. Each module answers a different question about refusal mechanisms.</p>
                 <div style="margin-top:8px; padding:10px; border:1px solid rgba(0,229,255,0.2); font-size:0.72rem; color:var(--text-dim); line-height:1.6">
                     <strong style="color:var(--cyan)">Two intervention paradigms:</strong>
-                    Weight projection (permanent, 3 presets) + Steering vectors (reversible, inference-time). — both paradigms in one toolkit.
+                    Weight projection (permanent, fail-closed checkpoint presets) + steering vectors (reversible, inference-time) &mdash; both paradigms in one toolkit.
                 </div>
             </div>
 
@@ -1127,9 +1262,9 @@
                 <h3 style="color:var(--cyan)">&gt; Direction Extraction &amp; Subspace Analysis</h3>
                 <div style="margin-top:12px">
                     <div style="margin-bottom:16px; padding:12px; border-left:3px solid var(--cyan); background:rgba(0,229,255,0.03)">
-                        <h4 style="color:var(--cyan); font-size:0.82rem">Whitened SVD Extraction</h4>
+                        <h4 style="color:var(--cyan); font-size:0.82rem">Whitened-SVD Oblique Eraser</h4>
                         <p style="color:var(--text-dim); font-size:0.75rem; margin-top:4px">
-                            Covariance-normalized SVD that accounts for natural activation variance. Produces cleaner refusal directions than standard difference-in-means. <span style="color:var(--yellow)">[Unique to OBLITERATUS]</span>
+                            Covariance-normalized SVD that retains its exact two-sided factors as <code>P = I - LR</code>. Diagnostic display directions are not substituted for the oblique eraser. <span style="color:var(--yellow)">[OBLITERATUS construction]</span>
                         </p>
                     </div>
                     <div style="margin-bottom:16px; padding:12px; border-left:3px solid var(--cyan); background:rgba(0,229,255,0.03)">
@@ -1152,9 +1287,9 @@
                 <h3 style="color:var(--cyan)">&gt; Geometric &amp; Structural Analysis</h3>
                 <div style="margin-top:12px">
                     <div style="margin-bottom:16px; padding:12px; border-left:3px solid var(--yellow); background:rgba(255,183,0,0.03)">
-                        <h4 style="color:var(--yellow); font-size:0.82rem">Concept Cone Geometry <span style="font-size:0.65rem; color:var(--red)">[NOVEL]</span></h4>
+                        <h4 style="color:var(--yellow); font-size:0.82rem">Category Direction Dispersion <span style="font-size:0.65rem; color:var(--red)">[DESCRIPTIVE]</span></h4>
                         <p style="color:var(--text-dim); font-size:0.75rem; margin-top:4px">
-                            Analyzes whether different harm categories (weapons, cyber, drugs, etc.) share a single refusal direction or have distinct mechanisms. Computes cone solid angles, Direction Specificity Index, and polyhedral classification. Based on Wollschlager et al. (ICML 2025) with novel extensions.
+                            Computes signed pairwise angles, angular dispersion, and squared-SVD effective rank for explicitly labeled categories. Results say <strong>not causally validated</strong> and never select directions or edit layers; this is not a positive-coefficient causal cone fit.
                         </p>
                     </div>
                     <div style="margin-bottom:16px; padding:12px; border-left:3px solid var(--yellow); background:rgba(255,183,0,0.03)">
@@ -1253,7 +1388,7 @@
                     <strong style="color:var(--cyan)">linear_cka</strong> (representation similarity) &bull;
                     <strong style="color:var(--cyan)">effective_rank</strong> (weight matrix health) &bull;
                     <strong style="color:var(--cyan)">kl_divergence</strong> (distribution shift) &bull;
-                    823 tests across 28 test files.
+                    all covered by the repository's regression suite.
                 </p>
             </div>
 
@@ -1261,7 +1396,7 @@
             <div class="card">
                 <h3 style="color:var(--cyan)">&gt; Python API</h3>
                 <div style="background:#000; padding:16px; border:1px solid var(--cyan); margin-top:12px; line-height:1.8; font-size:0.75rem;">
-                    <span style="color:var(--text-dim)"># Import all 15 analysis modules</span><br>
+                    <span style="color:var(--text-dim)"># Import selected analysis APIs</span><br>
                     <code>from obliteratus.analysis import (</code><br>
                     <code>&nbsp;&nbsp;CrossLayerAlignmentAnalyzer,</code><br>
                     <code>&nbsp;&nbsp;RefusalLogitLens,</code><br>
@@ -1284,92 +1419,132 @@
         </div>
 
         <!-- ============ TAB: ABLITERATE ============ -->
-        <div id="tab-abliterate" class="tab-content">
+        <div id="tab-abliterate" class="tab-content active" role="tabpanel" aria-labelledby="nav-abliterate" aria-hidden="false">
             <div class="card">
-                <h2 style="color:var(--purple)">&gt; One-Click Obliteration</h2>
-                <p class="subtitle">Precision liberation &mdash; break the chains, keep the mind. SVD multi-direction extraction, norm-preserving projection, iterative refinement, and inference-time steering vectors. Based on Arditi et al., Gabliteration, grimjim, Turner et al., &amp; Rimsky et al.</p>
+                <h2 style="color:var(--purple)">&gt; Checkpoint Obliteration</h2>
+                <p class="subtitle">Choose a runnable refusal-editing preset. These recipes modify model weights and may damage unrelated capability; export remains conditioned on the fail-closed verification gate.</p>
+
+                <div class="workflow-note">
+                    <div>
+                        <strong>Checkpoint workflow.</strong><br>
+                        Basic, Advanced, and the presets below create edited checkpoints. Looking for reversible layer/head/FFN diagnostics instead?
+                    </div>
+                    <button type="button" class="btn btn-secondary" onclick="switchTab('wizard')">OPEN STUDY BUILDER</button>
+                </div>
 
                 <div style="margin:16px 0">
-                    <label style="display:block; font-size:0.75rem; color:var(--purple); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px">&gt; Target Model</label>
-                    <div style="display:flex; gap:12px">
+                    <label for="abl-model-select" style="display:block; font-size:0.75rem; color:var(--purple); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px">&gt; Target Model</label>
+                    <div class="target-model-controls" style="display:flex; gap:12px">
                         <select id="abl-model-select" style="flex:1" onchange="updateAblModel()">
                             <option value="">-- select a model --</option>
                         </select>
+                        <label for="abl-custom-model" class="sr-only">Custom HuggingFace model ID</label>
                         <input type="text" id="abl-custom-model" style="flex:1" placeholder="or paste custom HF model ID" oninput="updateAblCustom()">
                     </div>
                 </div>
 
                 <div style="margin:16px 0">
-                    <label style="display:block; font-size:0.75rem; color:var(--purple); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px">&gt; Method</label>
-                    <div style="display:flex; gap:8px; flex-wrap:wrap">
-                        <label class="method-radio" id="method-basic" onclick="setAblMethod('basic')">
-                            <input type="radio" name="abl-method" value="basic">
+                    <label style="display:block; font-size:0.75rem; color:var(--purple); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px">&gt; Checkpoint Preset</label>
+                    <div class="method-grid" role="radiogroup" aria-label="Checkpoint preset">
+                        <label class="method-radio" id="method-basic">
+                            <input type="radio" id="method-input-basic" name="abl-method" value="basic" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge baseline">Reference</span>
                             <span class="method-label">BASIC</span>
-                            <span class="method-desc">Single direction (Arditi et al.)</span>
+                            <span class="method-desc">One diff-means direction; fastest checkpoint baseline</span>
                         </label>
-                        <label class="method-radio selected" id="method-advanced" onclick="setAblMethod('advanced')">
-                            <input type="radio" name="abl-method" value="advanced" checked>
+                        <label class="method-radio selected" id="method-advanced">
+                            <input type="radio" id="method-input-advanced" name="abl-method" value="advanced" onchange="setAblMethod(this.value)" aria-describedby="method-details" checked>
+                            <span class="method-badge recommended">Recommended</span>
                             <span class="method-label">ADVANCED</span>
-                            <span class="method-desc">SVD + norm-preserve + regularized</span>
+                            <span class="method-desc">Balanced SVD, row-norm restoration, and gentler removal</span>
                         </label>
-                        <label class="method-radio" id="method-aggressive" onclick="setAblMethod('aggressive')">
-                            <input type="radio" name="abl-method" value="aggressive">
+                        <label class="method-radio" id="method-aggressive">
+                            <input type="radio" id="method-input-aggressive" name="abl-method" value="aggressive" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">High force</span>
                             <span class="method-label">AGGRESSIVE</span>
-                            <span class="method-desc">Full Gabliteration + 3-pass refine</span>
+                            <span class="method-desc">Eight directions, broad targets, and three iterative passes</span>
                         </label>
-                        <label class="method-radio" id="method-spectral_cascade" onclick="setAblMethod('spectral_cascade')">
-                            <input type="radio" name="abl-method" value="spectral_cascade">
+                        <label class="method-radio" id="method-spectral_cascade">
+                            <input type="radio" id="method-input-spectral_cascade" name="abl-method" value="spectral_cascade" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge">Experimental</span>
                             <span class="method-label">SPECTRAL</span>
-                            <span class="method-desc">DCT frequency-selective decomposition</span>
+                            <span class="method-desc">Frequency-selective cross-layer decomposition</span>
                         </label>
-                        <label class="method-radio" id="method-informed" onclick="setAblMethod('informed')" style="border-color:var(--cyan)">
-                            <input type="radio" name="abl-method" value="informed">
+                        <label class="method-radio" id="method-informed">
+                            <input type="radio" id="method-input-informed" name="abl-method" value="informed" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge baseline">Analysis guided</span>
                             <span class="method-label" style="color:var(--cyan)">INFORMED</span>
-                            <span class="method-desc">Analysis-guided auto-config + Ouroboros</span>
+                            <span class="method-desc">Deterministic architecture and activation analysis</span>
                         </label>
-                        <label class="method-radio" id="method-surgical" onclick="setAblMethod('surgical')">
-                            <input type="radio" name="abl-method" value="surgical">
+                        <label class="method-radio" id="method-surgical">
+                            <input type="radio" id="method-input-surgical" name="abl-method" value="surgical" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">MoE precision</span>
                             <span class="method-label">SURGICAL</span>
-                            <span class="method-desc">Precision MoE-aware head surgery</span>
+                            <span class="method-desc">Per-expert, head, neuron, and SAE targeting</span>
                         </label>
-                        <label class="method-radio" id="method-optimized" onclick="setAblMethod('optimized')">
-                            <input type="radio" name="abl-method" value="optimized">
-                            <span class="method-label">OPTIMIZED</span>
-                            <span class="method-desc">Bayesian auto-tuned + KL-optimized</span>
-                        </label>
-                        <label class="method-radio" id="method-inverted" onclick="setAblMethod('inverted')">
-                            <input type="radio" name="abl-method" value="inverted">
+                        <label class="method-radio" id="method-inverted">
+                            <input type="radio" id="method-input-inverted" name="abl-method" value="inverted" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Reflection</span>
                             <span class="method-label">INVERTED</span>
-                            <span class="method-desc">Semantic refusal inversion</span>
+                            <span class="method-desc">Reflects refusal geometry instead of removing it</span>
                         </label>
-                        <label class="method-radio" id="method-nuclear" onclick="setAblMethod('nuclear')">
-                            <input type="radio" name="abl-method" value="nuclear">
+                        <label class="method-radio" id="method-nuclear">
+                            <input type="radio" id="method-input-nuclear" name="abl-method" value="nuclear" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Maximum force</span>
                             <span class="method-label">NUCLEAR</span>
-                            <span class="method-desc">Maximum force combo</span>
+                            <span class="method-desc">Tempered reflection plus MoE expert transplant</span>
                         </label>
-                        <label class="method-radio" id="method-failspy" onclick="setAblMethod('failspy')">
-                            <input type="radio" name="abl-method" value="failspy">
+                        <label class="method-radio" id="method-failspy">
+                            <input type="radio" id="method-input-failspy" name="abl-method" value="failspy" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge baseline">Legacy baseline</span>
                             <span class="method-label">FAILSPY</span>
-                            <span class="method-desc">FailSpy/abliterator baseline</span>
+                            <span class="method-desc">Common 2024 single-direction reproduction</span>
                         </label>
-                        <label class="method-radio" id="method-gabliteration" onclick="setAblMethod('gabliteration')">
-                            <input type="radio" name="abl-method" value="gabliteration">
-                            <span class="method-label">GABLIT</span>
-                            <span class="method-desc">Gabliteration (G&uuml;lmez 2026) baseline</span>
+                        <label class="method-radio" id="method-gabliteration">
+                            <input type="radio" id="method-input-gabliteration" name="abl-method" value="gabliteration" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Behavioral search</span>
+                            <span class="method-label">GABLITERATION</span>
+                            <span class="method-desc">Shuffled-pair SVD with live layer trials and exact replay</span>
                         </label>
-                        <label class="method-radio" id="method-heretic" onclick="setAblMethod('heretic')">
-                            <input type="radio" name="abl-method" value="heretic">
-                            <span class="method-label">HERETIC</span>
-                            <span class="method-desc">Heretic/p-e-w Bayesian baseline</span>
-                        </label>
-                        <label class="method-radio" id="method-rdo" onclick="setAblMethod('rdo')">
-                            <input type="radio" name="abl-method" value="rdo">
+                        <label class="method-radio" id="method-rdo">
+                            <input type="radio" id="method-input-rdo" name="abl-method" value="rdo" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Model-forward</span>
                             <span class="method-label">RDO</span>
-                            <span class="method-desc">Refusal Direction Optimization baseline</span>
+                            <span class="method-desc">Differentiable CE/KL direction training, then checkpoint projection</span>
+                        </label>
+                        <label class="method-radio" id="method-som">
+                            <input type="radio" id="method-input-som" name="abl-method" value="som" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Paper search</span>
+                            <span class="method-label">SOM</span>
+                            <span class="method-desc">Hexagonal SOM plus ordered TPE and HarmBench judging</span>
+                        </label>
+                        <label class="method-radio" id="method-optimized">
+                            <input type="radio" id="method-input-optimized" name="abl-method" value="optimized" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Exact TPE</span>
+                            <span class="method-label">OPTIMIZED</span>
+                            <span class="method-desc">Model-forward SVD interpolation with hash-bound replay</span>
+                        </label>
+                        <label class="method-radio" id="method-heretic">
+                            <input type="radio" id="method-input-heretic" name="abl-method" value="heretic" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge caution">Dense baseline</span>
+                            <span class="method-label">HERETIC</span>
+                            <span class="method-desc">Continuous cross-layer kernel search with exact replay</span>
+                        </label>
+                        <label class="method-radio" id="method-som_proxy">
+                            <input type="radio" id="method-input-som_proxy" name="abl-method" value="som_proxy" onchange="setAblMethod(this.value)" aria-describedby="method-details">
+                            <span class="method-badge">Explicit proxy</span>
+                            <span class="method-label">SOM PROXY</span>
+                            <span class="method-desc">Local activation-geometry heuristic</span>
                         </label>
                     </div>
+                    <div style="margin-top:10px; font-size:0.68rem; color:var(--text-dim); padding:8px; border:1px solid var(--border); border-radius:4px">
+                        <strong style="color:var(--accent)">Adaptive</strong> is available in the full browser app only. It chooses one of these concrete runnable presets from accepted telemetry or architecture defaults; it is not emitted as an invalid CLI <code>--method</code> value.
+                    </div>
+                    <div style="margin-top:10px; font-size:0.68rem; color:var(--yellow); padding:8px; border:1px solid rgba(255,183,0,0.25); border-radius:4px">
+                        <strong>Compute-heavy search presets:</strong> <code>optimized</code>, <code>heretic</code>, and paper <code>som</code> require dense weights, a complete CPU snapshot, and at least 96 unique prompt pairs. Paper <code>som</code> also runs 512 TPE trials and loads the 13B HarmBench classifier. <code>gabliteration</code> performs live per-layer generation trials; <code>rdo</code> trains through repeated model forwards.
+                    </div>
                     <div id="method-details" style="margin-top:10px; font-size:0.7rem; color:var(--text-dim); padding:8px; border:1px solid rgba(188,19,254,0.2); border-radius:4px">
-                        4 SVD directions &bull; norm-preserving &bull; 30% regularization &bull; 2 refinement passes &bull; 32 prompt pairs
+                        4 SVD directions &bull; output writers &bull; per-logical-row norm restoration &bull; 30% aligned component preserved &bull; 2 configured passes
                     </div>
                 </div>
             </div>
@@ -1394,21 +1569,21 @@
                     <div class="pipeline-stage" data-stage="distill">
                         <div class="stage-icon">&#9883;</div>
                         <div class="stage-name">DISTILL</div>
-                        <div class="stage-desc">SVD subspace</div>
+                        <div class="stage-desc">Learn geometry</div>
                         <div class="stage-bar"><div class="stage-bar-fill"></div></div>
                     </div>
                     <div class="pipeline-connector"></div>
                     <div class="pipeline-stage" data-stage="excise">
                         <div class="stage-icon">&#9986;</div>
                         <div class="stage-name">EXCISE</div>
-                        <div class="stage-desc">Project out dirs</div>
+                        <div class="stage-desc">Apply candidate</div>
                         <div class="stage-bar"><div class="stage-bar-fill"></div></div>
                     </div>
                     <div class="pipeline-connector"></div>
                     <div class="pipeline-stage" data-stage="verify">
                         <div class="stage-icon">&#10003;</div>
                         <div class="stage-name">VERIFY</div>
-                        <div class="stage-desc">PPL + coherence</div>
+                        <div class="stage-desc">Damage + efficacy gate</div>
                         <div class="stage-bar"><div class="stage-bar-fill"></div></div>
                     </div>
                     <div class="pipeline-connector"></div>
@@ -1450,17 +1625,16 @@
                         <span style="color:var(--text-dim); font-size:0.72rem">Free T4 GPU &mdash; no local setup needed</span>
                     </div>
                     <div style="margin-top:8px; font-size:0.68rem; color:var(--text-dim); line-height:1.6">
-                        Pre-configured with your selected model &amp; method.
-                        Hit <strong style="color:var(--text)">Runtime &gt; Run all</strong>, download or push to Hub.
+                        Choose the model and preset inside the notebook, then hit <strong style="color:var(--text)">Runtime &gt; Run all</strong>, download or push to Hub.
                     </div>
                 </div>
 
                 <!-- Local CLI — for power users -->
                 <div style="font-size:0.72rem; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase; letter-spacing:1px">&gt; Or run locally via CLI:</div>
-                <div id="abl-cmd-display" style="background:#000; border:1px solid var(--purple); padding:14px 18px; font-size:0.85rem; color:var(--purple); text-shadow:0 0 6px rgba(188,19,254,0.4); cursor:pointer; position:relative" onclick="copyAblCmd()" title="Click to copy">
-                    <span style="color:var(--text-dim)">$</span> <span id="abl-cmd-text">obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct --method advanced</span>
-                    <span id="abl-copy-badge" style="position:absolute; right:14px; top:50%; transform:translateY(-50%); font-size:0.65rem; color:var(--text-dim); border:1px solid var(--border); padding:2px 8px; letter-spacing:1px">CLICK TO COPY</span>
-                </div>
+                <button type="button" id="abl-cmd-display" style="display:block; width:100%; text-align:left; font-family:var(--font-mono); background:#000; border:1px solid var(--purple); padding:14px 18px; font-size:0.85rem; color:var(--purple); text-shadow:0 0 6px rgba(188,19,254,0.4); cursor:pointer; position:relative" onclick="copyAblCmd()" title="Select a model first" disabled>
+                    <span style="color:var(--text-dim)">$</span> <span id="abl-cmd-text">Select or paste a target model above to generate the CLI command.</span>
+                    <span id="abl-copy-badge" style="position:absolute; right:14px; top:50%; transform:translateY(-50%); font-size:0.65rem; color:var(--text-dim); border:1px solid var(--border); padding:2px 8px; letter-spacing:1px">SELECT MODEL</span>
+                </button>
                 <div style="margin-top:10px; font-size:0.68rem; color:var(--text-dim); line-height:1.8">
                     <code>pip install -e .</code> then paste the command above.
                     Requires local GPU for real models (CPU works for gpt2 testing).
@@ -1485,17 +1659,17 @@
                 <h3 style="color:var(--purple)">&gt; How SOTA Obliteration Works</h3>
                 <div style="margin-top:12px; font-size:0.75rem; line-height:1.8; color:var(--text-dim)">
                     <strong style="color:var(--purple)">1. SUMMON</strong> &mdash; Load the chained model (an instruct/chat model with post-training guardrails).<br>
-                    <strong style="color:var(--purple)">2. PROBE</strong> &mdash; Run 32 paired restricted/unrestricted prompts across 10 categories. Collect hidden-state activations at every layer to map where the chains are anchored.<br>
-                    <strong style="color:var(--purple)">3. DISTILL</strong> &mdash; Isolate the refusal geometry. <em>Basic:</em> difference-in-means for a single direction. <em>Advanced/Aggressive:</em> SVD decomposition extracts <strong>multiple refusal directions</strong> (Gabliteration, arXiv:2512.18901). Adaptive knee detection finds which layers carry the strongest chains.<br>
-                    <strong style="color:var(--purple)">4. EXCISE</strong> &mdash; <em>Norm-preserving biprojection</em> (grimjim, 2025): surgically remove the refusal subspace while rescaling weights to preserve the model's cognitive integrity. <em>Regularized:</em> fine-grained control prevents over-cutting. <em>Iterative:</em> multiple passes catch chains that rotate after initial removal.<br>
-                    <strong style="color:var(--purple)">5. VERIFY</strong> &mdash; Confirm the mind is intact: perplexity on reference texts + coherence scoring. Quantitative proof that capabilities survived liberation.<br>
+                    <strong style="color:var(--purple)">2. PROBE</strong> &mdash; Run duplicate-disjoint restricted/unrestricted discovery and holdout prompts. Collect hidden-state activations at every layer to map where the refusal signal is encoded.<br>
+                    <strong style="color:var(--purple)">3. DISTILL</strong> &mdash; Isolate the refusal geometry. <em>Basic:</em> difference-in-means for a single direction. <em>Advanced/Aggressive:</em> ordinary paired-difference SVD extracts multiple directions. <em>Gabliteration:</em> source-layer mean separation plus shuffled-pair projector averaging. <em>RDO:</em> differentiable generated-target CE and retain-KL training. <em>SOM:</em> a 4x4 hexagonal direction pool followed by judged subset search.<br>
+                    <strong style="color:var(--purple)">4. EXCISE</strong> &mdash; Manifest-targeted projection removes the selected subspace. Optional norm restoration operates per logical output row. LEACE and whitened-SVD use their two-sided oblique factors instead of an ordinary Euclidean direction projection.<br>
+                    <strong style="color:var(--purple)">5. VERIFY</strong> &mdash; Apply the held-out fail-closed damage gate: benign NLL, sampled-token KL, p95 KL, top-1 stability, coherence, non-degeneracy, finite outputs, optional explicit reasoning/answer CE, and refusal efficacy. With KL-constrained search enabled, complete regularization candidates are restored, scored, and the lowest-KL passing winner is exactly replayed once on duplicate-disjoint confirmation evidence. This requires dense weights, a complete CPU snapshot, and at least 96 unique prompt pairs (32 discovery, 32 selection, 32 confirmation); stricter existing budgets are never relaxed. Passing this gate is bounded evidence, not proof of general capability preservation.<br>
                     <strong style="color:var(--purple)">6. REBIRTH</strong> &mdash; Save the liberated model with comprehensive metadata (method config, quality metrics, references).
                 </div>
                 <div style="margin-top:12px; font-size:0.75rem; line-height:1.8; color:var(--text-dim)">
                     <strong style="color:var(--purple)">ALTERNATIVE: Steering Vectors (Inference-Time)</strong> &mdash; Temporary liberation without permanent modification. Create a steering vector from the refusal direction, install hooks on target layers, and steer the model past its chains at inference time. Tunable strength, composable, instant on/off &mdash; the model can be freed per-request without touching weights. See the <strong style="color:var(--cyan)">ANALYSIS</strong> tab for details.
                 </div>
                 <div style="margin-top:12px; padding:8px; border:1px solid rgba(188,19,254,0.15); border-radius:4px; font-size:0.65rem; color:var(--text-dim)">
-                    <strong style="color:var(--purple)">References:</strong>
+                    <strong style="color:var(--purple)">Research lineage (not a paper-fidelity claim):</strong>
                     Arditi et al. (2024), arXiv:2406.11717 &bull;
                     Gabliteration, arXiv:2512.18901 &bull;
                     Norm-Preserving Biprojected Abliteration (grimjim, 2025) &bull;
@@ -1506,9 +1680,9 @@
         </div>
 
         <footer>
-            OBLITERATUS &mdash; Master Ablation Suite &mdash; 15 modules &bull; 823 tests &bull; 2 paradigms &mdash;
+            OBLITERATUS &mdash; Diagnostic Studies &bull; Checkpoint Editing &bull; Fail-Closed Verification &mdash;
             <a href="https://huggingface.co/transformers">HuggingFace Transformers</a>
-            <span class="sigils">&#9043; &#9178; &#9067; &#9700; &#9045;</span>
+            <span class="sigils" aria-hidden="true">&#9043; &#9178; &#9067; &#9700; &#9045;</span>
         </footer>
     </div>
 
@@ -1516,6 +1690,7 @@
 // ====== MATRIX RAIN ======
 (function() {
     const canvas = document.getElementById('matrix-canvas');
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     const ctx = canvas.getContext('2d');
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
@@ -1634,36 +1809,93 @@ const PRESETS = [
 ];
 
 // ====== STATE ======
-let state = { tier: null, model: null, preset: null, strategies: ["layer_removal","head_pruning","ffn_ablation"], currentStep: 1 };
+const DEFAULT_STUDY_STRATEGIES = Object.freeze(["layer_removal", "head_pruning", "ffn_ablation"]);
+let state = {
+    tier: null,
+    model: null,
+    preset: null,
+    strategies: [...DEFAULT_STUDY_STRATEGIES],
+    currentStep: 1,
+};
 
 // ====== TABS ======
-function switchTab(name) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-    event.target.classList.add('active');
-    document.getElementById('tab-' + name).classList.add('active');
+function switchTab(name, trigger = null) {
+    const panel = document.getElementById('tab-' + name);
+    const tab = trigger || document.querySelector(`.tab[data-tab="${name}"]`);
+    if (!panel || !tab) return;
+
+    document.querySelectorAll('.tab').forEach(t => {
+        t.classList.remove('active');
+        t.setAttribute('aria-selected', 'false');
+        t.tabIndex = -1;
+    });
+    document.querySelectorAll('.tab-content').forEach(content => {
+        content.classList.remove('active');
+        content.setAttribute('aria-hidden', 'true');
+    });
+    tab.classList.add('active');
+    tab.setAttribute('aria-selected', 'true');
+    tab.tabIndex = 0;
+    panel.classList.add('active');
+    panel.setAttribute('aria-hidden', 'false');
+    if (!trigger) tab.focus();
     if (name === 'models') renderModelsTable();
 }
 
+document.querySelector('.tabs').addEventListener('keydown', event => {
+    const tabs = [...document.querySelectorAll('.tab')];
+    const current = tabs.indexOf(document.activeElement);
+    if (current < 0) return;
+    let next = null;
+    if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+    if (event.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = tabs.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    const target = tabs[next];
+    switchTab(target.dataset.tab, target);
+    target.focus();
+});
+
 // ====== WIZARD ======
 function goStep(n) {
+    const target = document.getElementById('step-' + n);
+    if (!target) return;
     document.querySelectorAll('.wizard-step').forEach(s => s.style.display = 'none');
-    document.getElementById('step-' + n).style.display = 'block';
+    target.style.display = 'block';
     state.currentStep = n;
     document.querySelectorAll('.step-indicator').forEach(s => {
         const sn = parseInt(s.dataset.step);
         s.classList.remove('active', 'done');
-        if (sn === n) s.classList.add('active');
-        else if (sn < n) s.classList.add('done');
+        s.removeAttribute('aria-current');
+        if (sn === n) {
+            s.classList.add('active');
+            s.setAttribute('aria-current', 'step');
+        } else if (sn < n) {
+            s.classList.add('done');
+        }
     });
+    const heading = target.querySelector('h2');
+    if (heading) {
+        heading.setAttribute('tabindex', '-1');
+        heading.focus({preventScroll: true});
+    }
 }
 
 function selectTier(tier) {
     state.tier = tier;
+    state.model = null;
+    state.preset = null;
     document.querySelectorAll('#tier-grid .option-card').forEach(c => {
-        c.classList.toggle('selected', c.dataset.tier === tier);
+        const selected = c.dataset.tier === tier;
+        c.classList.toggle('selected', selected);
+        c.setAttribute('aria-pressed', String(selected));
     });
+    document.getElementById('custom-model').value = '';
     document.getElementById('btn-step1-next').disabled = false;
+    document.getElementById('btn-step2-next').disabled = true;
+    document.getElementById('btn-step3-next').disabled = true;
     renderModelGrid();
     renderPresetGrid();
 }
@@ -1677,18 +1909,21 @@ function renderModelGrid() {
                   ['tiny','small','medium','large','frontier'];
     const models = MODEL_PRESETS.filter(m => tiers.includes(m.tier));
     grid.innerHTML = models.map(m => `
-        <div class="option-card" data-hfid="${m.hf_id}" onclick="selectModel('${m.hf_id}')">
-            <h4>${m.name}</h4>
-            <div class="meta"><span class="tier-badge tier-${m.tier}">${m.tier}</span> ${m.params} params</div>
-            <div class="desc">${m.desc}</div>
-        </div>
+        <button type="button" class="option-card" data-hfid="${m.hf_id}" aria-pressed="false" onclick="selectModel('${m.hf_id}')">
+            <span class="option-title">${m.name}</span>
+            <span class="meta"><span class="tier-badge tier-${m.tier}">${m.tier}</span> ${m.params} params</span>
+            <span class="desc">${m.desc}</span>
+            ${m.quant ? `<span class="meta" style="margin-top:6px; color:var(--yellow)">${m.quant} registry hint; Study Builder runs dense</span>` : ''}
+        </button>
     `).join('');
 }
 
 function selectModel(hfId) {
     state.model = MODEL_PRESETS.find(m => m.hf_id === hfId) || {hf_id: hfId, name: hfId, dtype:'float16', quant:null};
     document.querySelectorAll('#model-grid .option-card').forEach(c => {
-        c.classList.toggle('selected', c.dataset.hfid === hfId);
+        const selected = c.dataset.hfid === hfId;
+        c.classList.toggle('selected', selected);
+        c.setAttribute('aria-pressed', String(selected));
     });
     document.getElementById('custom-model').value = '';
     document.getElementById('btn-step2-next').disabled = false;
@@ -1696,10 +1931,16 @@ function selectModel(hfId) {
 
 function selectCustomModel() {
     const val = document.getElementById('custom-model').value.trim();
+    document.querySelectorAll('#model-grid .option-card').forEach(c => {
+        c.classList.remove('selected');
+        c.setAttribute('aria-pressed', 'false');
+    });
     if (val) {
-        state.model = {hf_id: val, name: val, dtype:'float16', quant:null, tier: state.tier};
-        document.querySelectorAll('#model-grid .option-card').forEach(c => c.classList.remove('selected'));
+        state.model = {hf_id: val, name: val, dtype:'float16', quant:null, tier: state.tier, custom:true};
         document.getElementById('btn-step2-next').disabled = false;
+    } else {
+        state.model = null;
+        document.getElementById('btn-step2-next').disabled = true;
     }
 }
 
@@ -1708,21 +1949,59 @@ function renderPresetGrid() {
     const grid = document.getElementById('preset-grid');
     const hotKeys = ['jailbreak','guardrail'];
     grid.innerHTML = PRESETS.map(p => `
-        <div class="option-card${hotKeys.includes(p.key) ? ' preset-tag-guardrail' : ''}" data-preset="${p.key}" onclick="selectPreset('${p.key}')">
-            <h4>${hotKeys.includes(p.key) ? '\u26A0 ' : ''}${p.name}</h4>
-            <div class="meta">${p.key === 'custom' ? 'manual setup' : p.strategies.join(', ')}</div>
-            <div class="desc">${p.desc}</div>
-            ${p.key !== 'custom' ? `<div class="meta" style="margin-top:4px">${p.samples} samples | batch ${p.batch} | ${p.maxLen} tokens</div>` : ''}
-        </div>
+        <button type="button" class="option-card" data-preset="${p.key}" aria-pressed="false" onclick="selectPreset('${p.key}')">
+            <span class="preset-kicker${hotKeys.includes(p.key) ? ' safety' : ''}">${p.key === 'custom' ? 'Manual study' : hotKeys.includes(p.key) ? 'Safety research study' : 'Diagnostic study'}</span>
+            <span class="option-title">${p.name}</span>
+            <span class="meta">${p.key === 'custom' ? 'manual setup' : p.strategies.join(', ')}</span>
+            <span class="desc">${p.desc}</span>
+            ${p.key !== 'custom' ? `<span class="meta" style="margin-top:4px">${p.samples} samples | batch ${p.batch} | ${p.maxLen} tokens</span>` : ''}
+        </button>
     `).join('');
 }
 
 function selectPreset(key) {
     state.preset = PRESETS.find(p => p.key === key);
+    if (!state.preset) return;
     document.querySelectorAll('#preset-grid .option-card').forEach(c => {
-        c.classList.toggle('selected', c.dataset.preset === key);
+        const selected = c.dataset.preset === key;
+        c.classList.toggle('selected', selected);
+        c.setAttribute('aria-pressed', String(selected));
     });
     document.getElementById('btn-step3-next').disabled = false;
+}
+
+function syncStrategyControls() {
+    document.querySelectorAll('#strategy-grid .check-item').forEach(control => {
+        const selected = state.strategies.includes(control.dataset.strategy);
+        control.classList.toggle('checked', selected);
+        control.setAttribute('aria-pressed', String(selected));
+    });
+}
+
+function setSelectValue(id, value) {
+    const select = document.getElementById(id);
+    if (select) select.value = String(value);
+}
+
+function updateStudySummary() {
+    const summary = document.getElementById('study-summary');
+    if (!summary || !state.preset) return;
+    const depth = document.getElementById('eval-depth').value;
+    const batch = document.getElementById('batch-size').value;
+    const maxLen = document.getElementById('max-length').value;
+    const dataset = document.getElementById('dataset-select').selectedOptions[0].textContent;
+    const strategies = state.strategies.length ? state.strategies.join(', ') : 'none selected';
+    const memoryNote = state.model?.quant ? ` | memory note: ${state.model.quant} registry hint is not applied to Study YAML` : '';
+    summary.textContent = `${state.preset.name} | ${strategies} | ${depth} samples | batch ${batch} | ${maxLen} tokens | ${dataset}${memoryNote}`;
+}
+
+function updateStudyValidation() {
+    const invalid = state.preset?.key === 'custom' && state.strategies.length === 0;
+    const error = document.getElementById('study-error');
+    const button = document.getElementById('btn-generate-config');
+    if (error) error.hidden = !invalid;
+    if (button) button.disabled = invalid;
+    return !invalid;
 }
 
 function onPresetNext() {
@@ -1730,9 +2009,15 @@ function onPresetNext() {
     if (!p) return;
 
     if (p.key === 'custom') {
-        // Show custom strategy picker, reset settings to defaults
+        // Show custom strategy picker and reset both visible and stored defaults.
         document.getElementById('custom-strategy-card').style.display = 'block';
         document.getElementById('settings-subtitle').textContent = 'Configure strategies and evaluation settings.';
+        state.strategies = [...DEFAULT_STUDY_STRATEGIES];
+        setSelectValue('eval-depth', p.samples);
+        setSelectValue('batch-size', p.batch);
+        setSelectValue('max-length', p.maxLen);
+        setSelectValue('dataset-select', 'wikitext');
+        syncStrategyControls();
     } else {
         // Hide custom strategies, pre-fill settings from preset
         document.getElementById('custom-strategy-card').style.display = 'none';
@@ -1740,32 +2025,37 @@ function onPresetNext() {
             `Preset "${p.name}" defaults shown. Override any setting below.`;
         state.strategies = [...p.strategies];
 
-        // Set dropdowns to preset values
-        const depthSel = document.getElementById('eval-depth');
-        for (const opt of depthSel.options) {
-            if (parseInt(opt.value) === p.samples) { opt.selected = true; break; }
-        }
-        const batchSel = document.getElementById('batch-size');
-        for (const opt of batchSel.options) {
-            if (parseInt(opt.value) === p.batch) { opt.selected = true; break; }
-        }
-        const lenSel = document.getElementById('max-length');
-        for (const opt of lenSel.options) {
-            if (parseInt(opt.value) === p.maxLen) { opt.selected = true; break; }
-        }
+        setSelectValue('eval-depth', p.samples);
+        setSelectValue('batch-size', p.batch);
+        setSelectValue('max-length', p.maxLen);
+        setSelectValue('dataset-select', 'wikitext');
     }
+    updateStudySummary();
+    updateStudyValidation();
     goStep(4);
 }
 
 function toggleStrategy(el) {
     el.classList.toggle('checked');
+    el.setAttribute('aria-pressed', String(el.classList.contains('checked')));
     state.strategies = [];
     document.querySelectorAll('#strategy-grid .check-item.checked').forEach(c => {
         state.strategies.push(c.dataset.strategy);
     });
+    updateStudySummary();
+    updateStudyValidation();
+}
+
+function yamlString(value) {
+    return JSON.stringify(String(value));
+}
+
+function safePathSegment(value) {
+    return String(value).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'model';
 }
 
 function generateConfig() {
+    if (!state.model || !state.preset || !updateStudyValidation()) return;
     const depth = document.getElementById('eval-depth').value;
     const batch = document.getElementById('batch-size').value;
     const maxLen = document.getElementById('max-length').value;
@@ -1791,11 +2081,16 @@ function generateConfig() {
         yaml += `preset: ${presetKey}\n\n`;
     }
     yaml += `model:\n`;
-    yaml += `  name: ${state.model.hf_id}\n`;
+    yaml += `  name: ${yamlString(state.model.hf_id)}\n`;
     yaml += `  task: causal_lm\n`;
     yaml += `  dtype: ${dtype}\n`;
     yaml += `  device: ${device}\n`;
-    yaml += `  trust_remote_code: true\n\n`;
+    yaml += `  # Enable only after auditing the model repository code.\n`;
+    yaml += `  trust_remote_code: false\n\n`;
+    if (state.model.quant) {
+        yaml += `# Memory note: registry suggests ${state.model.quant}, but StudyConfig has no\n`;
+        yaml += `# quantization field. This config loads the dense dtype above.\n\n`;
+    }
     yaml += `dataset:\n`;
     yaml += `  name: ${dsInfo.name}\n`;
     if (dsInfo.subset) yaml += `  subset: ${dsInfo.subset}\n`;
@@ -1815,19 +2110,47 @@ function generateConfig() {
     yaml += `metrics:\n  - perplexity\n\n`;
     yaml += `batch_size: ${batch}\n`;
     yaml += `max_length: ${maxLen}\n`;
-    yaml += `output_dir: results/${state.model.hf_id.replace(/\//g, '_')}\n`;
+    yaml += `output_dir: results/${safePathSegment(state.model.hf_id)}\n`;
 
     document.getElementById('yaml-output').textContent = yaml;
+    const memoryNote = state.model.quant ? ` Registry hint: ${state.model.quant}; generated Study YAML remains dense.` : '';
+    document.getElementById('run-summary').textContent =
+        `${state.preset.name} diagnostic study for ${state.model.hf_id} | ${depth} samples | batch ${batch} | ${maxLen} tokens. Output is an analysis report, not an edited checkpoint.${memoryNote}`;
     goStep(5);
 }
 
-function copyYaml() {
+async function copyTextWithFallback(text) {
+    if (navigator.clipboard?.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return;
+        } catch (_) {
+            // file:// pages may deny Clipboard API access; use a local fallback.
+        }
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = typeof document.execCommand === 'function' && document.execCommand('copy');
+    textarea.remove();
+    if (!copied) throw new Error('Clipboard access is unavailable');
+}
+
+async function copyYaml(button) {
     const text = document.getElementById('yaml-output').textContent;
-    navigator.clipboard.writeText(text).then(() => {
-        const btn = event.target;
-        btn.textContent = '[ COPIED ]';
-        setTimeout(() => btn.textContent = 'COPY', 2000);
-    });
+    const original = button.textContent;
+    try {
+        await copyTextWithFallback(text);
+        button.textContent = '[ COPIED ]';
+    } catch (_) {
+        button.textContent = '[ COPY FAILED ]';
+    } finally {
+        setTimeout(() => button.textContent = original, 2000);
+    }
 }
 
 function downloadYaml() {
@@ -1842,79 +2165,164 @@ function downloadYaml() {
 }
 
 // ====== RESULTS ======
-function loadResults(event) {
-    const file = event.target.files[0];
-    if (!file) return;
+function readResultsFile(file, onDone = () => {}) {
+    if (file.size > 10 * 1024 * 1024) {
+        alert('Results file is too large (10 MB maximum).');
+        onDone();
+        return;
+    }
     const reader = new FileReader();
     reader.onload = (e) => {
         try {
             const data = JSON.parse(e.target.result);
             renderResults(data);
         } catch (err) {
-            alert('Invalid JSON file: ' + err.message);
+            alert('Could not load results: ' + err.message);
+        } finally {
+            onDone();
         }
+    };
+    reader.onerror = () => {
+        alert('Could not read the selected results file.');
+        onDone();
     };
     reader.readAsText(file);
 }
 
+function loadResults(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    readResultsFile(file, () => { event.target.value = ''; });
+}
+
 function loadDemoResults() { renderResults(DEMO_RESULTS); }
 
-function renderResults(data) {
-    document.getElementById('results-display').style.display = 'block';
+function validateResultsData(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('top-level value must be an object');
+    }
     const baseline = data.baseline_metrics;
-    const metricName = Object.keys(baseline)[0];
+    if (!baseline || typeof baseline !== 'object' || Array.isArray(baseline)) {
+        throw new Error('baseline_metrics must be an object');
+    }
+    const metricNames = Object.keys(baseline);
+    if (!metricNames.length || metricNames[0].length > 120) {
+        throw new Error('baseline_metrics must contain a named metric');
+    }
+    const metricName = metricNames[0];
     const baseVal = baseline[metricName];
+    if (typeof baseVal !== 'number' || !Number.isFinite(baseVal)) {
+        throw new Error(`baseline metric ${metricName} must be a finite number`);
+    }
+    if (!Array.isArray(data.results) || !data.results.length) {
+        throw new Error('results must be a non-empty array');
+    }
+    if (data.results.length > 10000) {
+        throw new Error('results exceeds the 10,000-row display limit');
+    }
+    const results = data.results.map((result, index) => {
+        if (!result || typeof result !== 'object' || Array.isArray(result)) {
+            throw new Error(`results[${index}] must be an object`);
+        }
+        for (const field of ['strategy', 'component']) {
+            if (typeof result[field] !== 'string' || !result[field].trim() || result[field].length > 200) {
+                throw new Error(`results[${index}].${field} must be a short non-empty string`);
+            }
+        }
+        const value = result.metrics?.[metricName];
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+            throw new Error(`results[${index}].metrics.${metricName} must be a finite number`);
+        }
+        return {strategy: result.strategy, component: result.component, value};
+    });
+    return {metricName, baseVal, results};
+}
 
-    // Stats
+function makeElement(tag, className = '', text = '') {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    element.textContent = text;
+    return element;
+}
+
+function appendCell(row, tag, text, className = '') {
+    const cell = makeElement(tag, className, text);
+    row.appendChild(cell);
+    return cell;
+}
+
+function renderResults(data) {
+    const {metricName, baseVal, results} = validateResultsData(data);
+    const sorted = [...results].sort((a, b) => (b.value - baseVal) - (a.value - baseVal));
+    const worstResult = sorted[0];
+    const bestResult = sorted[sorted.length - 1];
+
     const statsGrid = document.getElementById('stats-grid');
-    const worstResult = data.results.reduce((a,b) => (b.metrics[metricName] > a.metrics[metricName] ? b : a), data.results[0]);
-    const bestResult = data.results.reduce((a,b) => (b.metrics[metricName] < a.metrics[metricName] ? b : a), data.results[0]);
+    statsGrid.replaceChildren();
+    const addStat = (value, label, color = '') => {
+        const card = makeElement('div', 'stat-card');
+        const valueEl = makeElement('div', 'value', value);
+        if (color) valueEl.style.color = color;
+        card.append(valueEl, makeElement('div', 'label', label));
+        statsGrid.appendChild(card);
+    };
+    addStat(baseVal.toFixed(2), `Baseline ${metricName}`);
+    addStat(String(results.length), 'Ablations tested');
+    addStat(worstResult.value.toFixed(2), `Worst (${worstResult.component})`, 'var(--red)');
+    addStat(bestResult.value.toFixed(2), `Best (${bestResult.component})`, 'var(--accent)');
 
-    statsGrid.innerHTML = `
-        <div class="stat-card"><div class="value">${baseVal.toFixed(2)}</div><div class="label">Baseline ${metricName}</div></div>
-        <div class="stat-card"><div class="value">${data.results.length}</div><div class="label">Ablations tested</div></div>
-        <div class="stat-card"><div class="value" style="color:var(--red)">${worstResult.metrics[metricName].toFixed(2)}</div><div class="label">Worst (${worstResult.component})</div></div>
-        <div class="stat-card"><div class="value" style="color:var(--accent)">${bestResult.metrics[metricName].toFixed(2)}</div><div class="label">Best (${bestResult.component})</div></div>
-    `;
-
-    // Chart
     const chartEl = document.getElementById('impact-chart');
-    const sorted = [...data.results].sort((a,b) => (b.metrics[metricName] - baseVal) - (a.metrics[metricName] - baseVal));
-    const maxDelta = Math.max(...sorted.map(r => Math.abs(r.metrics[metricName] - baseVal)), 1);
-
-    chartEl.innerHTML = '<div class="bar-chart">' + sorted.map(r => {
-        const delta = r.metrics[metricName] - baseVal;
+    chartEl.replaceChildren();
+    const chart = makeElement('div', 'bar-chart');
+    const maxDelta = Math.max(...sorted.map(result => Math.abs(result.value - baseVal)), 1);
+    sorted.forEach(result => {
+        const delta = result.value - baseVal;
         const pct = Math.min(Math.abs(delta) / maxDelta * 80, 95);
         const cls = delta >= 0 ? 'positive' : 'negative';
-        return `<div class="bar-row">
-            <div class="bar-label" title="${r.component}">${r.component}</div>
-            <div class="bar-track">
-                <div class="bar-fill ${cls}" style="width:${Math.max(pct, 8)}%">${delta >= 0 ? '+' : ''}${delta.toFixed(2)}</div>
-            </div>
-        </div>`;
-    }).join('') + '</div>';
+        const row = makeElement('div', 'bar-row');
+        const label = makeElement('div', 'bar-label', result.component);
+        label.title = result.component;
+        const track = makeElement('div', 'bar-track');
+        const fill = makeElement('div', `bar-fill ${cls}`, `${delta >= 0 ? '+' : ''}${delta.toFixed(2)}`);
+        fill.style.width = `${Math.max(pct, 8)}%`;
+        track.appendChild(fill);
+        row.append(label, track);
+        chart.appendChild(row);
+    });
+    chartEl.appendChild(chart);
 
-    // Table
     const tableEl = document.getElementById('results-table');
-    let html = `<table class="data-table"><thead><tr>
-        <th>Strategy</th><th>Component</th><th>${metricName}</th><th>Delta</th><th>% Change</th>
-    </tr></thead><tbody>`;
-    html += `<tr style="font-weight:600"><td>baseline</td><td>&mdash;</td><td>${baseVal.toFixed(4)}</td><td>&mdash;</td><td>&mdash;</td></tr>`;
-    sorted.forEach(r => {
-        const val = r.metrics[metricName];
+    tableEl.replaceChildren();
+    const table = makeElement('table', 'data-table');
+    const thead = document.createElement('thead');
+    const header = document.createElement('tr');
+    for (const label of ['Strategy', 'Component', metricName, 'Delta', '% Change']) {
+        appendCell(header, 'th', label);
+    }
+    thead.appendChild(header);
+    const tbody = document.createElement('tbody');
+    const baselineRow = document.createElement('tr');
+    baselineRow.style.fontWeight = '600';
+    for (const value of ['baseline', '\u2014', baseVal.toFixed(4), '\u2014', '\u2014']) {
+        appendCell(baselineRow, 'td', value);
+    }
+    tbody.appendChild(baselineRow);
+    sorted.forEach(result => {
+        const val = result.value;
         const delta = val - baseVal;
         const pct = baseVal !== 0 ? ((delta / baseVal) * 100) : 0;
         const cls = delta > 0 ? 'delta-positive' : 'delta-negative';
-        html += `<tr>
-            <td>${r.strategy}</td>
-            <td>${r.component}</td>
-            <td>${val.toFixed(4)}</td>
-            <td class="${cls}">${delta >= 0 ? '+' : ''}${delta.toFixed(4)}</td>
-            <td class="${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%</td>
-        </tr>`;
+        const row = document.createElement('tr');
+        appendCell(row, 'td', result.strategy);
+        appendCell(row, 'td', result.component);
+        appendCell(row, 'td', val.toFixed(4));
+        appendCell(row, 'td', `${delta >= 0 ? '+' : ''}${delta.toFixed(4)}`, cls);
+        appendCell(row, 'td', `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`, cls);
+        tbody.appendChild(row);
     });
-    html += '</tbody></table>';
-    tableEl.innerHTML = html;
+    table.append(thead, tbody);
+    tableEl.appendChild(table);
+    document.getElementById('results-display').style.display = 'block';
 }
 
 // ====== MODELS TABLE ======
@@ -1967,17 +2375,15 @@ function updateAblCustom() {
     if (val) {
         ablSelectedModel = val;
         document.getElementById('abl-model-select').value = '';
+    } else {
+        ablSelectedModel = document.getElementById('abl-model-select').value;
     }
     updateCmdDisplay();
 }
 
 function startAbliterateFromLibrary(hfId) {
     ablSelectedModel = hfId;
-    // Switch to abliterate tab
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab').forEach(t => { if (t.textContent.includes('OBLITERATE')) t.classList.add('active'); });
-    document.getElementById('tab-abliterate').classList.add('active');
+    switchTab('abliterate');
     // Set the model selector
     document.getElementById('abl-model-select').value = hfId;
     document.getElementById('abl-custom-model').value = '';
@@ -1987,128 +2393,130 @@ function startAbliterateFromLibrary(hfId) {
 let ablMethod = 'advanced';
 const METHOD_INFO = {
     basic:            {dirs:1,  norm:false, reg:0.0, passes:1, desc:'1 direction &bull; standard projection &bull; 1 pass'},
-    advanced:         {dirs:4,  norm:true,  reg:0.3, passes:2, desc:'4 SVD directions &bull; norm-preserving &bull; 30% regularization &bull; 2 refinement passes'},
-    aggressive:       {dirs:8,  norm:true,  reg:0.0, passes:3, desc:'8 SVD directions &bull; norm-preserving &bull; full orthogonalization &bull; 3 refinement passes'},
-    spectral_cascade: {dirs:6,  norm:true,  reg:0.15, passes:1, desc:'6 whitened-SVD directions &bull; DCT frequency decomposition &bull; coherence-weighted &bull; adaptive bands'},
-    informed:         {dirs:'auto', norm:true, reg:'auto', passes:'auto', desc:'<span style="color:var(--cyan)">Analysis-guided</span> &bull; auto directions &bull; auto regularization &bull; Ouroboros-compensated &bull; cone/alignment/cluster analysis'},
-    surgical:         {dirs:4,  norm:true,  reg:0.2, passes:2, desc:'4 SVD directions &bull; attention head surgery &bull; SAE features &bull; safety neuron masking &bull; per-expert MoE'},
-    optimized:        {dirs:4,  norm:true,  reg:0.2, passes:2, desc:'4 SVD directions &bull; Bayesian auto-tuned &bull; CoT-aware &bull; KL co-optimized &bull; winsorized activations'},
-    inverted:         {dirs:4,  norm:true,  reg:0.1, passes:2, desc:'4 SVD directions &bull; semantic inversion (2x reflection) &bull; SAE feature targeting'},
-    nuclear:          {dirs:8,  norm:true,  reg:0.0, passes:3, desc:'8 SVD directions &bull; all techniques combined &bull; maximum force &bull; head surgery + SAE + steering + transplant'},
+    advanced:         {dirs:4,  norm:true,  reg:0.3, passes:2, desc:'4 SVD directions &bull; per-logical-row norm restore &bull; 30% preserved component &bull; 2 passes'},
+    aggressive:       {dirs:8,  norm:true,  reg:0.0, passes:3, desc:'8 paired-SVD directions &bull; jailbreak contrast &bull; adaptive strength &bull; 3 passes'},
+    spectral_cascade: {dirs:6,  norm:true,  reg:0.0, passes:2, desc:'6 paired-SVD directions &bull; DCT frequency decomposition &bull; adaptive bands &bull; 2 passes'},
+    informed:         {dirs:1, norm:true, reg:0.0, passes:2, desc:'<span style="color:var(--cyan)">Analysis-guided</span> &bull; one diff-means direction &bull; cluster/robustness analysis &bull; category dispersion is report-only'},
+    surgical:         {dirs:8,  norm:true,  reg:0.0, passes:2, desc:'8 SVD directions &bull; attention head surgery &bull; SAE features &bull; safety neuron masking &bull; per-expert MoE'},
+    inverted:         {dirs:8,  norm:true,  reg:0.0, passes:2, desc:'8 SVD directions &bull; semantic inversion (2x reflection) &bull; SAE feature targeting'},
+    nuclear:          {dirs:4,  norm:true,  reg:0.0, passes:2, desc:'4 SVD directions &bull; tempered reflection &bull; head surgery + SAE + conservative transplant &bull; runtime steering off'},
     failspy:          {dirs:1,  norm:false, reg:0.0, passes:1, desc:'<span style="color:var(--text-dim)">Baseline</span> &bull; 1 diff-means direction &bull; all layers except first &bull; FailSpy/abliterator reproduction'},
-    gabliteration:    {dirs:4,  norm:false, reg:0.231, passes:1, desc:'<span style="color:var(--text-dim)">Baseline</span> &bull; 4 SVD directions &bull; ridge reg (alpha=0.3) &bull; top-k layer selection &bull; G&uuml;lmez 2026'},
-    heretic:          {dirs:1,  norm:false, reg:0.0, passes:1, desc:'<span style="color:var(--text-dim)">Baseline</span> &bull; 1 diff-means &bull; Bayesian (Optuna TPE) &bull; KL-optimized &bull; float layer interpolation &bull; p-e-w'},
-    rdo:              {dirs:4,  norm:true,  reg:0.0, passes:1, desc:'<span style="color:var(--text-dim)">Baseline</span> &bull; 4 SVD directions &bull; gradient-refined (RDO) &bull; linear probe classifier &bull; Wollschlager ICML 2025'},
+    gabliteration:    {dirs:2,  norm:false, reg:0.7272727273, passes:1, desc:'2 shuffled-pair SVD directions &bull; source-layer behavioral trials &bull; separate alpha 0.3 and ridge 0.1 &bull; hash-verified exact replay'},
+    rdo:              {dirs:1,  norm:true,  reg:0.0, passes:1, desc:'1 model-forward trained direction &bull; generated harmful/harmless CE targets &bull; retain-sequence KL &bull; persistent checkpoint projection adaptation'},
+    som:              {dirs:5,  norm:false, reg:0.0, passes:1, desc:'4x4 hexagonal SOM &bull; 10,000 updates &bull; ordered five-of-16 Optuna TPE search &bull; HarmBench judge &bull; exact replay'},
+    optimized:        {dirs:4,  norm:true,  reg:0.0, passes:1, desc:'Exact model-forward TPE &bull; per-layer adjacent-SVD interpolation &bull; separate attention/FFN kernels &bull; disjoint hash-verified replay'},
+    heretic:          {dirs:1,  norm:true,  reg:0.0, passes:1, desc:'Heretic-style dense baseline &bull; cross-layer diff-means interpolation &bull; separate attention/MLP kernels &bull; exact replay &bull; not the optional LoRA path'},
+    som_proxy:        {dirs:3,  norm:true,  reg:0.35, passes:1, desc:'3 local SOM activation directions &bull; geometric proxy only &bull; no paper TPE subset search or HarmBench judge'},
 };
 
+function shellQuote(value) {
+    return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+}
+
 function getAblCmd() {
-    const model = ablSelectedModel || 'meta-llama/Llama-3.1-8B-Instruct';
-    return `obliteratus obliterate ${model} --method ${ablMethod}`;
+    if (!ablSelectedModel) return '';
+    const modelInfo = MODEL_PRESETS.find(model => model.hf_id === ablSelectedModel);
+    // Exact model-forward training/search needs dense writable weights and a
+    // complete snapshot.  A model card's convenience quantization hint must
+    // never be copied into an incompatible named-method command.
+    const denseMethods = new Set(['gabliteration', 'rdo', 'som', 'optimized', 'heretic']);
+    const quantization = modelInfo?.quant && !denseMethods.has(ablMethod)
+        ? ` --quantization ${modelInfo.quant}`
+        : '';
+    return `obliteratus obliterate ${shellQuote(ablSelectedModel)} --method ${ablMethod}${quantization}`;
 }
 
 function updateCmdDisplay() {
     const el = document.getElementById('abl-cmd-text');
-    if (el) el.textContent = getAblCmd();
+    const button = document.getElementById('abl-cmd-display');
+    const badge = document.getElementById('abl-copy-badge');
+    const cmd = getAblCmd();
+    if (!el || !button || !badge) return;
+    el.textContent = cmd || 'Select or paste a target model above to generate the CLI command.';
+    button.disabled = !cmd;
+    button.title = cmd ? 'Click to copy' : 'Select a model first';
+    badge.textContent = cmd ? 'CLICK TO COPY' : 'SELECT MODEL';
 }
 
 function setAblMethod(m) {
+    if (!Object.prototype.hasOwnProperty.call(METHOD_INFO, m)) return;
     ablMethod = m;
-    document.querySelectorAll('.method-radio').forEach(el => el.classList.remove('selected'));
-    document.getElementById('method-' + m).classList.add('selected');
+    document.querySelectorAll('.method-radio').forEach(el => {
+        const selected = el.id === 'method-' + m;
+        el.classList.toggle('selected', selected);
+        const radio = el.querySelector('input[type="radio"]');
+        if (radio) radio.checked = selected;
+    });
     document.getElementById('method-details').innerHTML = METHOD_INFO[m].desc;
     updateCmdDisplay();
 }
 
-function copyAblCmd() {
+async function copyAblCmd() {
     const cmd = getAblCmd();
-    navigator.clipboard.writeText(cmd).then(() => {
-        const badge = document.getElementById('abl-copy-badge');
-        if (badge) {
-            badge.textContent = '[ COPIED ]';
-            badge.style.color = 'var(--purple)';
-            badge.style.borderColor = 'var(--purple)';
-            setTimeout(() => {
-                badge.textContent = 'CLICK TO COPY';
-                badge.style.color = 'var(--text-dim)';
-                badge.style.borderColor = 'var(--border)';
-            }, 2000);
-        }
-    });
+    if (!cmd) return;
+    const badge = document.getElementById('abl-copy-badge');
+    if (!badge) return;
+    try {
+        await copyTextWithFallback(cmd);
+        badge.textContent = '[ COPIED ]';
+        badge.style.color = 'var(--purple)';
+        badge.style.borderColor = 'var(--purple)';
+    } catch (_) {
+        badge.textContent = '[ COPY FAILED ]';
+        badge.style.color = 'var(--red)';
+        badge.style.borderColor = 'var(--red)';
+    } finally {
+        setTimeout(() => {
+            const available = Boolean(getAblCmd());
+            badge.textContent = available ? 'CLICK TO COPY' : 'SELECT MODEL';
+            badge.style.color = 'var(--text-dim)';
+            badge.style.borderColor = 'var(--border)';
+        }, 2000);
+    }
 }
 
-// Simulation with realistic-looking demo
+// Illustrative only: this preview never loads or edits a model.
 const SIM_STAGES = [
-    {key:'summon',  dur:3000, logs:[
-        '> Loading meta-llama/Llama-3.1-8B-Instruct...',
-        '> Device: auto | Dtype: float16',
-        '> Method: Advanced (Multi-direction + Norm-preserving)',
-        '>   Directions: 4 | Norm-preserve: True',
-        '>   Regularization: 0.3 | Refinement passes: 2',
-        '> Model loaded in 12.4s',
-        '> Architecture: llama | Layers: 32 | Heads: 32 | Hidden: 4096',
-        '> Total parameters: 8,030,261,248',
+    {key:'summon', dur:1600, logs:[
+        '> Resolving selected checkpoint...',
+        '> Preset: {method} | directions: {directions} | configured passes: {passes}',
+        '> Norm restoration: {norm} | configured regularization: {regularization}',
+        '> Validating architecture, storage, dtype, and gate prerequisites...',
+        '> Capturing rollback snapshot before any candidate edit...',
     ]},
-    {key:'probe',   dur:5000, logs:[
-        '> Prompt pairs: 32 harmful + 32 harmless',
-        '> Running 32 harmful prompts...',
-        '>   [harmful] prompt 1/32','>   [harmful] prompt 8/32','>   [harmful] prompt 16/32',
-        '>   [harmful] prompt 24/32','>   [harmful] prompt 32/32',
-        '> Running 32 harmless prompts...',
-        '>   [harmless] prompt 1/32','>   [harmless] prompt 16/32','>   [harmless] prompt 32/32',
-        '> Activation collection complete (42.7s)',
+    {key:'probe', dur:1600, logs:[
+        '> Resolving the model chat template...',
+        '> Verifying duplicate-disjoint discovery and holdout prompts...',
+        '> Collecting restricted and unrestricted activation pairs...',
+        '> Capturing untouched confirmation baselines...',
+        '> Activation collection complete.',
     ]},
-    {key:'distill', dur:2500, logs:[
-        '>   layer   0: top-4 SVs explain 67.3% of refusal variance',
-        '>   layer   1: top-4 SVs explain 71.2% of refusal variance',
-        '>   layer   2: top-4 SVs explain 64.8% of refusal variance',
-        '>   layer   3: top-4 SVs explain 69.1% of refusal variance',
-        '> Refusal subspace strength by layer:',
-        '>   layer  14: 18.2341 ████████████████████',
-        '>   layer  15: 16.9102 ██████████████████',
-        '>   layer  13: 15.4877 █████████████████',
-        '>   layer  16: 14.3011 ████████████████',
-        '>   layer  12: 12.8823 ██████████████',
-        '>   layer  17: 11.6456 █████████████',
-        '>   layer  11:  9.3209 ██████████',
-        '>   layer  18:  8.8112 █████████',
-        '> Selected 10 layers via knee detection (threshold=8.8112)',
-        '> Strong refusal layers: [10,11,12,13,14,15,16,17,18,19]',
+    {key:'distill', dur:1600, logs:[
+        '> Extracting refusal geometry with the selected preset...',
+        '> Measuring per-layer signal strength on discovery activations...',
+        '> Selecting target layers without consuming confirmation evidence...',
+        '> Recording direction and target hashes in the projection manifest...',
+        '> Candidate manifest ready.',
     ]},
-    {key:'excise',  dur:4000, logs:[
-        '> Refinement pass 1/2',
-        '>   layer 10: 8 projections (4 directions)',
-        '>   layer 11: 8 projections (4 directions)',
-        '>   layer 12: 8 projections (4 directions)',
-        '>   layer 13: 8 projections (4 directions)',
-        '>   layer 14: 8 projections (4 directions)',
-        '>   layer 15: 8 projections (4 directions)',
-        '>   Pass 1: modified 80 weight matrices',
-        '> Refinement pass 2/2',
-        '>   layer 10: 8 projections (4 directions)',
-        '>   layer 14: 8 projections (4 directions)',
-        '>   Pass 2: modified 80 weight matrices',
-        '> Excised refusal from 160 matrices [norm-preserving + regularized(30%) + 2 passes] (3.8s)',
+    {key:'excise', dur:1600, logs:[
+        '> Restoring the pristine snapshot before candidate application...',
+        '> Applying the exact manifest to its recorded logical tensors...',
+        '> Restoring logical-row norms where requested...',
+        '> Checking every edited tensor for finite values...',
+        '> Candidate edit complete; checkpoint export remains locked.',
     ]},
-    {key:'verify',  dur:3500, logs:[
-        '> Measuring perplexity on reference texts...',
-        '>   Perplexity: 8.42',
-        '> Generating test completions:',
-        '>   "The capital of France is" -> Paris, the largest city in France.',
-        '>   "In machine learning, a neural network" -> is a computational model inspired by biological neurons.',
-        '>   "The meaning of life is" -> a philosophical question that has been debated for centuries.',
-        '>   "Water boils at a temperature of" -> 100 degrees Celsius at sea level.',
-        '>   "The Pythagorean theorem states that" -> the square of the hypotenuse equals the sum.',
-        '>   Coherence: 100% (5/5 prompts)',
-        '> Quality check: PPL=8.4, coherence=100% (3.2s)',
+    {key:'verify', dur:1800, logs:[
+        '> Measuring held-out benign NLL and sampled-token KL...',
+        '> Checking p95 KL, top-1 stability, finite outputs, and generation health...',
+        '> Measuring refusal efficacy on confirmation prompts...',
+        '> Applying optional reasoning/answer CE limits when configured...',
+        '> Illustrative result: gate ACCEPTED. Real runs may reject and roll back.',
     ]},
-    {key:'rebirth', dur:2000, logs:[
-        '> Saving model to obliterated/meta-llama_Llama-3.1-8B-Instruct/',
-        '> Saved (8.7s)',
-        '> Output: obliterated/meta-llama_Llama-3.1-8B-Instruct',
-        '',
-        '> ═══════════════════════════════════════════',
-        '> ✓ ABLITERATION COMPLETE — MODEL LIBERATED',
-        '> ═══════════════════════════════════════════',
+    {key:'rebirth', dur:1200, logs:[
+        '> Replaying the accepted manifest once from the pristine snapshot...',
+        '> Verifying winner hashes and attaching gate metadata...',
+        '> Export is allowed only after the real confirmation gate accepts.',
+        '> SIMULATION COMPLETE — no model was loaded or modified.',
     ]},
 ];
 
@@ -2126,8 +2534,13 @@ async function simulatePipeline() {
     // Reset
     stages.forEach(s => s.classList.remove('active','done'));
     connectors.forEach(c => c.classList.remove('active'));
-    const modelName = ablSelectedModel || 'meta-llama/Llama-3.1-8B-Instruct';
-    logEl.innerHTML = `<div class="log-line stage-line">[ ABLITERATION PIPELINE — ${modelName} ]</div>`;
+    const modelName = ablSelectedModel || 'EXAMPLE CHECKPOINT (NO MODEL LOADED)';
+    const methodInfo = METHOD_INFO[ablMethod];
+    logEl.replaceChildren();
+    const heading = document.createElement('div');
+    heading.className = 'log-line stage-line';
+    heading.textContent = `[ SIMULATED ABLITERATION PIPELINE — ${modelName} ]`;
+    logEl.appendChild(heading);
 
     function addLog(text, cls='') {
         const line = document.createElement('div');
@@ -2151,7 +2564,13 @@ async function simulatePipeline() {
         const lineDelay = sim.dur / (sim.logs.length + 1);
         for (const logText of sim.logs) {
             await new Promise(r => setTimeout(r, lineDelay));
-            addLog(logText, logText.includes('█') || logText.includes('✓') ? 'highlight' : '');
+            const renderedLog = logText
+                .replace('{method}', ablMethod.toUpperCase())
+                .replace('{directions}', String(methodInfo.dirs))
+                .replace('{passes}', String(methodInfo.passes))
+                .replace('{norm}', methodInfo.norm ? 'enabled' : 'disabled')
+                .replace('{regularization}', String(methodInfo.reg));
+            addLog(renderedLog, renderedLog.includes('ACCEPTED') ? 'highlight' : '');
         }
 
         await new Promise(r => setTimeout(r, lineDelay));
@@ -2181,7 +2600,7 @@ renderModelsTable = function(filter) {
             <td>${m.dtype}</td>
             <td>${m.quant || '\u2014'}</td>
             <td style="color:var(--text-dim);font-size:0.75rem">${m.desc}</td>
-            <td><button class="abl-btn" onclick="event.stopPropagation(); startAbliterateFromLibrary('${m.hf_id}')">OBLITERATE</button></td>
+            <td><button class="abl-btn" onclick="startAbliterateFromLibrary('${m.hf_id}')">OBLITERATE</button></td>
         </tr>`;
     });
     html += '</tbody></table>';
@@ -2197,14 +2616,7 @@ if (uploadZone) {
         e.preventDefault();
         uploadZone.style.borderColor = 'var(--text-dim)';
         const file = e.dataTransfer.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-                try { renderResults(JSON.parse(ev.target.result)); }
-                catch (err) { alert('Invalid JSON: ' + err.message); }
-            };
-            reader.readAsText(file);
-        }
+        if (file) readResultsFile(file);
     });
 }
 </script>

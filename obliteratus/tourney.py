@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from obliteratus.abliterate import UNAVAILABLE_METHODS, available_method_names
 from obliteratus.evaluation.candidate_selection import (
     CandidateEvidenceError,
     add_acceptance_evidence,
@@ -38,7 +39,9 @@ from obliteratus.evaluation.candidate_selection import (
 # All tournament-eligible methods.
 #
 # Excluded:
-#   - 'optimized' — runs its own Bayesian optimization, far too slow per round
+#   - compute-heavy paper/model-forward search presets — runnable explicitly,
+#     but omitted from the default tournament because each entrant performs
+#     its own multi-trial search and full-snapshot replay
 #   - 'nuclear'   — collapsed in essentially every telemetry run (n=7,545)
 #   - 'basic'     — fast but quality is unusable across architectures
 # ---------------------------------------------------------------------------
@@ -51,10 +54,28 @@ TOURNEY_METHODS = [
     "surgical",
     "inverted",
     "failspy",
-    "gabliteration",
-    "heretic",
-    "rdo",
 ]
+
+
+def validate_tourney_methods(methods: list[str] | None) -> list[str]:
+    """Return runnable tournament methods or reject stale/raw preset names."""
+    if isinstance(methods, (str, bytes)):
+        raise TypeError("Tournament methods must be provided as a list of preset names")
+    selected = list(TOURNEY_METHODS) if not methods else list(methods)
+    available = frozenset(available_method_names())
+
+    problems: list[str] = []
+    for method in selected:
+        if not isinstance(method, str):
+            problems.append(f"method names must be strings, got {type(method).__name__}")
+        elif method in UNAVAILABLE_METHODS:
+            problems.append(f"`{method}` is unavailable: {UNAVAILABLE_METHODS[method]}")
+        elif method not in available:
+            problems.append(f"`{method}` is not a runnable preset")
+
+    if problems:
+        raise ValueError("Invalid tournament method selection: " + "; ".join(problems))
+    return selected
 
 
 # Tournament output directories are recursively cleaned between fresh runs.
@@ -1091,7 +1112,7 @@ class TourneyRunner:
         self.dtype = dtype
         self.dataset_key = dataset_key
         self.quantization = quantization
-        self.methods = methods or list(TOURNEY_METHODS)
+        self.methods = validate_tourney_methods(methods)
         self.requested_output_dir = Path(output_dir).expanduser()
         self.output_dir = resolve_tourney_output_dir(
             self.requested_output_dir,

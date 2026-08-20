@@ -161,7 +161,7 @@ def test_signal_threshold_rejects_all_candidates():
 def test_iterative_distillation_keeps_using_som(monkeypatch):
     pipeline = AbliterationPipeline(
         model_name="fake/model",
-        method="som",
+        method="som_proxy",
         harmful_prompts=["harmful one", "harmful two"],
         harmless_prompts=["harmless one", "harmless two"],
     )

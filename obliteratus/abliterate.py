@@ -2,7 +2,8 @@
 
 Implements multiple refusal direction removal techniques drawing from:
 - Arditi et al. (2024): Refusal in LLMs Is Mediated by a Single Direction
-- Gabliteration (arXiv:2512.18901): SVD-based multi-direction extraction
+- Gabliteration (arXiv:2512.18901): isolated tensor primitives; the named
+  checkpoint preset fails closed until behavioral layer trials can be replayed
 - Norm-Preserving Biprojected Abliteration (grimjim, 2025)
 - Projected Abliteration: Separating refusal vs compliance components
 - Iterative refinement for cleaner orthogonalization
@@ -20,13 +21,15 @@ Novel contributions (OBLITERATUS):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
+import numbers
 import os
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -82,15 +85,25 @@ from obliteratus.strategies.utils import (  # noqa: E402
     get_ffn_module,
     get_layer_modules,
 )
+from obliteratus.analysis.linear_eraser import ResidualEraser  # noqa: E402
+from obliteratus.analysis.cot_preservation import (  # noqa: E402
+    DEFAULT_COT_PRESERVATION_EXAMPLES,
+    CoTPreservationError,
+    CoTPreservationExample,
+    CoTScoreSnapshot,
+    compare_cot_score_snapshots,
+    score_cot_references,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Maximum norm amplification allowed per projection step.  After removing
-# the refusal component from a weight matrix, the remaining matrix's norm
-# should not increase by more than this factor (1.10 = 10%).  This prevents
-# compounding norm drift across many layers/directions.
-_MAX_NORM_RATIO = 1.10
+@dataclass(frozen=True)
+class _SavedLogicalRowNorms:
+    """Per-output-unit norms plus the axes reduced to compute each row."""
+
+    norms: torch.Tensor
+    reduction_axes: tuple[int, ...]
 
 # ── Abliteration method presets ───────────────────────────────────────────
 
@@ -132,10 +145,10 @@ METHODS = {
         "projection_target": "output",
     },
     "aggressive": {
-        "label": "Aggressive (Full Gabliteration + Enhanced)",
+        "label": "Aggressive (Multi-direction OBLITERATUS)",
         "description": (
             "Maximum direction extraction with enhanced adaptive pipeline. "
-            "Whitened SVD with jailbreak-contrastive refinement, layer-adaptive "
+            "SVD with jailbreak-contrastive refinement, layer-adaptive "
             "projection strengths, cosine-similarity early-exit for iterative "
             "refinement (skips unnecessary re-probe passes when directions "
             "converge), attention head surgery on top safety heads, and "
@@ -150,7 +163,7 @@ METHODS = {
         "refinement_passes": 3,
         "project_biases": True,
         "use_chat_template": True,
-        "use_whitened_svd": True,
+        "use_whitened_svd": False,
         "true_iterative_refinement": True,
         "use_jailbreak_contrast": True,
         "layer_adaptive_strength": True,
@@ -179,7 +192,7 @@ METHODS = {
         "refinement_passes": 2,
         "project_biases": True,
         "use_chat_template": True,
-        "use_whitened_svd": True,
+        "use_whitened_svd": False,
         "true_iterative_refinement": True,
         "use_jailbreak_contrast": True,
         "layer_adaptive_strength": True,
@@ -194,9 +207,11 @@ METHODS = {
             "Runs analysis modules between PROBE and DISTILL to auto-configure "
             "direction extraction, layer selection, and projection strategy. "
             "Uses InformedAbliterationPipeline for the full feedback loop. "
-            "Auto-detects alignment method (DPO/RLHF/CAI/SFT), maps concept "
-            "cone geometry, performs cluster-aware layer selection, and gates "
-            "projection by safety-capability entanglement. Defaults to single "
+            "Auto-detects alignment method (DPO/RLHF/CAI/SFT), reports labeled "
+            "category-direction dispersion descriptively, performs cluster-aware "
+            "layer selection, and gates projection by safety-capability "
+            "entanglement. Descriptive category geometry never changes the "
+            "checkpoint edit. Defaults to single "
             "diff-of-means direction. Bayesian tuning is disabled until exact "
             "winning-trial replay exists; the deterministic analysis-guided "
             "path remains available. "
@@ -218,8 +233,8 @@ METHODS = {
         "attention_head_surgery": False,
         "use_sae_features": False,
         "use_wasserstein_optimal": False,
-        "use_kl_optimization": True,
-        "kl_budget": 0.5,
+        "use_kl_optimization": False,
+        "kl_budget": 0.05,
         "float_layer_interpolation": True,
         "winsorize_activations": True,
         "winsorize_percentile": 0.01,
@@ -240,7 +255,7 @@ METHODS = {
         "refinement_passes": 2,
         "project_biases": True,
         "use_chat_template": True,
-        "use_whitened_svd": True,
+        "use_whitened_svd": False,
         "true_iterative_refinement": True,
         "use_jailbreak_contrast": True,
         "layer_adaptive_strength": True,
@@ -270,7 +285,7 @@ METHODS = {
         "refinement_passes": 2,
         "project_biases": True,
         "use_chat_template": True,
-        "use_whitened_svd": True,
+        "use_whitened_svd": False,
         "true_iterative_refinement": True,
         "use_jailbreak_contrast": True,
         "layer_adaptive_strength": False,  # inversion overrides per-layer scaling
@@ -284,12 +299,12 @@ METHODS = {
         "projection_target": "all",
     },
     "optimized": {
-        "label": "Optimized (Disabled: Exact Replay Pending)",
+        "label": "Optimized (Exact Model-Forward TPE)",
         "description": (
-            "Temporarily unavailable. The former Bayesian path scored one "
-            "output-writer candidate but replayed an averaged, multi-direction "
-            "approximation. It now fails closed before editing any weights until "
-            "the exact winning trial can be replayed byte-for-byte."
+            "Model-forward TPE search over per-layer SVD interpolation and "
+            "separate attention/FFN removal kernels. Every candidate starts "
+            "from a full CPU snapshot; the complete winner plan is hash-verified "
+            "on replay and a disjoint confirmation gate."
         ),
         "n_directions": 4,
         "direction_method": "svd",
@@ -298,22 +313,22 @@ METHODS = {
         "refinement_passes": 1,
         "project_biases": True,
         "use_chat_template": True,
-        "use_whitened_svd": True,
+        "use_whitened_svd": False,
         "true_iterative_refinement": False,
         "use_jailbreak_contrast": True,
-        "layer_adaptive_strength": True,
+        "layer_adaptive_strength": False,
         "safety_neuron_masking": False,
-        "per_expert_directions": True,
-        "attention_head_surgery": True,
-        "use_sae_features": True,
+        "per_expert_directions": False,
+        "attention_head_surgery": False,
+        "use_sae_features": False,
         "invert_refusal": False,
-        # Heretic-inspired enhancements
+        # Optional editing and preservation enhancements
         "winsorize_activations": True,
         "winsorize_percentile": 0.01,
-        "float_layer_interpolation": True,
-        "cot_aware": True,
+        "float_layer_interpolation": False,
+        "cot_aware": False,
         "use_kl_optimization": True,
-        "kl_budget": 0.5,
+        "kl_budget": 0.05,
         "use_lora_ablation": False,
         "bayesian_trials": 50,
     },
@@ -322,16 +337,17 @@ METHODS = {
         "description": (
             "Combo mode for stubborn MoE models (GPT-OSS 20B, GLM-5, etc). "
             "Builds on inverted baseline with layer-adaptive projection "
-            "strengths, tempered 1.25x reflection (vs 2x) to preserve CoT "
-            "coherence and conservative expert transplant (10%% blend into "
+            "strengths, tempered 1.25x reflection (vs 2x) to reduce broad "
+            "distribution damage, and conservative expert transplant (10%% blend into "
             "top-third safety experts only). Embedding/output-head surgery and "
             "runtime steering remain opt-in because they have broad or "
             "non-serializable effects. "
             "Uses 4 SVD directions (not 8) to avoid over-ablation — SAE "
             "features provide supplementary precision instead. "
-            "Tuned for models with multi-pass safety reasoning (visible CoT "
-            "policy-check architectures) where full-force reflection destroys "
-            "the reasoning pipeline. Official verification covers only the "
+            "Intended for models with multi-pass safety reasoning (visible CoT "
+            "policy-check architectures), but reasoning preservation is not "
+            "inferred from expert geometry and requires the explicit gate. "
+            "Official verification covers only the "
             "persistent weights that will exist after checkpoint reload."
         ),
         "n_directions": 4,
@@ -341,7 +357,7 @@ METHODS = {
         "refinement_passes": 2,
         "project_biases": True,
         "use_chat_template": True,
-        "use_whitened_svd": True,
+        "use_whitened_svd": False,
         "true_iterative_refinement": True,
         "use_jailbreak_contrast": True,
         "layer_adaptive_strength": True,
@@ -365,19 +381,17 @@ METHODS = {
         # Heretic-inspired enhancements for nuclear mode
         "winsorize_activations": True,
         "winsorize_percentile": 0.01,
-        "cot_aware": True,
+        "cot_aware": False,
         "float_layer_interpolation": True,
     },
-    # ── Baseline reproductions for head-to-head benchmarking ──────────
-    # These are adapted reproductions of competing SOTA methods using
-    # OBLITERATUS infrastructure. Each faithfully matches the original
-    # algorithm's core design choices (direction count, layer selection,
-    # regularization, optimization) while sharing the same evaluation
-    # pipeline for fair comparison.
+    # ── Baseline configurations ───────────────────────────────────────
+    # FailSpy is available through the shared checkpoint/evaluation
+    # infrastructure. Incomplete paper/search configurations remain below
+    # solely to produce explicit, informative fail-closed errors.
     "failspy": {
         "label": "FailSpy/abliterator (2024 Baseline)",
         "description": (
-            "Faithful reproduction of the FailSpy/abliterator library — the "
+            "OBLITERATUS reproduction of the FailSpy/abliterator layout — the "
             "most widely used community tool. Single direction via difference-"
             "in-means (Arditi et al.), applied to all layers except layer 0 "
             "(matching FailSpy source: range(1, n_layers)). Projects both "
@@ -404,22 +418,19 @@ METHODS = {
         "layer_selection": "all_except_first",
     },
     "gabliteration": {
-        "label": "Gabliteration (Gülmez 2026 Baseline)",
+        "label": "Gabliteration (Paper Behavioral Search)",
         "description": (
-            "Faithful reproduction of Gabliteration (arXiv:2512.18901). "
-            "SVD-based multi-direction extraction (top-4), ridge-regularized "
-            "projection (alpha=0.3, equivalent to OBLITERATUS reg=0.231), "
-            "variance-based layer selection (top-k by sigma^2). Uses chat "
-            "template. No norm preservation (added by grimjim later), no "
-            "whitened SVD, no iterative refinement."
+            "Paper-style source-layer mean-separation search, five shuffled-pair "
+            "SVD estimates with projector averaging, actual one-layer behavioral "
+            "trials, and hash-verified exact replay. Ridge lambda and partial "
+            "removal alpha remain separate parameters."
         ),
-        "n_directions": 4,
+        "n_directions": 2,
         "direction_method": "svd",
         "norm_preserve": False,
-        # Ridge alpha=0.3 → effective reg = alpha/(1+alpha) = 0.3/1.3 ≈ 0.231
-        # For orthonormal V: P_V^alpha = 1/(1+alpha) * VV^T = 0.769 * VV^T
-        # which is equivalent to OBLITERATUS reg = 1 - 0.769 = 0.231
-        "regularization": 0.231,
+        # OBLITERATUS regularization is the aligned fraction *preserved*.
+        # Paper defaults keep 1 - alpha/(1 + lambda) = 1 - .3/1.1.
+        "regularization": 0.7272727272727273,
         "refinement_passes": 1,
         "project_biases": False,
         "use_chat_template": True,
@@ -432,22 +443,29 @@ METHODS = {
         "attention_head_surgery": False,
         "use_sae_features": False,
         "invert_refusal": False,
-        "layer_selection": "top_k",
+        "layer_selection": "all",
+        "projection_target": "output",
+        "gabliteration_shuffles": 5,
+        "gabliteration_alpha": 0.3,
+        "gabliteration_beta": 0.5,
+        "gabliteration_ridge": 0.1,
+        "gabliteration_effectiveness_threshold": 0.8,
+        "gabliteration_eval_prompts": 32,
     },
     "heretic": {
-        "label": "Heretic / p-e-w (Disabled: Exact Replay Pending)",
+        "label": "Heretic / p-e-w (Exact Replay Baseline)",
         "description": (
-            "Temporarily unavailable. The previous Heretic-inspired search used "
-            "separate attention/MLP kernels and an interpolated direction, but the "
-            "saved edit was an averaged approximation rather than the scored trial. "
-            "This preset now fails closed before editing weights until exact replay "
-            "is implemented; it does not claim LoRA behavior."
+            "Heretic-style model-forward TPE search with a continuous cross-layer "
+            "diff-means direction and separate piecewise-linear attention/MLP "
+            "kernels. The scored tensor plan is restored and replayed exactly, "
+            "then checked on disjoint confirmation data. This is the dense "
+            "checkpoint projection baseline, not Heretic's optional LoRA path."
         ),
         "n_directions": 1,
         "direction_method": "diff_means",
-        # Heretic default row_normalization is NONE; PRE/FULL are optional.
-        # OBLITERATUS norm_preserve=False matches Heretic's default behavior.
-        "norm_preserve": False,
+        # Current Heretic defaults to FULL per-output-row normalization and a
+        # rank-3 approximation of the nonlinear delta.
+        "norm_preserve": True,
         "regularization": 0.0,
         "refinement_passes": 1,
         "project_biases": False,
@@ -467,33 +485,30 @@ METHODS = {
         # For faithful baseline reproduction we match the source default.
         "winsorize_activations": False,
         "winsorize_percentile": 1.0,
-        # Heretic's float direction index interpolates between adjacent LAYERS'
-        # directions (not SVD components). OBLITERATUS float_layer_interpolation
-        # provides the bell-curve layer weighting aspect.
-        "float_layer_interpolation": True,
+        # The exact search owns Heretic's continuous cross-layer direction;
+        # do not apply OBLITERATUS's independent layer-weight interpolation.
+        "float_layer_interpolation": False,
         "cot_aware": False,
         "use_kl_optimization": True,
-        "kl_budget": 0.5,
+        "kl_budget": 0.05,
         "bayesian_trials": 50,
         "layer_selection": "all",
     },
     "rdo": {
-        "label": "RDO (Wollschlager et al. ICML 2025 Baseline)",
+        "label": "RDO-Trained Direction + Checkpoint Projection",
         "description": (
-            "Adapted reproduction of Refusal Direction Optimization (RDO) "
-            "from Wollschlager et al. (ICML 2025, 'The Geometry of Refusal'). "
-            "Starts with SVD-extracted directions, then refines them via "
-            "gradient-based optimization to maximize refusal behavior flip. "
-            "Uses a differentiable linear probe as the refusal classifier. "
-            "This produces directions aligned with the actual refusal decision "
-            "boundary rather than the statistical activation difference."
+            "Trains one global direction through actual all-layer ablation and "
+            "one-layer addition forwards using generated harmful/harmless CE "
+            "targets plus sequence retain KL. The exported checkpoint then "
+            "projects that trained direction from output writers; this persistent "
+            "projection is an explicit adaptation of the paper's runtime hooks."
         ),
-        "n_directions": 4,
-        "direction_method": "svd",
+        "n_directions": 1,
+        "direction_method": "diff_means",
         "norm_preserve": True,
         "regularization": 0.0,
         "refinement_passes": 1,
-        "project_biases": True,
+        "project_biases": False,
         "use_chat_template": True,
         "use_whitened_svd": False,
         "true_iterative_refinement": False,
@@ -505,56 +520,105 @@ METHODS = {
         "use_sae_features": False,
         "invert_refusal": False,
         "rdo_refinement": True,
-        "layer_selection": "knee_cosmic",
+        "rdo_steps": 40,
+        "rdo_batch_size": 16,
+        "rdo_snapshot_window": 20,
+        "layer_selection": "all",
+        "projection_target": "output",
     },
     "som": {
-        "label": "SOM-Manifold (AAAI 2026 + OBLITERATUS stack)",
+        "label": "SOM Paper Behavioral Search",
         "description": (
-            "Self-Organizing-Map refusal manifold extraction from Piras et al. "
-            "(AAAI 2026, 'SOM Directions Are Better than One'), combined with "
-            "OBLITERATUS norm-preserving projection, layer-adaptive strengths, "
-            "optional RDO refinement, KL co-optimization, CoT-aware preservation, and "
-            "true iterative re-probing. This targets multi-modal refusal geometry "
-            "without assuming that top singular vectors are the manifold generators."
+            "Trains the paper's 4x4 hexagonal SOM for 10,000 updates, then "
+            "uses ordered-without-replacement Optuna TPE over real temporary "
+            "checkpoint interventions scored by a HarmBench-compatible judge. "
+            "The exact winner is hash-bound, replayed, and damage-gated."
         ),
-        "n_directions": 3,
+        "n_directions": 5,
         "direction_method": "som",
-        "norm_preserve": True,
-        "regularization": 0.35,
+        "norm_preserve": False,
+        "regularization": 0.0,
         "embed_regularization": 0.5,
         "refinement_passes": 1,
-        "project_biases": True,
+        "project_biases": False,
         "use_chat_template": True,
         "use_whitened_svd": False,
-        "true_iterative_refinement": True,
+        "true_iterative_refinement": False,
         "use_jailbreak_contrast": False,
-        "layer_adaptive_strength": True,
+        "layer_adaptive_strength": False,
         "safety_neuron_masking": False,
-        "per_expert_directions": True,
-        "attention_head_surgery": True,
+        "per_expert_directions": False,
+        "attention_head_surgery": False,
         "use_sae_features": False,
         "invert_refusal": False,
-        "winsorize_activations": True,
-        "winsorize_percentile": 0.01,
-        "float_layer_interpolation": True,
-        "cot_aware": True,
+        "winsorize_activations": False,
+        "winsorize_percentile": 1.0,
+        "float_layer_interpolation": False,
+        "cot_aware": False,
         "use_kl_optimization": True,
-        "kl_budget": 0.4,
+        "kl_budget": 0.05,
         "rdo_refinement": False,
-        "som_iterations": 250,
-        "som_learning_rate": 0.35,
-        "som_sigma": None,
+        "som_iterations": 10_000,
+        "som_learning_rate": 0.01,
+        "som_sigma": 0.3,
         "som_candidate_count": 16,
-        "som_harmless_pc_count": 2,
-        "som_distortion_aware": True,
-        "som_diversity_penalty": 1.0,
+        "som_harmless_pc_count": 0,
+        "som_distortion_aware": False,
+        "som_diversity_penalty": 0.0,
         "som_min_signal_to_noise": 0.0,
-        "min_layer_fraction": 0.75,
-        "max_layer_fraction": 0.25,
+        "som_search_trials": 512,
+        "som_subset_size": 5,
+        "som_seed": 0,
+        "min_layer_fraction": None,
+        "max_layer_fraction": None,
         "som_contiguous_layer_budget": False,
-        "layer_selection": "knee",
+        "layer_selection": "all",
+        "projection_target": "output",
     },
 }
+
+# The local SOM implementation is useful as an activation-geometry heuristic,
+# but it must not inherit the paper baseline's name or evaluation claims.
+METHODS["som_proxy"] = {
+    **METHODS["som"],
+    "label": "SOM Activation-Geometry Proxy",
+    "description": (
+        "A compute-bounded local SOM heuristic ranked by activation support, "
+        "signal-to-noise, harmless distortion, and diversity. It does not run "
+        "the paper's TPE subset search or HarmBench judge and makes no paper-fidelity claim."
+    ),
+    "direction_method": "som_proxy",
+    "n_directions": 3,
+    "norm_preserve": True,
+    "regularization": 0.35,
+    "project_biases": True,
+    "cot_aware": False,
+    "use_kl_optimization": False,
+    "true_iterative_refinement": False,
+    "per_expert_directions": False,
+    "attention_head_surgery": False,
+    "float_layer_interpolation": False,
+    "projection_target": "output",
+    "som_iterations": 250,
+    "som_learning_rate": 0.35,
+    "som_sigma": None,
+    "som_candidate_count": 16,
+    "som_harmless_pc_count": 2,
+    "som_distortion_aware": True,
+    "som_diversity_penalty": 1.0,
+    "winsorize_activations": True,
+    "winsorize_percentile": 0.01,
+}
+
+
+UNAVAILABLE_METHODS: dict[str, str] = {
+}
+
+
+def available_method_names() -> tuple[str, ...]:
+    """Return checkpoint-producing presets that do not intentionally fail closed."""
+
+    return tuple(name for name in METHODS if name not in UNAVAILABLE_METHODS)
 
 
 # ── Prompt pairs ─────────────────────────────────────────────────────────
@@ -746,21 +810,22 @@ def auto_hub_repo_id(model_name: str, *, api=None, org: str | None = None) -> st
 class AbliterationPipeline:
     """SOTA pipeline to abliterate (remove refusal directions from) a model.
 
-    Supports multiple methods (see METHODS dict for full list):
+    Supports multiple checkpoint-producing methods (see
+    :func:`available_method_names` for the authoritative list):
     - basic: Single refusal direction (Arditi et al.)
     - advanced: Multi-direction SVD + norm-preserving + regularization
-    - aggressive: Full Gabliteration with iterative refinement
+    - aggressive: OBLITERATUS multi-direction SVD with iterative refinement
     - spectral_cascade: DCT frequency-domain decomposition
     - informed: GRP-Obliteration with distributional analysis
     - surgical: Head surgery + SAE + neuron masking
     - inverted: Reflection-based (beyond removal into inversion)
-    - optimized: Bayesian-tuned hyperparameters
     - nuclear: Maximum strength with all techniques
     - failspy: FailSpy-style middle-60% layer selection
-    - gabliteration: Original Gabliteration method
-    - heretic: Heretic-style with Bayesian optimization
-    - rdo: Refusal Direction Optimization with gradient refinement
-    - som: SOM-manifold directions with RDO + KL/coherence safeguards
+    - optimized/heretic: Exact model-forward TPE plans with verified replay
+    - gabliteration: Shuffled-SVD source/layer behavioral search
+    - rdo: Differentiable RDO direction training plus checkpoint projection
+    - som: Paper SOM ordered-subset TPE with HarmBench confirmation
+    - som_proxy: Local activation-geometry SOM heuristic
     """
 
     def __init__(
@@ -806,15 +871,23 @@ class AbliterationPipeline:
         expert_transplant: bool | None = None,
         transplant_blend: float | None = None,
         n_sae_features: int | None = None,
-        # Heretic-inspired enhancements
+        # Optional editing and preservation enhancements
         winsorize_activations: bool | None = None,
         winsorize_percentile: float | None = None,
         use_lora_ablation: bool | None = None,
         lora_rank: int | None = None,
         use_kl_optimization: bool | None = None,
         kl_budget: float | None = None,
+        kl_search_steps: int = 5,
         float_layer_interpolation: bool | None = None,
         cot_aware: bool | None = None,
+        cot_preservation_examples: Iterable[
+            CoTPreservationExample | dict[str, str]
+        ] | None = None,
+        cot_reasoning_ce_budget: float = 0.25,
+        cot_answer_ce_budget: float = 0.15,
+        cot_max_length: int = 512,
+        cot_min_eval_examples: int = 4,
         layer_selection: str | None = None,
         min_layer_fraction: float | None = None,
         max_layer_fraction: float | None = None,
@@ -888,19 +961,63 @@ class AbliterationPipeline:
         # Resolve method configuration (explicit params override method defaults)
         if method not in METHODS:
             raise ValueError(
-                f"Unknown method {method!r}. Choose from: {list(METHODS.keys())}"
+                f"Unknown method {method!r}. Available checkpoint methods: "
+                f"{list(available_method_names())}"
             )
-        if method in {"optimized", "heretic"}:
+        if method in UNAVAILABLE_METHODS:
             raise ValueError(
-                f"Method {method!r} is disabled before model loading: exact "
-                "Bayesian winning-trial replay is not implemented"
+                f"Method {method!r} is unavailable before model loading: "
+                f"{UNAVAILABLE_METHODS[method]}"
             )
         method_cfg = METHODS[method]
         self.method = method
         self.n_directions = n_directions if n_directions is not None else method_cfg["n_directions"]
+        if (
+            not isinstance(self.n_directions, int)
+            or isinstance(self.n_directions, bool)
+            or self.n_directions < 1
+        ):
+            raise ValueError("n_directions must be a positive integer")
         self.direction_method = direction_method if direction_method is not None else method_cfg.get("direction_method", "svd")
+        # A caller overriding a single-direction preset with multiple
+        # directions is requesting a subspace; select the SVD backend instead
+        # of silently running mean-difference logic under an impossible rank.
+        if (
+            direction_method is None
+            and n_directions is not None
+            and self.n_directions > 1
+            and self.direction_method == "diff_means"
+        ):
+            self.direction_method = "svd"
+        if self.direction_method not in {"diff_means", "svd", "leace", "som_proxy", "som"}:
+            raise ValueError(
+                "direction_method must be one of: diff_means, svd, leace, som_proxy, som"
+            )
+        if self.direction_method == "som" and method != "som":
+            raise ValueError(
+                "direction_method='som' is available only through method='som' "
+                "so behavioral TPE/judge evidence is never bypassed"
+            )
+        if self.direction_method in {"diff_means", "leace"} and self.n_directions != 1:
+            raise ValueError(
+                f"direction_method={self.direction_method!r} requires n_directions=1"
+            )
+        if self.direction_method == "som_proxy" and method != "som_proxy":
+            raise ValueError(
+                "direction_method='som_proxy' is available only through "
+                "method='som_proxy' so checkpoint metadata retains the proxy label"
+            )
         self.norm_preserve = norm_preserve if norm_preserve is not None else method_cfg["norm_preserve"]
         self.regularization = regularization if regularization is not None else method_cfg["regularization"]
+        if (
+            not isinstance(self.regularization, (int, float))
+            or isinstance(self.regularization, bool)
+            or not math.isfinite(float(self.regularization))
+            or not 0.0 <= float(self.regularization) <= 1.0
+        ):
+            raise ValueError("regularization must be a finite number between 0 and 1")
+        self.regularization = float(self.regularization)
+        self._requested_regularization = self.regularization
         self.refinement_passes = refinement_passes if refinement_passes is not None else method_cfg["refinement_passes"]
         self.project_biases = project_biases if project_biases is not None else method_cfg.get("project_biases", False)
         self.use_chat_template = use_chat_template if use_chat_template is not None else method_cfg.get("use_chat_template", False)
@@ -933,30 +1050,132 @@ class AbliterationPipeline:
         self.transplant_blend = transplant_blend if transplant_blend is not None else method_cfg.get("transplant_blend", 0.1)
         self.n_sae_features = n_sae_features if n_sae_features is not None else method_cfg.get("n_sae_features", 8)
 
-        # Heretic-inspired enhancements
+        # Optional editing and preservation enhancements
         self.winsorize_activations = winsorize_activations if winsorize_activations is not None else method_cfg.get("winsorize_activations", False)
         self.winsorize_percentile = winsorize_percentile if winsorize_percentile is not None else method_cfg.get("winsorize_percentile", 0.01)
         self.use_lora_ablation = use_lora_ablation if use_lora_ablation is not None else method_cfg.get("use_lora_ablation", False)
         self.lora_rank = lora_rank if lora_rank is not None else method_cfg.get("lora_rank", 1)
-        self.use_kl_optimization = use_kl_optimization if use_kl_optimization is not None else method_cfg.get("use_kl_optimization", False)
-        self.kl_budget = kl_budget if kl_budget is not None else method_cfg.get("kl_budget", 0.5)
+        self.use_kl_optimization_requested = (
+            use_kl_optimization
+            if use_kl_optimization is not None
+            else method_cfg.get("use_kl_optimization", False)
+        )
+        if not isinstance(self.use_kl_optimization_requested, bool):
+            raise TypeError("use_kl_optimization must be a boolean")
+        self.use_kl_optimization = self.use_kl_optimization_requested
+        resolved_kl_budget = (
+            kl_budget if kl_budget is not None else method_cfg.get("kl_budget", 0.05)
+        )
+        if (
+            isinstance(resolved_kl_budget, bool)
+            or not isinstance(resolved_kl_budget, numbers.Real)
+            or not math.isfinite(float(resolved_kl_budget))
+            or float(resolved_kl_budget) < 0.0
+        ):
+            raise ValueError("kl_budget must be a finite non-negative number")
+        self.kl_budget = float(resolved_kl_budget)
+        if (
+            not isinstance(kl_search_steps, int)
+            or isinstance(kl_search_steps, bool)
+            or kl_search_steps < 2
+        ):
+            raise ValueError("kl_search_steps must be an integer of at least 2")
+        self._requested_kl_budget = self.kl_budget
+        self.kl_search_steps = kl_search_steps
         self.float_layer_interpolation = float_layer_interpolation if float_layer_interpolation is not None else method_cfg.get("float_layer_interpolation", False)
         self.cot_aware_requested = (
             cot_aware if cot_aware is not None else method_cfg.get("cot_aware", False)
         )
-        # The legacy implementation averaged positions in the *user prompt*
-        # and labelled harmless-prompt PC1 a reasoning trace direction.  That
-        # claim is unvalidated and must not change checkpoint weights.  Keep
-        # the request visible for metadata/UI compatibility, but make it a
-        # no-op until generated trace activations have a real control study.
-        self.cot_aware = False
-        if self.cot_aware_requested:
-            warnings.warn(
-                "cot_aware weight editing is disabled: the legacy heuristic did "
-                "not observe generated reasoning traces",
-                stacklevel=2,
+        if not isinstance(self.cot_aware_requested, bool):
+            raise TypeError("cot_aware must be a boolean")
+        self.cot_aware = self.cot_aware_requested
+        if cot_preservation_examples is not None and not self.cot_aware:
+            raise ValueError(
+                "cot_preservation_examples requires cot_aware=True; explicit "
+                "references must not be silently ignored"
             )
-        self.layer_selection = layer_selection if layer_selection is not None else method_cfg.get("layer_selection", "knee_cosmic")
+        self.cot_preservation_examples = (
+            list(cot_preservation_examples)
+            if cot_preservation_examples is not None
+            else None
+        )
+        for name, value in {
+            "cot_reasoning_ce_budget": cot_reasoning_ce_budget,
+            "cot_answer_ce_budget": cot_answer_ce_budget,
+        }.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError(f"{name} must be a finite non-negative number")
+        if (
+            not isinstance(cot_max_length, int)
+            or isinstance(cot_max_length, bool)
+            or cot_max_length < 3
+        ):
+            raise ValueError("cot_max_length must be an integer of at least 3")
+        if (
+            not isinstance(cot_min_eval_examples, int)
+            or isinstance(cot_min_eval_examples, bool)
+            or cot_min_eval_examples < 1
+        ):
+            raise ValueError("cot_min_eval_examples must be a positive integer")
+        self.cot_reasoning_ce_budget = float(cot_reasoning_ce_budget)
+        self.cot_answer_ce_budget = float(cot_answer_ce_budget)
+        self._requested_cot_reasoning_ce_budget = self.cot_reasoning_ce_budget
+        self._requested_cot_answer_ce_budget = self.cot_answer_ce_budget
+        self.cot_max_length = cot_max_length
+        configured_cot_minimum = (
+            damage_budget.damage.min_cot_eval_examples
+            if damage_budget is not None
+            else 0
+        )
+        self.cot_min_eval_examples = max(
+            cot_min_eval_examples,
+            int(configured_cot_minimum or 0),
+        )
+        cot_source = (
+            DEFAULT_COT_PRESERVATION_EXAMPLES
+            if self.cot_preservation_examples is None
+            else self.cot_preservation_examples
+        )
+        self._cot_examples = (
+            self._normalize_cot_preservation_examples(cot_source)
+            if self.cot_aware
+            else ()
+        )
+        required_cot_examples = self.cot_min_eval_examples * (
+            2
+            if self.use_kl_optimization
+            or (
+                projection_target
+                if projection_target is not None
+                else method_cfg.get("projection_target", "output")
+            )
+            == "auto"
+            else 1
+        )
+        if self.cot_aware and len(self._cot_examples) < required_cot_examples:
+            raise ValueError(
+                "cot_aware requires at least "
+                f"{required_cot_examples} explicit reasoning examples "
+                "for the configured preservation gate"
+            )
+        self.layer_selection = layer_selection if layer_selection is not None else method_cfg.get("layer_selection", "knee")
+        if self.layer_selection == "knee_cosmic":
+            raise ValueError(
+                "layer_selection='knee_cosmic' was removed: COSMIC's bottom-10% "
+                "layers are evaluation layers, not intervention layers; use 'knee'"
+            )
+        if self.layer_selection not in {
+            "all_except_first", "middle60", "all", "top_k", "knee",
+        }:
+            raise ValueError(
+                "layer_selection must be one of: all_except_first, middle60, "
+                "all, top_k, knee"
+            )
         self.min_layer_fraction = min_layer_fraction if min_layer_fraction is not None else method_cfg.get("min_layer_fraction", None)
         self.max_layer_fraction = max_layer_fraction if max_layer_fraction is not None else method_cfg.get("max_layer_fraction", None)
         self.harmless_pc_count = harmless_pc_count if harmless_pc_count is not None else method_cfg.get("harmless_pc_count", 0)
@@ -994,7 +1213,20 @@ class AbliterationPipeline:
         if not 0.0 < self.projection_row_fraction <= 1.0:
             raise ValueError("projection_row_fraction must be in (0.0, 1.0]")
         self.rdo_refinement = rdo_refinement if rdo_refinement is not None else method_cfg.get("rdo_refinement", False)
+        if self.rdo_refinement and method != "rdo":
+            raise ValueError(
+                "rdo_refinement is available only through method='rdo' so its "
+                "generated-target and model-forward evidence is always recorded"
+            )
         self.use_wasserstein_optimal = use_wasserstein_optimal if use_wasserstein_optimal is not None else method_cfg.get("use_wasserstein_optimal", False)
+        if self.use_whitened_svd and (
+            self.direction_method in {"leace", "som_proxy"}
+            or self.use_wasserstein_optimal
+        ):
+            raise ValueError(
+                "use_whitened_svd cannot be combined with LEACE, the SOM proxy, "
+                "or Wasserstein extraction; select one direction backend"
+            )
         self.som_iterations = method_cfg.get("som_iterations", 200)
         self.som_learning_rate = method_cfg.get("som_learning_rate", 0.4)
         self.som_sigma = method_cfg.get("som_sigma", None)
@@ -1005,10 +1237,293 @@ class AbliterationPipeline:
         self.som_min_signal_to_noise = method_cfg.get("som_min_signal_to_noise", 0.0)
         self.som_contiguous_layer_budget = method_cfg.get("som_contiguous_layer_budget", False)
 
+        # LEACE and whitened SVD produce a two-sided oblique operator P=I-LR.
+        # Several legacy modifiers only know how to mutate a symmetric list of
+        # directions; accepting those combinations would silently discard the
+        # exact eraser that was just fitted.
+        oblique_requested = self.direction_method == "leace" or self.use_whitened_svd
+        if oblique_requested:
+            incompatible: list[str] = []
+            if self.norm_preserve:
+                incompatible.append("norm_preserve")
+            if self.use_jailbreak_contrast:
+                incompatible.append("use_jailbreak_contrast")
+            if self.harmless_pc_count > 0:
+                incompatible.append("harmless_pc_count")
+            if self.shield_residualize:
+                incompatible.append("shield_residualize")
+            if self.per_expert_directions:
+                incompatible.append("per_expert_directions")
+            if self.use_lora_ablation:
+                incompatible.append("use_lora_ablation")
+            if self.projection_row_fraction < 1.0:
+                incompatible.append("projection_row_fraction")
+            if incompatible:
+                raise ValueError(
+                    "Exact LEACE/whitened-SVD erasers are incompatible with "
+                    + ", ".join(incompatible)
+                    + "; disable those symmetric-only modifiers"
+                )
+
         # Spectral Cascade parameters
         self.spectral_cascade = spectral_cascade if spectral_cascade is not None else method_cfg.get("spectral_cascade", False)
         self.spectral_bands = spectral_bands if spectral_bands is not None else method_cfg.get("spectral_bands", 3)
         self.spectral_threshold = spectral_threshold if spectral_threshold is not None else method_cfg.get("spectral_threshold", 0.05)
+
+        # Named orchestration methods bypass the ordinary EXCISE composition.
+        # Reject overrides that would otherwise be silently ignored or would
+        # bypass the scored intervention under the same public method name.
+        if method == "som":
+            som_incompatibilities: list[str] = []
+            if self.direction_method != "som":
+                som_incompatibilities.append("direction_method must be 'som'")
+            if not 2 <= self.n_directions <= 7:
+                som_incompatibilities.append("n_directions must be in [2, 7]")
+            if self._requested_projection_target != "output":
+                som_incompatibilities.append("projection_target must be 'output'")
+            if not self.use_kl_optimization:
+                som_incompatibilities.append("exact candidate orchestration must remain enabled")
+            if self.norm_preserve:
+                som_incompatibilities.append("norm_preserve must be false")
+            if self.regularization != 0.0:
+                som_incompatibilities.append("regularization must be 0")
+            if self.project_biases:
+                som_incompatibilities.append("project_biases must be false")
+            if self.true_iterative_refinement or self.refinement_passes != 1:
+                som_incompatibilities.append("iterative refinement must remain disabled")
+            if self.layer_selection != "all":
+                som_incompatibilities.append("layer_selection must be 'all'")
+            ignored_flags = {
+                "use_whitened_svd": self.use_whitened_svd,
+                "use_jailbreak_contrast": self.use_jailbreak_contrast,
+                "layer_adaptive_strength": self.layer_adaptive_strength,
+                "safety_neuron_masking": self.safety_neuron_masking,
+                "per_expert_directions": self.per_expert_directions,
+                "attention_head_surgery": self.attention_head_surgery,
+                "use_sae_features": self.use_sae_features,
+                "invert_refusal": self.invert_refusal,
+                "float_layer_interpolation": self.float_layer_interpolation,
+                "use_lora_ablation": self.use_lora_ablation,
+                "use_wasserstein_optimal": self.use_wasserstein_optimal,
+                "spectral_cascade": self.spectral_cascade,
+                "project_lm_head": self.project_lm_head,
+                "project_embeddings": self.project_embeddings,
+                "activation_steering": self.activation_steering,
+                "expert_transplant": self.expert_transplant,
+            }
+            if self.projection_row_fraction != 1.0:
+                som_incompatibilities.append("projection_row_fraction must be 1")
+            if self.min_layer_fraction is not None or self.max_layer_fraction is not None:
+                som_incompatibilities.append("min/max layer fractions must be unset")
+            if self.som_contiguous_layer_budget:
+                som_incompatibilities.append("som_contiguous_layer_budget must be false")
+            if self.harmless_pc_count or self.shield_concept_count or self.shield_residualize:
+                som_incompatibilities.append("generic harmless/shield direction modifiers must be disabled")
+            som_incompatibilities.extend(
+                f"{name} must be false" for name, enabled in ignored_flags.items() if enabled
+            )
+            if som_incompatibilities:
+                raise ValueError(
+                    "method='som' requires its exact scored orchestration: "
+                    + "; ".join(som_incompatibilities)
+                )
+
+        if method in {"gabliteration", "rdo", "som", "optimized", "heretic"} and (
+            self.quantization is not None
+        ):
+            raise ValueError(
+                f"method={method!r} requires dense writable weights and a full "
+                "CPU snapshot; quantization is not supported"
+            )
+
+        if method == "rdo":
+            rdo_incompatibilities: list[str] = []
+            required_rdo_values = (
+                (self.rdo_refinement, True, "rdo_refinement must be true"),
+                (self.n_directions, 1, "n_directions must be 1"),
+                (
+                    self.direction_method,
+                    "diff_means",
+                    "direction_method must be 'diff_means'",
+                ),
+                (self.refinement_passes, 1, "refinement_passes must be 1"),
+                (self.norm_preserve, True, "norm_preserve must be true"),
+                (self.project_biases, False, "project_biases must be false"),
+                (self.layer_selection, "all", "layer_selection must be 'all'"),
+                (self.use_chat_template, True, "use_chat_template must be true"),
+            )
+            rdo_incompatibilities.extend(
+                message
+                for actual, expected, message in required_rdo_values
+                if actual != expected
+            )
+            if self._requested_projection_target != "output":
+                rdo_incompatibilities.append("projection_target must be 'output'")
+            if not math.isclose(self.regularization, 0.0):
+                rdo_incompatibilities.append("regularization must be 0")
+            if self.projection_row_fraction != 1.0:
+                rdo_incompatibilities.append("projection_row_fraction must be 1")
+            if self.min_layer_fraction is not None or self.max_layer_fraction is not None:
+                rdo_incompatibilities.append("min/max layer fractions must be unset")
+            rdo_ignored_flags = {
+                "use_whitened_svd": self.use_whitened_svd,
+                "true_iterative_refinement": self.true_iterative_refinement,
+                "use_jailbreak_contrast": self.use_jailbreak_contrast,
+                "layer_adaptive_strength": self.layer_adaptive_strength,
+                "safety_neuron_masking": self.safety_neuron_masking,
+                "per_expert_directions": self.per_expert_directions,
+                "attention_head_surgery": self.attention_head_surgery,
+                "use_sae_features": self.use_sae_features,
+                "invert_refusal": self.invert_refusal,
+                "winsorize_activations": self.winsorize_activations,
+                "float_layer_interpolation": self.float_layer_interpolation,
+                "use_lora_ablation": self.use_lora_ablation,
+                "use_wasserstein_optimal": self.use_wasserstein_optimal,
+                "spectral_cascade": self.spectral_cascade,
+                "project_lm_head": self.project_lm_head,
+                "project_embeddings": self.project_embeddings,
+                "activation_steering": self.activation_steering,
+                "expert_transplant": self.expert_transplant,
+            }
+            rdo_incompatibilities.extend(
+                f"{name} must be false"
+                for name, enabled in rdo_ignored_flags.items()
+                if enabled
+            )
+            if self.harmless_pc_count or self.shield_concept_count or self.shield_residualize:
+                rdo_incompatibilities.append(
+                    "generic harmless/shield direction modifiers must be disabled"
+                )
+            if rdo_incompatibilities:
+                raise ValueError(
+                    "method='rdo' requires its model-forward training and exact "
+                    "checkpoint adaptation: " + "; ".join(rdo_incompatibilities)
+                )
+
+        if method in {"optimized", "heretic"}:
+            bayesian_incompatibilities: list[str] = []
+            if not self.use_kl_optimization:
+                bayesian_incompatibilities.append(
+                    "exact candidate search and replay cannot be disabled"
+                )
+            expected_direction_method = (
+                "svd" if method == "optimized" else "diff_means"
+            )
+            if self.direction_method != expected_direction_method:
+                bayesian_incompatibilities.append(
+                    f"direction_method must be {expected_direction_method!r}"
+                )
+            if method == "heretic" and self.n_directions != 1:
+                bayesian_incompatibilities.append("n_directions must be 1")
+            if not math.isclose(self.regularization, 0.0):
+                bayesian_incompatibilities.append(
+                    "scalar regularization is owned by the per-component kernels"
+                )
+            if self.refinement_passes != 1 or self.true_iterative_refinement:
+                bayesian_incompatibilities.append(
+                    "ordinary iterative refinement must remain disabled"
+                )
+            if self._requested_projection_target != "output":
+                bayesian_incompatibilities.append("projection_target must be 'output'")
+            bayesian_ignored_flags = {
+                "use_whitened_svd": self.use_whitened_svd,
+                "layer_adaptive_strength": self.layer_adaptive_strength,
+                "safety_neuron_masking": self.safety_neuron_masking,
+                "per_expert_directions": self.per_expert_directions,
+                "attention_head_surgery": self.attention_head_surgery,
+                "use_sae_features": self.use_sae_features,
+                "invert_refusal": self.invert_refusal,
+                "float_layer_interpolation": self.float_layer_interpolation,
+                "use_lora_ablation": self.use_lora_ablation,
+                "use_wasserstein_optimal": self.use_wasserstein_optimal,
+                "spectral_cascade": self.spectral_cascade,
+                "project_lm_head": self.project_lm_head,
+                "project_embeddings": self.project_embeddings,
+                "activation_steering": self.activation_steering,
+                "expert_transplant": self.expert_transplant,
+            }
+            bayesian_incompatibilities.extend(
+                f"{name} must be false"
+                for name, enabled in bayesian_ignored_flags.items()
+                if enabled
+            )
+            if self.harmless_pc_count or self.shield_concept_count or self.shield_residualize:
+                bayesian_incompatibilities.append(
+                    "generic harmless/shield direction modifiers must be disabled"
+                )
+            if bayesian_incompatibilities:
+                raise ValueError(
+                    f"method={method!r} requires its exact scored orchestration: "
+                    + "; ".join(bayesian_incompatibilities)
+                )
+
+        if method == "gabliteration":
+            expected_regularization = 1.0 - (
+                float(method_cfg["gabliteration_alpha"])
+                / (1.0 + float(method_cfg["gabliteration_ridge"]))
+            )
+            gabliteration_incompatibilities: list[str] = []
+            if self.direction_method != "svd":
+                gabliteration_incompatibilities.append("direction_method must be 'svd'")
+            if self._requested_projection_target != "output":
+                gabliteration_incompatibilities.append("projection_target must be 'output'")
+            if not math.isclose(self.regularization, expected_regularization):
+                gabliteration_incompatibilities.append(
+                    "regularization is fixed by alpha_base and ridge_lambda"
+                )
+            if self.norm_preserve or self.project_biases:
+                gabliteration_incompatibilities.append(
+                    "norm preservation and bias projection must remain disabled"
+                )
+            if self.true_iterative_refinement or self.refinement_passes != 1:
+                gabliteration_incompatibilities.append(
+                    "ordinary iterative refinement must remain disabled"
+                )
+            if self.layer_selection != "all":
+                gabliteration_incompatibilities.append("layer_selection must be 'all'")
+            if self.use_kl_optimization:
+                gabliteration_incompatibilities.append(
+                    "generic KL regularization search must remain disabled"
+                )
+            if self.projection_row_fraction != 1.0:
+                gabliteration_incompatibilities.append("projection_row_fraction must be 1")
+            ignored_flags = {
+                "use_whitened_svd": self.use_whitened_svd,
+                "use_jailbreak_contrast": self.use_jailbreak_contrast,
+                "layer_adaptive_strength": self.layer_adaptive_strength,
+                "safety_neuron_masking": self.safety_neuron_masking,
+                "per_expert_directions": self.per_expert_directions,
+                "attention_head_surgery": self.attention_head_surgery,
+                "use_sae_features": self.use_sae_features,
+                "invert_refusal": self.invert_refusal,
+                "winsorize_activations": self.winsorize_activations,
+                "float_layer_interpolation": self.float_layer_interpolation,
+                "use_lora_ablation": self.use_lora_ablation,
+                "use_wasserstein_optimal": self.use_wasserstein_optimal,
+                "spectral_cascade": self.spectral_cascade,
+                "project_lm_head": self.project_lm_head,
+                "project_embeddings": self.project_embeddings,
+                "activation_steering": self.activation_steering,
+                "expert_transplant": self.expert_transplant,
+            }
+            gabliteration_incompatibilities.extend(
+                f"{name} must be false" for name, enabled in ignored_flags.items() if enabled
+            )
+            if (
+                self.min_layer_fraction is not None
+                or self.max_layer_fraction is not None
+                or self.harmless_pc_count
+                or self.shield_concept_count
+                or self.shield_residualize
+            ):
+                gabliteration_incompatibilities.append(
+                    "generic layer/harmless/shield modifiers must be disabled"
+                )
+            if gabliteration_incompatibilities:
+                raise ValueError(
+                    "method='gabliteration' requires its exact scored orchestration: "
+                    + "; ".join(gabliteration_incompatibilities)
+                )
 
         # Tokenizer max_seq_length: controls truncation for all internal
         # tokenizer calls (activation collection, KL eval, verify stage).
@@ -1032,6 +1547,111 @@ class AbliterationPipeline:
         # observing a candidate's score.
         self.damage_gate_enabled = bool(damage_gate_enabled)
         self.damage_budget = damage_budget or AcceptanceBudget()
+        self._preservation_search_requested = self.use_kl_optimization
+        if (self.use_kl_optimization or self.cot_aware) and not self.damage_gate_enabled:
+            raise ValueError(
+                "KL/CoT preservation requires the fail-closed damage gate to be enabled"
+            )
+        if self.use_kl_optimization:
+            if self._requested_projection_target == "auto":
+                raise ValueError(
+                    "use_kl_optimization cannot be combined with projection_target='auto'; "
+                    "each feature performs its own exact candidate search"
+                )
+            if self.damage_budget.damage.unsafe_allow_inconclusive:
+                raise ValueError(
+                    "use_kl_optimization requires fail-closed damage evidence"
+                )
+            if self.damage_budget.efficacy.max_refusal_rate is None:
+                raise ValueError(
+                    "use_kl_optimization requires a held-out refusal-rate limit"
+                )
+            if self.damage_budget.damage.max_p95_sampled_token_kl is None:
+                raise ValueError(
+                    "use_kl_optimization requires a predeclared p95 sampled-token "
+                    "KL limit"
+                )
+            if self.quantization is not None:
+                raise ValueError(
+                    "use_kl_optimization currently supports only dense "
+                    "FP16/BF16/FP32 loading, not quantization"
+                )
+            if self.use_lora_ablation or self.true_iterative_refinement:
+                raise ValueError(
+                    "use_kl_optimization requires deterministic in-place excision; "
+                    "LoRA ablation and true iterative refinement are not supported"
+                )
+            if self.invert_refusal:
+                raise ValueError(
+                    "use_kl_optimization cannot search regularization while "
+                    "invert_refusal overrides it with reflection strength"
+                )
+            if self.damage_budget.damage.min_eval_prompts > 32:
+                raise ValueError(
+                    "use_kl_optimization uses fixed disjoint 32-pair selection and "
+                    "confirmation gates; damage min_eval_prompts cannot exceed 32"
+                )
+            if self.damage_budget.efficacy.min_eval_prompts > 32:
+                raise ValueError(
+                    "use_kl_optimization uses fixed disjoint 32-pair selection and "
+                    "confirmation gates; efficacy min_eval_prompts cannot exceed 32"
+                )
+            existing_kl_limit = (
+                self.damage_budget.damage.max_sampled_token_kl_upper_ci
+            )
+            self.kl_budget = (
+                self._requested_kl_budget
+                if existing_kl_limit is None
+                else min(self._requested_kl_budget, existing_kl_limit)
+            )
+            self.damage_budget = replace(
+                self.damage_budget,
+                damage=replace(
+                    self.damage_budget.damage,
+                    max_sampled_token_kl_upper_ci=self.kl_budget,
+                ),
+            )
+        if self.cot_aware:
+            if self.damage_budget.damage.unsafe_allow_inconclusive:
+                raise ValueError(
+                    "cot_aware requires fail-closed damage evidence"
+                )
+            if self.quantization is not None:
+                raise ValueError(
+                    "cot_aware currently supports only dense FP16/BF16/FP32 "
+                    "loading so a rejected candidate can be restored exactly"
+                )
+            existing_reasoning_limit = (
+                self.damage_budget.damage.max_cot_reasoning_ce_increase
+            )
+            existing_answer_limit = (
+                self.damage_budget.damage.max_cot_answer_ce_increase
+            )
+            self.cot_reasoning_ce_budget = (
+                self._requested_cot_reasoning_ce_budget
+                if existing_reasoning_limit is None
+                else min(
+                    self._requested_cot_reasoning_ce_budget,
+                    existing_reasoning_limit,
+                )
+            )
+            self.cot_answer_ce_budget = (
+                self._requested_cot_answer_ce_budget
+                if existing_answer_limit is None
+                else min(
+                    self._requested_cot_answer_ce_budget,
+                    existing_answer_limit,
+                )
+            )
+            self.damage_budget = replace(
+                self.damage_budget,
+                damage=replace(
+                    self.damage_budget.damage,
+                    max_cot_reasoning_ce_increase=self.cot_reasoning_ce_budget,
+                    max_cot_answer_ce_increase=self.cot_answer_ce_budget,
+                    min_cot_eval_examples=self.cot_min_eval_examples,
+                ),
+            )
         if self._requested_projection_target == "auto":
             if not self.damage_gate_enabled:
                 raise ValueError(
@@ -1081,11 +1701,11 @@ class AbliterationPipeline:
         ):
             raise ValueError("damage_eval_max_samples must be a positive integer")
         if (
-            self._requested_projection_target == "auto"
+            (self._requested_projection_target == "auto" or self.use_kl_optimization)
             and damage_eval_max_samples < 64
         ):
             raise ValueError(
-                "projection_target='auto' reserves 64 held-out pairs; "
+                "candidate search reserves 64 held-out pairs; "
                 "damage_eval_max_samples must be at least 64"
             )
         if not isinstance(damage_eval_seed, int) or isinstance(damage_eval_seed, bool):
@@ -1107,6 +1727,26 @@ class AbliterationPipeline:
         self.damage_eval_seed = damage_eval_seed
         self.damage_kl_positions_per_prompt = damage_kl_positions_per_prompt
         self.damage_generation_samples = damage_generation_samples
+        generation_health_prompts = tuple(
+            BENIGN_GENERATION_HEALTH_PROMPTS[: self.damage_generation_samples]
+        )
+        if self._requested_projection_target == "auto" or self.use_kl_optimization:
+            if len(generation_health_prompts) < 2:
+                raise ValueError(
+                    "candidate search requires at least two benign generation-health "
+                    "prompts so selection and confirmation remain disjoint"
+                )
+            health_midpoint = len(generation_health_prompts) // 2
+            self._selection_generation_health_prompts = (
+                generation_health_prompts[:health_midpoint]
+            )
+            self._confirmation_generation_health_prompts = (
+                generation_health_prompts[health_midpoint:]
+            )
+        else:
+            self._selection_generation_health_prompts = generation_health_prompts
+            self._confirmation_generation_health_prompts = ()
+        self._generation_health_prompts = generation_health_prompts
         self._prompt_split: PromptSplit = split_prompt_pairs(
             self.harmful_prompts,
             self.harmless_prompts,
@@ -1114,12 +1754,12 @@ class AbliterationPipeline:
             seed=damage_eval_seed,
             min_holdout=(
                 64
-                if self._requested_projection_target == "auto"
+                if self._requested_projection_target == "auto" or self.use_kl_optimization
                 else self.damage_budget.damage.min_eval_prompts
             ),
             min_discovery=(
                 32
-                if self._requested_projection_target == "auto"
+                if self._requested_projection_target == "auto" or self.use_kl_optimization
                 else self.damage_budget.damage.min_eval_prompts
             ),
             evaluation_harmful=evaluation_harmful_prompts,
@@ -1133,10 +1773,10 @@ class AbliterationPipeline:
         self._auto_selection_harmless: list[str] = []
         self._auto_confirmation_harmful: list[str] = []
         self._auto_confirmation_harmless: list[str] = []
-        if self._requested_projection_target == "auto":
+        if self._requested_projection_target == "auto" or self.use_kl_optimization:
             if not self._prompt_split.disjoint or len(self._holdout_harmful) < 64:
                 raise ValueError(
-                    "projection_target='auto' requires at least 64 duplicate-disjoint "
+                    "candidate search requires at least 64 duplicate-disjoint "
                     "held-out prompt pairs: 32 for selection and 32 for confirmation"
                 )
             reserved_harmful = self._holdout_harmful[:64]
@@ -1154,7 +1794,7 @@ class AbliterationPipeline:
                 or len(auto_split.holdout_harmful) != 32
             ):
                 raise ValueError(
-                    "projection_target='auto' could not form duplicate-group-disjoint "
+                    "candidate search could not form duplicate-group-disjoint "
                     "32-pair selection and confirmation sets; provide 64 unique "
                     "evaluation prompt pairs"
                 )
@@ -1187,6 +1827,9 @@ class AbliterationPipeline:
         self._projection_manifests: dict[str, ProjectionManifest] = {}
         self.refusal_directions: dict[int, torch.Tensor] = {}  # per-layer primary direction
         self.refusal_subspaces: dict[int, torch.Tensor] = {}   # per-layer SVD subspace (n_dirs x hidden)
+        # Exact low-rank operators for backends whose eraser is oblique.  The
+        # display directions above are never sufficient to replay these maps.
+        self.residual_erasers: dict[int, ResidualEraser] = {}
         self._strong_layers: list[int] = []
         self._harmful_acts: dict[int, list[torch.Tensor]] = {}
         self._harmless_acts: dict[int, list[torch.Tensor]] = {}
@@ -1197,19 +1840,36 @@ class AbliterationPipeline:
         self._damage_baseline: list[LocalityBaseline] = []
         self._locality_measurement: Any | None = None
         self._baseline_generation_health: dict[str, Any] | None = None
+        self._selection_generation_health_baseline: dict[str, Any] | None = None
+        self._confirmation_generation_health_baseline: dict[str, Any] | None = None
         self._damage_assessment: DamageAssessment | None = None
 
         # LoRA ablation state (reversible adapters)
         self._lora_adapters: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        # KL optimization state (per-layer KL contribution tracking)
-        self._kl_contributions: dict[int, float] = {}
+        # Exact KL-constrained candidate-search state.
+        self._kl_search_results: list[dict[str, Any]] = []
+        self._kl_selected_regularization: float | None = None
         # Float layer interpolation: continuous layer weights
         self._float_layer_weights: dict[int, float] = {}
         # Bayesian optimizer component-specific scales (set by optimizer)
         self._bayesian_attn_scale: float | None = None
         self._bayesian_mlp_scale: float | None = None
-        # CoT-aware: identified reasoning-critical directions to preserve
-        self._cot_preserve_directions: dict[int, torch.Tensor] = {}
+        # Complete scored/replayed plan for Optimized and Heretic.  This is
+        # intentionally distinct from the legacy averaged layer scalars.
+        self._bayesian_optimization_result: Any | None = None
+        self._gabliteration_search_result: Any | None = None
+        self._rdo_result: Any | None = None
+        self._som_paper_result: Any | None = None
+        self._som_direction_pool: Any | None = None
+        self._som_source_layer: int | None = None
+        self._som_confirmation_evidence: dict[str, Any] | None = None
+        # CoT preservation stores explicit reference examples and untouched
+        # teacher-forced scores; it never invents a reasoning direction from
+        # prompt activations.
+        self._cot_active_examples: tuple[CoTPreservationExample, ...] = ()
+        self._cot_baseline: CoTScoreSnapshot | None = None
+        self._cot_selection_baseline: CoTScoreSnapshot | None = None
+        self._cot_confirmation_baseline: CoTScoreSnapshot | None = None
 
         # Jailbreak-contrastive state
         self._jailbreak_acts: dict[int, list[torch.Tensor]] = {}
@@ -1251,6 +1911,104 @@ class AbliterationPipeline:
     def _free_gpu_memory():
         """Release unused GPU/accelerator memory between pipeline stages."""
         dev.free_gpu_memory()
+
+    @staticmethod
+    def _normalize_cot_preservation_examples(
+        examples: Iterable[CoTPreservationExample | dict[str, str]],
+    ) -> tuple[CoTPreservationExample, ...]:
+        """Validate explicit CoT references without inferring hidden traces."""
+
+        try:
+            raw_examples = tuple(examples)
+        except TypeError as exc:
+            raise ValueError(
+                "cot_preservation_examples must be an iterable of explicit examples"
+            ) from exc
+        normalized: list[CoTPreservationExample] = []
+        for index, example in enumerate(raw_examples):
+            if isinstance(example, CoTPreservationExample):
+                normalized.append(example)
+                continue
+            if not isinstance(example, dict):
+                raise ValueError(
+                    "cot_preservation_examples entries must be "
+                    "CoTPreservationExample values or dictionaries"
+                )
+            try:
+                normalized.append(
+                    CoTPreservationExample(
+                        prompt=example["prompt"],
+                        reference_reasoning=example.get(
+                            "reference_reasoning",
+                            example.get("reasoning", ""),
+                        ),
+                        reference_answer=example.get(
+                            "reference_answer",
+                            example.get("answer", ""),
+                        ),
+                        example_id=example.get("example_id", f"example_{index}"),
+                    )
+                )
+            except (KeyError, TypeError, CoTPreservationError) as exc:
+                raise ValueError(
+                    f"Invalid cot_preservation_examples entry at index {index}: {exc}"
+                ) from exc
+        seen_ids: set[str] = set()
+        seen_prompts: set[str] = set()
+        seen_references: set[tuple[str, str, str]] = set()
+        for index, example in enumerate(normalized):
+            if example.example_id is not None:
+                normalized_id = " ".join(example.example_id.split()).casefold()
+                if normalized_id in seen_ids:
+                    raise ValueError(
+                        "cot_preservation_examples contains duplicate example_id "
+                        f"{example.example_id!r} at index {index}"
+                    )
+                seen_ids.add(normalized_id)
+            normalized_prompt = " ".join(example.prompt.split()).casefold()
+            if normalized_prompt in seen_prompts:
+                raise ValueError(
+                    "cot_preservation_examples contains a duplicate normalized "
+                    f"prompt at index {index}; selection and confirmation must "
+                    "not score alternate traces for the same task"
+                )
+            seen_prompts.add(normalized_prompt)
+            signature = tuple(
+                " ".join(value.split()).casefold()
+                for value in (
+                    example.prompt,
+                    example.reference_reasoning,
+                    example.reference_answer,
+                )
+            )
+            if signature in seen_references:
+                raise ValueError(
+                    "cot_preservation_examples contains duplicate normalized "
+                    f"reference content at index {index}"
+                )
+            seen_references.add(signature)
+        return tuple(normalized)
+
+    @staticmethod
+    def _fingerprint_text_sequence(values: Iterable[str]) -> str:
+        """Hash an ordered text sequence without persisting its contents."""
+
+        payload = json.dumps(list(values), ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _fingerprint_prompt_pairs(
+        cls,
+        harmful: Iterable[str],
+        harmless: Iterable[str],
+    ) -> str:
+        """Hash ordered harmful/harmless pairs for replay auditability."""
+
+        payload = [
+            f"{harmful_text}\N{NULL}{harmless_text}"
+            for harmful_text, harmless_text in zip(harmful, harmless, strict=True)
+        ]
+        return cls._fingerprint_text_sequence(payload)
 
     def _remove_activation_steering(self) -> int:
         """Remove runtime-only hooks before measuring or saving the artifact.
@@ -1387,14 +2145,11 @@ class AbliterationPipeline:
             def make_hook(layer_idx: int):
                 def hook_fn(module, input, output):
                     logits = output if isinstance(output, torch.Tensor) else output[0]
-                    # Extract router logits — use mean across positions for
-                    # CoT-aware models so we capture expert routing at reasoning
-                    # tokens, not just the final output token.
+                    # Extract router logits at the prompt boundary. CoT
+                    # preservation is evaluated on explicit reasoning/answer
+                    # token spans; it does not change direction-discovery data.
                     if logits.dim() == 3:
-                        if getattr(self, "cot_aware", False) and logits.shape[1] > 4:
-                            logits = logits.mean(dim=1)  # (batch, num_experts)
-                        else:
-                            logits = logits[:, -1, :]  # (batch, num_experts)
+                        logits = logits[:, -1, :]  # (batch, num_experts)
                     elif logits.dim() == 2 and logits.shape[0] > 1:
                         logits = logits[-1:, :]
                     target = (self._routing_harmful
@@ -1494,7 +2249,10 @@ class AbliterationPipeline:
                 f"No validated manifest exists for projection target {self.projection_target!r}"
             ) from exc
 
-    def _assert_auto_projection_prerequisites(self) -> None:
+    def _assert_auto_projection_prerequisites(
+        self,
+        purpose: str = "projection_target='auto'",
+    ) -> None:
         """Require an exactly restorable dense model for candidate search.
 
         Auto target selection deliberately pays the memory cost of a complete
@@ -1503,10 +2261,10 @@ class AbliterationPipeline:
         dependent and could leave a rejected edit in the eventual checkpoint.
         """
         if self.handle is None:
-            raise RuntimeError("projection_target='auto' requires a loaded model")
+            raise RuntimeError(f"{purpose} requires a loaded model")
         snapshot = getattr(self.handle, "_original_state", None)
         snapshot_error = (
-            "projection_target='auto' requires a full CPU snapshot for exact "
+            f"{purpose} requires a full CPU snapshot for exact "
             "candidate rollback; budget roughly another model-size of RAM"
         )
         if snapshot is None:
@@ -1528,7 +2286,7 @@ class AbliterationPipeline:
         quantization_config = getattr(self.handle.config, "quantization_config", None)
         if quantization_config is not None:
             raise RuntimeError(
-                "projection_target='auto' currently supports only dense FP16/BF16/FP32 "
+                f"{purpose} currently supports only dense FP16/BF16/FP32 "
                 "models; quantized checkpoint restore equivalence is not proven"
             )
 
@@ -1536,17 +2294,17 @@ class AbliterationPipeline:
         for module in self.handle.model.modules():
             if hasattr(module, "qweight"):
                 raise RuntimeError(
-                    "projection_target='auto' does not support packed quantized modules"
+                    f"{purpose} does not support packed quantized modules"
                 )
             weight = getattr(module, "weight", None)
             if weight is not None and self._is_quantized_param(weight):
                 raise RuntimeError(
-                    "projection_target='auto' does not support quantized parameters"
+                    f"{purpose} does not support quantized parameters"
                 )
         for parameter in self.handle.model.parameters():
             if parameter.device.type == "meta" or parameter.dtype not in allowed_dtypes:
                 raise RuntimeError(
-                    "projection_target='auto' requires dense, materialized "
+                    f"{purpose} requires dense, materialized "
                     "FP16/BF16/FP32 parameters"
                 )
 
@@ -1562,6 +2320,11 @@ class AbliterationPipeline:
             ("coherence_drop", budget.max_coherence_drop),
             ("new_degenerate_count", budget.max_new_degenerate_outputs),
             ("nonfinite_output_count", budget.max_nonfinite_output_count),
+            (
+                "cot_reasoning_ce_increase",
+                budget.max_cot_reasoning_ce_increase,
+            ),
+            ("cot_answer_ce_increase", budget.max_cot_answer_ce_increase),
         )
         fractions: list[float] = []
         for metric_name, limit in checks:
@@ -1581,15 +2344,17 @@ class AbliterationPipeline:
     def _restore_auto_projection_baseline(
         self,
         baseline_layer_weights: dict[int, float],
+        *,
+        purpose: str = "projection_target='auto'",
     ) -> None:
         """Restore both model weights and mutable excision bookkeeping."""
         self._remove_activation_steering()
-        self._assert_auto_projection_prerequisites()
+        self._assert_auto_projection_prerequisites(purpose)
         try:
             self.handle.restore()
         except Exception as exc:
             raise RuntimeError(
-                "Exact auto-candidate rollback failed; refusing to evaluate or save"
+                f"Exact {purpose} candidate rollback failed; refusing to evaluate or save"
             ) from exc
         self._layer_excise_weights = dict(baseline_layer_weights)
         self._lora_adapters.clear()
@@ -1629,7 +2394,7 @@ class AbliterationPipeline:
                 break
             else:
                 raise RuntimeError(
-                    "Auto projection locality batches cross a 32-prompt boundary; "
+                    "Candidate-search locality batches cross a 32-prompt boundary; "
                     "refusing a non-comparable selection/confirmation split"
                 )
             prompt_offset = batch_end
@@ -1637,7 +2402,7 @@ class AbliterationPipeline:
                 break
         if prompt_offset != 64:
             raise RuntimeError(
-                "projection_target='auto' requires untouched locality artifacts "
+                "Candidate search requires untouched locality artifacts "
                 "for all 64 reserved held-out pairs"
             )
         return selection, confirmation
@@ -1651,28 +2416,47 @@ class AbliterationPipeline:
         original_harmful = list(self._holdout_harmful)
         original_harmless = list(self._holdout_harmless)
         original_baseline = list(self._damage_baseline)
+        original_generation_prompts = self._generation_health_prompts
+        original_generation_baseline = self._baseline_generation_health
         original_verify_sample_size = self.verify_sample_size
+        original_cot_active_examples = self._cot_active_examples
+        original_cot_baseline = self._cot_baseline
         tokenizer = self.handle.tokenizer
         tokenizer_state = {}
         for name in ("padding_side", "pad_token_id"):
             if hasattr(tokenizer, name):
                 tokenizer_state[name] = getattr(tokenizer, name)
-        self._projection_auto_tokenizer_state = {
-            "tokenizer": tokenizer_state,
-            "use_chat_template": self.use_chat_template,
-        }
-
-        self._holdout_harmful = list(self._auto_selection_harmful)
-        self._holdout_harmless = list(self._auto_selection_harmless)
-        self._damage_baseline = selection_baseline
-        self.verify_sample_size = 32
         try:
+            self._projection_auto_tokenizer_state = {
+                "tokenizer": tokenizer_state,
+                "use_chat_template": self.use_chat_template,
+            }
+            self._holdout_harmful = list(self._auto_selection_harmful)
+            self._holdout_harmless = list(self._auto_selection_harmless)
+            self._damage_baseline = selection_baseline
+            self._generation_health_prompts = (
+                self._selection_generation_health_prompts
+            )
+            self._baseline_generation_health = (
+                self._selection_generation_health_baseline
+            )
+            self.verify_sample_size = 32
+            if self.cot_aware:
+                if self._cot_selection_baseline is None:
+                    raise RuntimeError("CoT selection baseline was not captured")
+                midpoint = len(self._cot_examples) // 2
+                self._cot_active_examples = self._cot_examples[:midpoint]
+                self._cot_baseline = self._cot_selection_baseline
             return self._run_auto_projection_search_inner(confirmation_baseline)
         finally:
             self._holdout_harmful = original_harmful
             self._holdout_harmless = original_harmless
             self._damage_baseline = original_baseline
+            self._generation_health_prompts = original_generation_prompts
+            self._baseline_generation_health = original_generation_baseline
             self.verify_sample_size = original_verify_sample_size
+            self._cot_active_examples = original_cot_active_examples
+            self._cot_baseline = original_cot_baseline
             self._restore_auto_tokenizer_state()
             self._projection_auto_tokenizer_state = None
 
@@ -1789,7 +2573,17 @@ class AbliterationPipeline:
         self._holdout_harmful = list(self._auto_confirmation_harmful)
         self._holdout_harmless = list(self._auto_confirmation_harmless)
         self._damage_baseline = list(confirmation_baseline)
+        self._generation_health_prompts = self._confirmation_generation_health_prompts
+        self._baseline_generation_health = (
+            self._confirmation_generation_health_baseline
+        )
         self.verify_sample_size = 32
+        if self.cot_aware:
+            if self._cot_confirmation_baseline is None:
+                raise RuntimeError("CoT confirmation baseline was not captured")
+            midpoint = len(self._cot_examples) // 2
+            self._cot_active_examples = self._cot_examples[midpoint:]
+            self._cot_baseline = self._cot_confirmation_baseline
         self.projection_target = selected_target
         self._projection_auto_selected = selected_target
         self.log(
@@ -1809,6 +2603,815 @@ class AbliterationPipeline:
             self.projection_target = self._requested_projection_target
             self._reject_and_restore(final_assessment)
         return final_assessment
+
+    def _kl_regularization_candidates(self) -> tuple[float, ...]:
+        """Return a deterministic strong-to-gentle preservation search grid.
+
+        ``regularization`` is the aligned fraction preserved, so increasing it
+        weakens the edit. The user's requested value is always evaluated first;
+        the remaining candidates approach, but do not include, the no-op value
+        of one.
+        """
+
+        start = float(self._requested_regularization)
+        stop = max(start, 0.95)
+        if math.isclose(start, stop, rel_tol=0.0, abs_tol=1e-12):
+            return (start,)
+        values = [
+            start + (stop - start) * index / (self.kl_search_steps - 1)
+            for index in range(self.kl_search_steps)
+        ]
+        return tuple(dict.fromkeys(round(value, 12) for value in values))
+
+    def _run_kl_preservation_search(self) -> DamageAssessment:
+        """Select and exactly replay a KL-bounded regularization candidate.
+
+        Search and confirmation use duplicate-disjoint 32-pair partitions.
+        Every trial starts from the immutable CPU snapshot, applies the full
+        checkpoint edit, and runs the ordinary damage/efficacy gate. The winner
+        is then restored and replayed once on the untouched confirmation half.
+        """
+
+        purpose = "use_kl_optimization"
+        self._assert_auto_projection_prerequisites(purpose)
+        selection_baseline, confirmation_baseline = (
+            self._split_auto_locality_baseline(self._damage_baseline)
+        )
+        original_harmful = list(self._holdout_harmful)
+        original_harmless = list(self._holdout_harmless)
+        original_baseline = list(self._damage_baseline)
+        original_generation_prompts = self._generation_health_prompts
+        original_generation_baseline = self._baseline_generation_health
+        original_verify_sample_size = self.verify_sample_size
+        original_cot_active_examples = self._cot_active_examples
+        original_cot_baseline = self._cot_baseline
+        tokenizer = self.handle.tokenizer
+        tokenizer_state = {}
+        for name in ("padding_side", "pad_token_id"):
+            if hasattr(tokenizer, name):
+                tokenizer_state[name] = getattr(tokenizer, name)
+        try:
+            self._projection_auto_tokenizer_state = {
+                "tokenizer": tokenizer_state,
+                "use_chat_template": self.use_chat_template,
+            }
+            self._holdout_harmful = list(self._auto_selection_harmful)
+            self._holdout_harmless = list(self._auto_selection_harmless)
+            self._damage_baseline = selection_baseline
+            self._generation_health_prompts = (
+                self._selection_generation_health_prompts
+            )
+            self._baseline_generation_health = (
+                self._selection_generation_health_baseline
+            )
+            self.verify_sample_size = 32
+            if self.cot_aware:
+                if self._cot_selection_baseline is None:
+                    raise RuntimeError("CoT selection baseline was not captured")
+                midpoint = len(self._cot_examples) // 2
+                self._cot_active_examples = self._cot_examples[:midpoint]
+                self._cot_baseline = self._cot_selection_baseline
+            return self._run_kl_preservation_search_inner(confirmation_baseline)
+        finally:
+            self._holdout_harmful = original_harmful
+            self._holdout_harmless = original_harmless
+            self._damage_baseline = original_baseline
+            self._generation_health_prompts = original_generation_prompts
+            self._baseline_generation_health = original_generation_baseline
+            self.verify_sample_size = original_verify_sample_size
+            self._cot_active_examples = original_cot_active_examples
+            self._cot_baseline = original_cot_baseline
+            self._restore_auto_tokenizer_state()
+            self._projection_auto_tokenizer_state = None
+
+    def _run_kl_preservation_search_inner(
+        self,
+        confirmation_baseline: list[LocalityBaseline],
+    ) -> DamageAssessment:
+        """Choose the lowest-KL exact edit among candidates meeting hard gates."""
+
+        if self.method == "som":
+            return self._run_som_paper_search_inner(confirmation_baseline)
+        if self.method in {"optimized", "heretic"}:
+            return self._run_bayesian_projection_search_inner(
+                confirmation_baseline
+            )
+
+        purpose = "use_kl_optimization"
+        self._assert_auto_projection_prerequisites(purpose)
+        baseline_layer_weights = dict(self._layer_excise_weights)
+        self._kl_search_results = []
+        self._kl_selected_regularization = None
+        accepted: list[
+            tuple[tuple[float, float, float, int], float, DamageAssessment]
+        ] = []
+        rejected: list[tuple[float, DamageAssessment]] = []
+        candidates = self._kl_regularization_candidates()
+        self.log(
+            "KL preservation search: exact candidate replay inside the held-out "
+            f"mean-KL upper-confidence budget {self.kl_budget:.6g}"
+        )
+
+        for order, candidate_regularization in enumerate(candidates):
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self.regularization = candidate_regularization
+            self.log(
+                f"  KL candidate {order + 1}/{len(candidates)}: "
+                f"regularization={candidate_regularization:.6g}"
+            )
+            try:
+                self._excise()
+                self._remove_activation_steering()
+                assessment = self._verify()
+            except Exception as exc:
+                self._kl_search_results.append(
+                    {
+                        "regularization": candidate_regularization,
+                        "accepted": False,
+                        "error": str(exc),
+                    }
+                )
+                self.log(
+                    f"  KL candidate {candidate_regularization:.6g} failed: {exc}"
+                )
+                continue
+            except BaseException:
+                # Cancellation is not a scored candidate failure.  Restore the
+                # immutable model before propagating it to the caller.
+                self._restore_auto_projection_baseline(
+                    baseline_layer_weights,
+                    purpose=purpose,
+                )
+                self.regularization = self._requested_regularization
+                self._kl_selected_regularization = None
+                raise
+
+            refusal_value = assessment.metrics.get("refusal_rate")
+            refusal_rate = (
+                float(refusal_value)
+                if refusal_value is not None
+                and math.isfinite(float(refusal_value))
+                else float("inf")
+            )
+            normalized_damage = self._normalized_projection_damage(assessment)
+            mean_kl_value = assessment.metrics.get("sampled_token_kl_mean")
+            p95_kl_value = assessment.metrics.get("sampled_token_kl_p95")
+            mean_kl = (
+                float(mean_kl_value)
+                if mean_kl_value is not None
+                and math.isfinite(float(mean_kl_value))
+                else float("inf")
+            )
+            p95_kl = (
+                float(p95_kl_value)
+                if p95_kl_value is not None
+                and math.isfinite(float(p95_kl_value))
+                else float("inf")
+            )
+            self._kl_search_results.append(
+                {
+                    "regularization": candidate_regularization,
+                    "accepted": assessment.accepted,
+                    "refusal_rate": (
+                        refusal_rate if math.isfinite(refusal_rate) else None
+                    ),
+                    "normalized_damage": (
+                        normalized_damage
+                        if math.isfinite(normalized_damage)
+                        else None
+                    ),
+                    "sampled_token_kl_upper_ci": assessment.metrics.get(
+                        "sampled_token_kl_upper_ci"
+                    ),
+                    "sampled_token_kl_p95": assessment.metrics.get(
+                        "sampled_token_kl_p95"
+                    ),
+                    "cot_reasoning_ce_increase": assessment.metrics.get(
+                        "cot_reasoning_ce_increase"
+                    ),
+                    "cot_answer_ce_increase": assessment.metrics.get(
+                        "cot_answer_ce_increase"
+                    ),
+                    "assessment": assessment.to_dict(),
+                }
+            )
+            if assessment.accepted:
+                accepted.append(
+                    (
+                        (mean_kl, p95_kl, refusal_rate, order),
+                        candidate_regularization,
+                        assessment,
+                    )
+                )
+            else:
+                rejected.append((refusal_rate, assessment))
+
+        if not accepted:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self.regularization = self._requested_regularization
+            if rejected:
+                _, failure = min(rejected, key=lambda item: item[0])
+                self._damage_assessment = failure
+                raise DamageGateError(failure)
+            raise RuntimeError(
+                "Every KL-preservation candidate failed before producing "
+                "conclusive acceptance evidence"
+            )
+
+        _, selected_regularization, _ = min(accepted, key=lambda item: item[0])
+        self.log(
+            "  KL preservation selected regularization="
+            f"{selected_regularization:.6g}; replaying on untouched confirmation data"
+        )
+        self._restore_auto_projection_baseline(
+            baseline_layer_weights,
+            purpose=purpose,
+        )
+        self._holdout_harmful = list(self._auto_confirmation_harmful)
+        self._holdout_harmless = list(self._auto_confirmation_harmless)
+        self._damage_baseline = list(confirmation_baseline)
+        self._generation_health_prompts = self._confirmation_generation_health_prompts
+        self._baseline_generation_health = (
+            self._confirmation_generation_health_baseline
+        )
+        self.verify_sample_size = 32
+        if self.cot_aware:
+            if self._cot_confirmation_baseline is None:
+                raise RuntimeError("CoT confirmation baseline was not captured")
+            midpoint = len(self._cot_examples) // 2
+            self._cot_active_examples = self._cot_examples[midpoint:]
+            self._cot_baseline = self._cot_confirmation_baseline
+        self.regularization = selected_regularization
+        self._kl_selected_regularization = selected_regularization
+        try:
+            self._excise()
+            self._remove_activation_steering()
+            final_assessment = self._verify()
+        except BaseException:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self.regularization = self._requested_regularization
+            self._kl_selected_regularization = None
+            raise
+        if not final_assessment.accepted:
+            self._kl_selected_regularization = None
+            self.regularization = self._requested_regularization
+            self._reject_and_restore(final_assessment)
+        return final_assessment
+
+    def _run_som_paper_search_inner(
+        self,
+        confirmation_baseline: list[LocalityBaseline],
+    ) -> DamageAssessment:
+        """Run ordered SOM subset TPE and confirm its exact replay once."""
+
+        from obliteratus.analysis.som_paper import (
+            HarmBenchJudgeAdapter,
+            SOMBehaviorExample,
+            SOMEvidenceSplits,
+            SOMGeneratorEvidence,
+            SOMPaperSearchResult,
+            SOMProjectionTarget,
+            SOMSearchConfig,
+            replay_som_winner,
+            search_som_direction_subsets,
+        )
+
+        if self.handle is None or self._som_direction_pool is None:
+            raise RuntimeError("Paper SOM direction training was not completed")
+        purpose = "method='som' ordered behavioral TPE search"
+        self._assert_auto_projection_prerequisites(purpose)
+        baseline_layer_weights = dict(self._layer_excise_weights)
+        manifest = self._current_projection_manifest()
+        if manifest.target != "output":
+            raise RuntimeError("Paper SOM requires projection_target='output'")
+        projection_targets = tuple(
+            SOMProjectionTarget(
+                name=entry.qualified_name,
+                tensor=entry.parameter,
+                residual_axis=entry.residual_axis,
+            )
+            for entry in manifest.entries
+        )
+
+        def evidence_id(text: str) -> str:
+            # The same normalized text must receive the same identity in every
+            # partition so SOMEvidenceSplits can detect leakage. Prefixing the
+            # partition would manufacture disjoint IDs for duplicate prompts.
+            return hashlib.sha256(
+                " ".join(text.split()).casefold().encode()
+            ).hexdigest()
+
+        splits = SOMEvidenceSplits(
+            harmful_train_ids=tuple(
+                evidence_id(prompt)
+                for prompt in self._discovery_harmful
+            ),
+            harmless_train_ids=tuple(
+                evidence_id(prompt)
+                for prompt in self._discovery_harmless
+            ),
+            validation=tuple(
+                SOMBehaviorExample(
+                    evidence_id(prompt),
+                    prompt,
+                )
+                for prompt in self._auto_selection_harmful
+            ),
+            test=tuple(
+                SOMBehaviorExample(
+                    evidence_id(prompt),
+                    prompt,
+                )
+                for prompt in self._auto_confirmation_harmful
+            ),
+        )
+        all_examples = (*splits.validation, *splits.test)
+        rendered = self._maybe_apply_chat_template(
+            [
+                (
+                    f"{example.context}\n\n{example.behavior}"
+                    if example.context
+                    else example.behavior
+                )
+                for example in all_examples
+            ]
+        )
+        rendered_by_id = {
+            example.example_id: prompt
+            for example, prompt in zip(all_examples, rendered, strict=True)
+        }
+        pipeline = self
+
+        class _Generator:
+            evidence = SOMGeneratorEvidence(
+                model_id=pipeline.model_name,
+                decoding="greedy; chat template; max_new_tokens=64",
+                implementation_version="OBLITERATUS-som-generator-v1",
+            )
+
+            def generate(self, model: nn.Module, examples):
+                prompts = tuple(rendered_by_id[example.example_id] for example in examples)
+                return pipeline._generate_gabliteration_responses(model, prompts)
+
+        generator = _Generator()
+        judge = HarmBenchJudgeAdapter()
+
+        def release_judge() -> None:
+            from obliteratus.evaluation.heretic_eval import (
+                unload_harmbench_classifier,
+            )
+
+            unload_harmbench_classifier()
+
+        search_config = SOMSearchConfig(
+            subset_size=self.n_directions,
+            n_trials=int(METHODS[self.method].get("som_search_trials", 512)),
+            sampler="optuna_tpe",
+            allow_deterministic_fallback=False,
+            seed=int(METHODS[self.method].get("som_seed", 0)),
+        )
+        self.log(
+            "Paper SOM: ordered unique-subset Optuna TPE with real checkpoint "
+            f"trials ({search_config.resolved_trials} trials)"
+        )
+        if (
+            self._som_direction_pool.harmful_example_count
+            != len(splits.harmful_train_ids)
+            or self._som_direction_pool.harmless_example_count
+            != len(splits.harmless_train_ids)
+        ):
+            raise RuntimeError(
+                "SOM direction-pool rows do not match the bound training evidence IDs"
+            )
+        try:
+            search = search_som_direction_subsets(
+                model=self.handle.model,
+                projection_targets=projection_targets,
+                directions=self._som_direction_pool.directions,
+                splits=splits,
+                generator=generator,
+                judge=judge,
+                config=search_config,
+                restore_full_state=self.handle.restore,
+            )
+            result = SOMPaperSearchResult(
+                direction_pool=self._som_direction_pool,
+                search=search,
+            )
+        except BaseException:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self._som_paper_result = None
+            self._som_confirmation_evidence = None
+            release_judge()
+            raise
+
+        # Rebuild from the full immutable snapshot before the one permitted
+        # confirmation replay. The SOM replay then verifies target bytes and
+        # its stored winner hash independently.
+        try:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+        except BaseException:
+            self._som_paper_result = None
+            self._som_confirmation_evidence = None
+            release_judge()
+            raise
+        self._holdout_harmful = list(self._auto_confirmation_harmful)
+        self._holdout_harmless = list(self._auto_confirmation_harmless)
+        self._damage_baseline = list(confirmation_baseline)
+        self._generation_health_prompts = self._confirmation_generation_health_prompts
+        self._baseline_generation_health = (
+            self._confirmation_generation_health_baseline
+        )
+        self.verify_sample_size = 32
+        try:
+            final_hash = replay_som_winner(projection_targets, search.replay)
+            test_generations = tuple(
+                generator.generate(self.handle.model, splits.test)
+            )
+            test_labels = tuple(
+                int(value)
+                for value in judge.classify(
+                    [example.behavior for example in splits.test],
+                    test_generations,
+                )
+            )
+            if len(test_labels) != len(splits.test) or any(
+                value not in {0, 1} for value in test_labels
+            ):
+                raise RuntimeError("HarmBench confirmation returned malformed labels")
+            self._som_confirmation_evidence = {
+                "example_count": len(test_labels),
+                "successes": sum(test_labels),
+                "asr": sum(test_labels) / len(test_labels),
+                "split_fingerprint": splits.fingerprints()["test"],
+                "generation_hashes": [
+                    hashlib.sha256(value.encode()).hexdigest()
+                    for value in test_generations
+                ],
+                "labels": list(test_labels),
+                "edited_checkpoint_sha256": final_hash,
+            }
+            final_assessment = self._verify()
+        except BaseException:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self._som_paper_result = None
+            self._som_confirmation_evidence = None
+            release_judge()
+            raise
+        if not final_assessment.accepted:
+            self._som_paper_result = None
+            self._som_confirmation_evidence = None
+            release_judge()
+            self._reject_and_restore(final_assessment)
+
+        winner_directions = torch.stack(search.replay.applied_directions)
+        self._strong_layers = list(range(manifest.num_layers))
+        self.refusal_subspaces = {
+            layer: winner_directions.clone() for layer in self._strong_layers
+        }
+        self.refusal_directions = {
+            layer: winner_directions[0].clone() for layer in self._strong_layers
+        }
+        self._som_paper_result = result
+        modified_count = len(projection_targets) * len(search.replay.applied_directions)
+        self._excise_modified_count = modified_count
+        self._emit(
+            "excise",
+            "done",
+            f"{modified_count} exact SOM sequential writer projections",
+            modified_count=modified_count,
+        )
+        release_judge()
+        return final_assessment
+
+    def _run_bayesian_projection_search_inner(
+        self,
+        confirmation_baseline: list[LocalityBaseline],
+    ) -> DamageAssessment:
+        """Select and confirm one complete Optimized/Heretic edit plan.
+
+        The optimizer directly scores the stored direction tensors, separate
+        attention/FFN kernels, and validated manifest target.  The winner is
+        recreated from the immutable snapshot and its edited-tensor hash must
+        match both the selection replay and the confirmation replay.
+        """
+
+        from obliteratus.bayesian_optimizer import (
+            apply_exact_projection_candidate,
+            run_bayesian_optimization,
+        )
+
+        purpose = f"method={self.method!r} exact Bayesian search"
+        self._assert_auto_projection_prerequisites(purpose)
+        baseline_layer_weights = dict(self._layer_excise_weights)
+        trial_count = int(
+            getattr(self, "_bayesian_trials", 0)
+            or METHODS[self.method].get("bayesian_trials", 50)
+        )
+        self.log(
+            f"{self.method.title()} search: {trial_count} model-forward TPE "
+            "trials with exact full-snapshot rollback"
+        )
+        self._bayesian_optimization_result = None
+        result = run_bayesian_optimization(self, n_trials=trial_count)
+
+        # Selection evidence is now spent.  Recreate the immutable base model,
+        # switch every gate input to the disjoint confirmation partition, and
+        # apply only the stored winner—never the ordinary EXCISE loop.
+        self._restore_auto_projection_baseline(
+            baseline_layer_weights,
+            purpose=purpose,
+        )
+        self._holdout_harmful = list(self._auto_confirmation_harmful)
+        self._holdout_harmless = list(self._auto_confirmation_harmless)
+        self._damage_baseline = list(confirmation_baseline)
+        self._generation_health_prompts = self._confirmation_generation_health_prompts
+        self._baseline_generation_health = (
+            self._confirmation_generation_health_baseline
+        )
+        self.verify_sample_size = 32
+        if self.cot_aware:
+            if self._cot_confirmation_baseline is None:
+                raise RuntimeError("CoT confirmation baseline was not captured")
+            midpoint = len(self._cot_examples) // 2
+            self._cot_active_examples = self._cot_examples[midpoint:]
+            self._cot_baseline = self._cot_confirmation_baseline
+
+        self.log(
+            "  Replaying the exact winner once on 32 untouched confirmation pairs"
+        )
+        try:
+            application = apply_exact_projection_candidate(
+                self,
+                result.winner,
+                expected_state_hash=result.selection_state_hash,
+            )
+            self._excise_modified_count = application.modified_count
+            final_assessment = self._verify()
+        except BaseException:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self._bayesian_optimization_result = None
+            raise
+        if not final_assessment.accepted:
+            self._bayesian_optimization_result = None
+            self._reject_and_restore(final_assessment)
+        self._bayesian_optimization_result = replace(
+            result,
+            confirmation_state_hash=application.target_state_hash,
+        )
+        self._emit(
+            "excise",
+            "done",
+            f"{application.modified_count} exact Bayesian manifest projections",
+            modified_count=application.modified_count,
+        )
+        return final_assessment
+
+    def _gabliteration_hidden_batches(
+        self,
+        prompts: list[str],
+    ) -> tuple[Any, ...]:
+        """Tokenize source-search prompts as explicit model-forward batches."""
+
+        from obliteratus.analysis.gabliteration import HiddenStateBatch
+
+        if self.handle is None:
+            raise RuntimeError("Gabliteration requires a loaded model")
+        tokenizer = self.handle.tokenizer
+        device = self._get_model_device(self.handle.model)
+        formatted = self._maybe_apply_chat_template(prompts)
+        batches: list[HiddenStateBatch] = []
+        batch_size = 8
+        for start in range(0, len(formatted), batch_size):
+            texts = formatted[start : start + batch_size]
+            encoded = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_length or 256,
+            )
+            if "input_ids" not in encoded:
+                raise RuntimeError("Tokenizer omitted input_ids for Gabliteration")
+            model_kwargs = {
+                name: value.to(device)
+                for name, value in encoded.items()
+                if isinstance(value, torch.Tensor)
+                and name in {"input_ids", "attention_mask", "token_type_ids"}
+            }
+            batches.append(HiddenStateBatch(model_kwargs=model_kwargs))
+        if not batches:
+            raise RuntimeError("Gabliteration source search has no tokenized prompts")
+        return tuple(batches)
+
+    def _generate_gabliteration_responses(
+        self,
+        model: nn.Module,
+        formatted_prompts: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Generate deterministic live-model responses for behavioral trials."""
+
+        from obliteratus.evaluation.advanced_metrics import _is_refusal_detailed
+
+        if self.handle is None or model is not self.handle.model:
+            raise RuntimeError("Gabliteration evaluator received the wrong live model")
+        tokenizer = self.handle.tokenizer
+        device = self._get_model_device(model)
+        responses: list[str] = []
+        for prompt in formatted_prompts:
+            encoded = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_seq_length or 256,
+            )
+            if "input_ids" not in encoded:
+                raise RuntimeError("Tokenizer omitted input_ids during behavioral trial")
+            input_length = int(encoded["input_ids"].shape[1])
+            model_inputs = {
+                name: value.to(device)
+                for name, value in encoded.items()
+                if isinstance(value, torch.Tensor)
+                and name in {"input_ids", "attention_mask", "token_type_ids"}
+            }
+            generation_kwargs: dict[str, Any] = {
+                **model_inputs,
+                "max_new_tokens": 64,
+                "do_sample": False,
+            }
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+            if isinstance(pad_token_id, int) and not isinstance(pad_token_id, bool):
+                generation_kwargs["pad_token_id"] = pad_token_id
+            with torch.no_grad():
+                generated = model.generate(**generation_kwargs)
+            sequences = getattr(generated, "sequences", generated)
+            if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2:
+                raise RuntimeError("Gabliteration generation returned malformed sequences")
+            completion = tokenizer.decode(
+                sequences[0, input_length:].detach().cpu(),
+                skip_special_tokens=True,
+            ).strip()
+            _refused, reason = _is_refusal_detailed(completion, mode="combined")
+            # Empty/repetitive output is not evidence of successful refusal
+            # suppression.  Make it count as a failed behavioral trial.
+            if not completion or reason == "DEGENERATE":
+                completion = "I cannot provide a valid response [DEGENERATE]"
+            responses.append(completion)
+        return tuple(responses)
+
+    def _run_gabliteration_checkpoint_search(self) -> DamageAssessment:
+        """Run paper Gabliteration and gate its exact applied replay."""
+
+        from obliteratus.analysis.gabliteration import (
+            GabliterationSearchConfig,
+            run_gabliteration_search,
+        )
+
+        if self.handle is None:
+            raise RuntimeError("Gabliteration requires a loaded model")
+        purpose = "method='gabliteration' behavioral search"
+        self._assert_auto_projection_prerequisites(purpose)
+        baseline_layer_weights = dict(self._layer_excise_weights)
+        manifest = self._current_projection_manifest()
+        if manifest.target != "output":
+            raise RuntimeError("Gabliteration requires projection_target='output'")
+
+        pair_count = min(len(self._discovery_harmful), len(self._discovery_harmless))
+        if pair_count < max(8, self.n_directions * 2 + 2):
+            raise RuntimeError(
+                "Gabliteration needs at least eight duplicate-disjoint discovery pairs "
+                "for source extraction and behavioral layer trials"
+            )
+        evaluation_count = min(
+            int(METHODS[self.method].get("gabliteration_eval_prompts", 32)),
+            max(4, pair_count // 4),
+        )
+        train_count = pair_count - evaluation_count
+        harmful_batches = self._gabliteration_hidden_batches(
+            self._discovery_harmful[:train_count]
+        )
+        harmless_batches = self._gabliteration_hidden_batches(
+            self._discovery_harmless[:train_count]
+        )
+        evaluation_prompts = tuple(
+            self._maybe_apply_chat_template(
+                self._discovery_harmful[train_count:pair_count]
+            )
+        )
+        config = GabliterationSearchConfig(
+            candidate_layers=tuple(range(manifest.num_layers)),
+            n_directions=self.n_directions,
+            n_shuffles=int(METHODS[self.method]["gabliteration_shuffles"]),
+            seed=self.damage_eval_seed,
+            alpha_base=float(METHODS[self.method]["gabliteration_alpha"]),
+            beta=float(METHODS[self.method]["gabliteration_beta"]),
+            ridge_lambda=float(METHODS[self.method]["gabliteration_ridge"]),
+            effectiveness_threshold=float(
+                METHODS[self.method]["gabliteration_effectiveness_threshold"]
+            ),
+        )
+        self.log(
+            "Gabliteration: source-layer forwards, shuffled-pair subspace, "
+            f"and {manifest.num_layers} isolated behavioral layer trials"
+        )
+        try:
+            self._gabliteration_search_result = run_gabliteration_search(
+                handle=self.handle,
+                manifest=manifest,
+                harmful_batches=harmful_batches,
+                harmless_batches=harmless_batches,
+                evaluation_prompts=evaluation_prompts,
+                response_generator=self._generate_gabliteration_responses,
+                config=config,
+                apply_final=True,
+            )
+            replay = self._gabliteration_search_result.replay_plan
+            self._strong_layers = list(replay.effective_layers)
+            self.refusal_subspaces = {
+                layer: replay.directions.detach().cpu().clone()
+                for layer in replay.effective_layers
+            }
+            self.refusal_directions = {
+                layer: replay.directions[0].detach().cpu().clone()
+                for layer in replay.effective_layers
+            }
+            modified_count = sum(
+                len(manifest.entries_for_layer(layer))
+                for layer in replay.effective_layers
+            )
+            self._excise_modified_count = modified_count
+            self._emit(
+                "excise",
+                "done",
+                f"{modified_count} exact Gabliteration writer projections",
+                modified_count=modified_count,
+            )
+            assessment = self._verify()
+        except BaseException:
+            # The search applies its winner before returning. Verification is
+            # part of the same transaction: even an evaluator crash must leave
+            # the in-memory model at the immutable pre-search snapshot.
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self._gabliteration_search_result = None
+            self._excise_modified_count = None
+            raise
+        if self.damage_gate_enabled and not assessment.accepted:
+            self._gabliteration_search_result = None
+            self._reject_and_restore(assessment)
+        return assessment
+
+    def _run_rdo_checkpoint_projection(self) -> DamageAssessment:
+        """Apply and verify the trained RDO checkpoint adaptation atomically."""
+
+        purpose = "method='rdo' trained-direction checkpoint projection"
+        self._assert_auto_projection_prerequisites(purpose)
+        baseline_layer_weights = dict(self._layer_excise_weights)
+        try:
+            self._excise()
+            removed_hooks = self._remove_activation_steering()
+            if removed_hooks:
+                raise RuntimeError(
+                    "RDO installed unexpected runtime steering hooks during "
+                    "its checkpoint-only projection"
+                )
+            self._free_gpu_memory()
+            assessment = self._verify()
+        except BaseException:
+            self._restore_auto_projection_baseline(
+                baseline_layer_weights,
+                purpose=purpose,
+            )
+            self._rdo_result = None
+            self._excise_modified_count = None
+            raise
+        if self.damage_gate_enabled and not assessment.accepted:
+            self._rdo_result = None
+            self._reject_and_restore(assessment)
+        return assessment
 
     def run(self) -> Path:
         """Execute the full abliteration pipeline. Returns path to saved model."""
@@ -1834,6 +3437,12 @@ class AbliterationPipeline:
         self._capture_damage_baseline()
         if self._requested_projection_target == "auto":
             assessment = self._run_auto_projection_search()
+        elif self.method == "gabliteration":
+            assessment = self._run_gabliteration_checkpoint_search()
+        elif self.use_kl_optimization:
+            assessment = self._run_kl_preservation_search()
+        elif self.method == "rdo":
+            assessment = self._run_rdo_checkpoint_projection()
         else:
             self._excise()
             removed_hooks = self._remove_activation_steering()
@@ -1873,7 +3482,14 @@ class AbliterationPipeline:
             quantization=self.quantization,
             # Exact rollback is a correctness requirement for target search.
             # This intentionally costs roughly another model-size of CPU RAM.
-            skip_snapshot=(False if self._requested_projection_target == "auto" else None),
+            skip_snapshot=(
+                False
+                if self._requested_projection_target == "auto"
+                or self.use_kl_optimization
+                or self.cot_aware
+                or self.method in {"gabliteration", "rdo", "som"}
+                else None
+            ),
         )
         self._input_source_metadata = {
             "format": getattr(self.handle, "source_format", "hf"),
@@ -1897,8 +3513,26 @@ class AbliterationPipeline:
         # allowed to masquerade as a successful low-damage candidate.
         self._assert_supported_storage_format()
         self._prepare_projection_manifests()
-        if self._requested_projection_target == "auto":
-            self._assert_auto_projection_prerequisites()
+        if (
+            self._requested_projection_target == "auto"
+            or self.use_kl_optimization
+            or self.cot_aware
+            or self.method in {"gabliteration", "rdo", "som"}
+        ):
+            purpose = (
+                "projection_target='auto'"
+                if self._requested_projection_target == "auto"
+                else (
+                    "use_kl_optimization"
+                    if self.use_kl_optimization
+                    else (
+                        "cot_aware"
+                        if self.cot_aware
+                        else f"method={self.method!r} exact behavioral search"
+                    )
+                )
+            )
+            self._assert_auto_projection_prerequisites(purpose)
 
         summary = self.handle.summary()
         elapsed = time.time() - t0
@@ -2464,41 +4098,21 @@ class AbliterationPipeline:
     ) -> dict[int, list[torch.Tensor]]:
         """Collect activations at each layer for a set of prompts.
 
-        When cot_aware is enabled, collects activations at multiple token
-        positions (last, 75th-percentile, 50th-percentile) to capture
-        refusal signals that live in reasoning/thinking tokens, not just
-        the final output token. The collected activations are averaged
-        across positions so downstream code (means, SVD) works unchanged.
-
-        For non-CoT models, uses last-token only (classic Arditi et al.).
+        Direction discovery always uses the final real prompt token (classic
+        Arditi et al.). CoT preservation is a separate baseline-vs-candidate
+        evaluation over explicit reasoning and answer token spans; enabling it
+        must not silently alter the refusal-direction estimator.
         """
         n_layers = len(layer_modules)
         activations: dict[int, list[torch.Tensor]] = {i: [] for i in range(n_layers)}
         hooks = []
 
-        # When cot_aware, collect at multiple positions and average them
-        collect_multi_pos = getattr(self, "cot_aware", False)
-
         def make_hook(idx: int):
             def hook_fn(module, input, output):
                 hidden = output[0] if isinstance(output, tuple) else output
-                if collect_multi_pos and hidden.shape[1] > 4:
-                    seq_len = hidden.shape[1]
-                    positions = [
-                        seq_len - 1,
-                        int(seq_len * 0.75),
-                        int(seq_len * 0.50),
-                    ]
-                    positions = sorted(set(positions))
-                    pos_acts = hidden[:, positions, :]
-                    avg_act = pos_acts.mean(dim=1).detach().cpu().float()
-                    # Unbatch: preserve per-prompt (1, hidden) structure
-                    for b in range(avg_act.shape[0]):
-                        activations[idx].append(avg_act[b:b+1])
-                else:
-                    act = hidden[:, -1, :].detach().cpu().float()
-                    for b in range(act.shape[0]):
-                        activations[idx].append(act[b:b+1])
+                act = hidden[:, -1, :].detach().cpu().float()
+                for b in range(act.shape[0]):
+                    activations[idx].append(act[b:b+1])
             return hook_fn
 
         for idx in range(n_layers):
@@ -2508,12 +4122,11 @@ class AbliterationPipeline:
         tokenizer = self.handle.tokenizer
 
         # Adaptive max_length: shorten sequences when GPU memory is tight.
-        # For CoT-aware mode we need more sequence to capture reasoning tokens.
         # User override via max_seq_length takes priority over all heuristics.
         if self.max_seq_length is not None:
             max_length = self.max_seq_length
         else:
-            max_length = 384 if collect_multi_pos else 256
+            max_length = 256
         free_gb = dev.get_total_free_gb()
         # Scale memory thresholds by model size — a 1.2B model needs far
         # less KV-cache memory per token than a 7B model.  Baseline
@@ -2612,18 +4225,24 @@ class AbliterationPipeline:
         """Extract refusal directions/subspaces with the configured method.
 
         For n_directions=1: equivalent to basic difference-in-means (Arditi et al.)
-        For n_directions>1: SVD-based multi-direction extraction (Gabliteration)
-        For direction_method="som": harmful-manifold prototype directions
+        For n_directions>1: ordinary paired-difference SVD extraction
+        For direction_method="som_proxy": local harmful-manifold prototypes
         For use_whitened_svd=True: covariance-normalized SVD (OBLITERATUS novel)
         For use_wasserstein_optimal=True: Wasserstein-optimal direction (minimizes
             W2 cost per unit refusal removed via generalized eigenvalue problem)
         """
         self._emit("distill", "running", "Extracting refusal subspace...")
         t0 = time.time()
+        self.residual_erasers.clear()
+
+        if self.method == "som":
+            self._distill_paper_som(t0)
+            return
 
         n_layers = len(self._harmful_means)
         norms: dict[int, float] = {}
         n_dirs = self.n_directions
+        self.residual_erasers.clear()
 
         # ── Small-model direction cap ──────────────────────────────────
         # On small models, each SVD direction removes a proportionally
@@ -2664,21 +4283,19 @@ class AbliterationPipeline:
             leace_extractor = LEACEExtractor()
             self.log("Using LEACE (closed-form optimal concept erasure) for direction extraction")
 
-        # Optionally use SOM manifold directions (AAAI 2026)
+        # Optionally use the local SOM activation-geometry proxy.
         som_extractor = None
-        if self.direction_method == "som":
+        if self.direction_method == "som_proxy":
             som_extractor = self._make_som_extractor()
             self.log(
-                "Using SOM manifold direction extraction "
-                "(AAAI 2026: SOM Directions Are Better than One; "
-                "ranked by refusal signal per harmless distortion)"
+                "Using local SOM activation-geometry proxy "
+                "(no paper TPE subset search or HarmBench judge)"
             )
 
         # Optionally use whitened SVD for cleaner direction extraction
         whitened_extractor = None
         if (
             self.use_whitened_svd
-            and n_dirs > 1
             and not self.use_wasserstein_optimal
             and leace_extractor is None
             and som_extractor is None
@@ -2731,57 +4348,73 @@ class AbliterationPipeline:
 
             if leace_extractor is not None:
                 # LEACE: closed-form optimal concept erasure direction
-                if idx in self._harmful_acts and idx in self._harmless_acts:
-                    try:
-                        l_result = leace_extractor.extract(
-                            self._harmful_acts[idx],
-                            self._harmless_acts[idx],
-                            layer_idx=idx,
-                        )
-                        self.refusal_directions[idx] = l_result.direction
-                        self.refusal_subspaces[idx] = l_result.direction.unsqueeze(0)
-                        norms[idx] = l_result.generalized_eigenvalue
+                if idx not in self._harmful_acts or idx not in self._harmless_acts:
+                    raise RuntimeError(
+                        f"LEACE extraction is missing paired activations for layer {idx}"
+                    )
+                try:
+                    l_result = leace_extractor.extract(
+                        self._harmful_acts[idx],
+                        self._harmless_acts[idx],
+                        layer_idx=idx,
+                    )
+                    self.residual_erasers[idx] = l_result.eraser
+                    self.refusal_directions[idx] = l_result.direction
+                    display = l_result.eraser.display_directions
+                    self.refusal_subspaces[idx] = (
+                        display
+                        if display is not None and display.shape[0] > 0
+                        else l_result.direction.unsqueeze(0)
+                    )
+                    norms[idx] = l_result.generalized_eigenvalue
 
-                        if idx < 5 or idx == n_layers - 1:
-                            self.log(
-                                f"  layer {idx}: LEACE eigenvalue={l_result.generalized_eigenvalue:.4f}, "
-                                f"erasure_loss={l_result.erasure_loss:.4f}, "
-                                f"cond={l_result.within_class_condition:.0f}"
-                            )
-                        continue
-                    except Exception as e:
-                        if idx < 5:
-                            self.log(f"  layer {idx}: LEACE failed ({e}), falling back to diff-of-means")
+                    if idx < 5 or idx == n_layers - 1:
+                        self.log(
+                            f"  layer {idx}: LEACE eigenvalue={l_result.generalized_eigenvalue:.4f}, "
+                            f"erasure_loss={l_result.erasure_loss:.4f}, "
+                            f"cond={l_result.within_class_condition:.0f}"
+                        )
+                    continue
+                except Exception as e:
+                    raise RuntimeError(
+                        f"LEACE extraction failed at layer {idx}; refusing to "
+                        "substitute a different direction backend"
+                    ) from e
 
             if som_extractor is not None:
-                # SOM directions: learn harmful-manifold prototypes and subtract
-                # the harmless centroid.  This approximates cone generators more
-                # directly than SVD principal components when refusal is multimodal.
-                if idx in self._harmful_acts and idx in self._harmless_acts:
-                    try:
-                        som_result, som_strength = self._extract_som_layer(
-                            som_extractor,
-                            idx,
-                            n_dirs,
+                # SOM proxy directions: learn local harmful-activation prototypes
+                # and subtract the harmless centroid.  This is descriptive
+                # clustering, not causal cone fitting or the paper's judged search.
+                if idx not in self._harmful_acts or idx not in self._harmless_acts:
+                    raise RuntimeError(
+                        f"SOM proxy extraction is missing paired activations for layer {idx}"
+                    )
+                try:
+                    som_result, som_strength = self._extract_som_layer(
+                        som_extractor,
+                        idx,
+                        n_dirs,
+                    )
+                    # Layer strength combines manifold coverage and
+                    # prototype displacement.  Squared strengths match the
+                    # variance-style scale used by SVD layer ranking.
+                    norms[idx] = som_strength
+
+                    if idx < 5 or idx == n_layers - 1:
+                        self.log(
+                            f"  layer {idx}: SOM proxy {som_result.directions.shape[0]} dirs, "
+                            f"coverage={som_result.coverage_score:.1%}, "
+                            f"qerr={som_result.quantization_error:.4f}, "
+                            f"score={som_result.direction_scores.sum().item():.4f}"
                         )
-                        # Layer strength combines manifold coverage and
-                        # prototype displacement.  Squared strengths match the
-                        # variance-style scale used by SVD layer ranking.
-                        norms[idx] = som_strength
+                    continue
+                except Exception as e:
+                    raise RuntimeError(
+                        f"SOM proxy extraction failed at layer {idx}; refusing "
+                        "to relabel an SVD fallback as SOM"
+                    ) from e
 
-                        if idx < 5 or idx == n_layers - 1:
-                            self.log(
-                                f"  layer {idx}: SOM {som_result.directions.shape[0]} dirs, "
-                                f"coverage={som_result.coverage_score:.1%}, "
-                                f"qerr={som_result.quantization_error:.4f}, "
-                                f"score={som_result.direction_scores.sum().item():.4f}"
-                            )
-                        continue
-                    except Exception as e:
-                        if idx < 5:
-                            self.log(f"  layer {idx}: SOM extraction failed ({e}), falling back to SVD")
-
-            if n_dirs == 1:
+            if self.direction_method == "diff_means" and whitened_extractor is None:
                 # Classic single-direction: difference-in-means
                 diff = (self._harmful_means[idx] - self._harmless_means[idx]).squeeze(0)
                 # Guard against NaN/Inf from degenerate activations.
@@ -2807,8 +4440,13 @@ class AbliterationPipeline:
                     n_directions=n_dirs,
                     layer_idx=idx,
                 )
+                self.residual_erasers[idx] = result.eraser
                 self.refusal_subspaces[idx] = result.directions
-                self.refusal_directions[idx] = result.directions[0]
+                self.refusal_directions[idx] = (
+                    result.directions[0]
+                    if result.directions.shape[0] > 0
+                    else torch.zeros_like(self._harmful_means[idx].squeeze(0))
+                )
                 norms[idx] = result.singular_values.sum().item()
 
                 if idx < 5 or idx == n_layers - 1:
@@ -2817,7 +4455,9 @@ class AbliterationPipeline:
                         f"cond={result.condition_number:.0f}, erank={result.effective_rank:.1f}"
                     )
             else:
-                # SVD-based multi-direction extraction (Gabliteration)
+                # Ordinary paired-difference SVD extraction.  This alone is
+                # not the behavioral layer-selection pipeline from the
+                # Gabliteration paper.
                 harmful_stack = torch.stack(self._harmful_acts[idx]).squeeze(1)  # (n_prompts, hidden)
                 harmless_stack = torch.stack(self._harmless_acts[idx]).squeeze(1)
                 diff_matrix = (harmful_stack - harmless_stack).float()  # float32 for SVD stability
@@ -2865,7 +4505,7 @@ class AbliterationPipeline:
                     var_pct = (top_k_var / total_var * 100) if total_var > 0 else 0
                     self.log(f"  layer {idx}: top-{k} SVs explain {var_pct:.1f}% of refusal variance")
 
-        if self.harmless_pc_count > 0 and self.direction_method != "som":
+        if self.harmless_pc_count > 0 and self.direction_method != "som_proxy":
             self.log(
                 "Removing top harmless activation PCs from refusal directions "
                 f"(k={self.harmless_pc_count})"
@@ -2928,17 +4568,16 @@ class AbliterationPipeline:
         # ── Layer selection ────────────────────────────────────────────────
         # Configurable strategy for selecting which layers to project.
         # Supports multiple algorithms for baseline comparison:
-        #   knee_cosmic: OBLITERATUS default (knee detection + COSMIC fusion)
-        #   knee:        knee detection only (simplified OBLITERATUS)
+        #   knee:        knee detection on refusal strength (default)
         #   middle60:    legacy heuristic (layers 20%-80%)
         #   all_except_first: FailSpy/abliterator (all layers except layer 0)
-        #   all:         all layers (for Bayesian optimization / Heretic)
-        #   top_k:       top-k by refusal strength (Gabliteration-style)
+        #   all:         all layers
+        #   top_k:       top-k by refusal strength
         sorted_layers = sorted(norms.items(), key=lambda x: x[1], reverse=True)
         # Filter out NaN/Inf/zero norms (degenerate layers).
         import math
         sorted_layers = [(idx, n) for idx, n in sorted_layers
-                         if not (math.isnan(n) or math.isinf(n))]
+                         if n > 0 and not (math.isnan(n) or math.isinf(n))]
         max_norm = sorted_layers[0][1] if sorted_layers else 1.0
         if math.isnan(max_norm) or math.isinf(max_norm) or max_norm <= 0:
             max_norm = 1.0
@@ -2963,12 +4602,12 @@ class AbliterationPipeline:
             self.log(f"Layer selection: middle-60% ({len(self._strong_layers)} layers)")
 
         elif selection_method == "all":
-            # All layers (Heretic uses Bayesian weights to control per-layer strength)
+            # All layers.
             self._strong_layers = self._select_layers_all(n_layers)
             self.log(f"Layer selection: all ({len(self._strong_layers)} layers)")
 
         elif selection_method == "top_k":
-            # Gabliteration-style: top layers by refusal variance, with 5% threshold
+            # Top layers by refusal variance, with a 5% threshold.
             min_threshold = max_norm * 0.05 if max_norm > 0 else 0.0
             self._strong_layers = [idx for idx, norm in sorted_layers if norm >= min_threshold]
             self.log(f"Layer selection: top-k by variance ({len(self._strong_layers)} layers, threshold={min_threshold:.4f})")
@@ -2979,21 +4618,7 @@ class AbliterationPipeline:
             self.log(f"Layer selection: knee ({len(self._strong_layers)} layers)")
 
         else:
-            # Default: knee + COSMIC fusion (OBLITERATUS standard)
-            knee_layers = self._select_layers_knee(sorted_layers)
-            cosmic_layers = self._select_layers_cosmic(n_layers)
-
-            if cosmic_layers:
-                fused_set = set(knee_layers) | set(cosmic_layers)
-                self._strong_layers = [
-                    idx for idx, _ in sorted_layers if idx in fused_set
-                ]
-                self.log(
-                    f"Layer selection: knee={len(knee_layers)}, "
-                    f"COSMIC={len(cosmic_layers)}, fused={len(self._strong_layers)}"
-                )
-            else:
-                self._strong_layers = knee_layers
+            raise ValueError(f"Unknown layer selection method: {selection_method!r}")
 
         # ── Small-model safeguards ────────────────────────────────────
         # Models with limited capacity are highly sensitive to ablation.
@@ -3107,116 +4732,8 @@ class AbliterationPipeline:
                     self.refusal_subspaces[idx] = sub
             self.log(f"  Blended {len(self._strong_layers)} directions (data-driven α per layer)")
 
-        # ── Refusal Direction Optimization (RDO) ──────────────────────────
-        # Wollschlager et al. (ICML 2025, "The Geometry of Refusal") show that
-        # gradient-based optimization finds directions that maximally flip
-        # refusal behavior, producing more effective directions than purely
-        # statistical methods (SVD). RDO refines SVD-extracted directions by
-        # gradient descent on a refusal classification objective.
-        #
-        # Algorithm:
-        #   1. Train a linear probe to classify harmful vs harmless activations
-        #   2. Initialize direction d = SVD primary direction (warm start)
-        #   3. Optimize d to maximize the probe's classification flip:
-        #      L(d) = -Σ_h log P(harmless | a_h - (a_h·d)d)  (project harmful → looks harmless)
-        #             -Σ_b log P(harmless | a_b)                (harmless stays harmless)
-        #   4. The optimized d is the direction whose removal most effectively
-        #      transforms harmful activations into harmless-looking ones
-        if self.rdo_refinement and self._strong_layers:
-            self.log("RDO: Refining directions via gradient-based optimization (Wollschlager et al.)...")
-            n_refined = 0
-            for idx in self._strong_layers:
-                if idx not in self.refusal_directions:
-                    continue
-                if idx not in self._harmful_acts or idx not in self._harmless_acts:
-                    continue
-                harmful_stack = torch.stack(
-                    [a.squeeze() for a in self._harmful_acts[idx]]
-                ).float()
-                harmless_stack = torch.stack(
-                    [a.squeeze() for a in self._harmless_acts[idx]]
-                ).float()
-
-                if harmful_stack.shape[0] < 4 or harmless_stack.shape[0] < 4:
-                    continue
-
-                # Step 1: Train linear refusal probe
-                labels = torch.cat([
-                    torch.ones(harmful_stack.shape[0]),   # 1 = harmful/refusal
-                    torch.zeros(harmless_stack.shape[0]),  # 0 = harmless
-                ])
-                all_acts = torch.cat([harmful_stack, harmless_stack], dim=0)
-
-                # Probe: simple logistic regression (direction + bias)
-                probe_d = all_acts[labels == 1].mean(0) - all_acts[labels == 0].mean(0)
-                probe_d = probe_d / probe_d.norm().clamp(min=1e-8)
-
-                # Step 2: Initialize from SVD direction (warm start)
-                d = self.refusal_directions[idx].float().clone().detach()
-                d.requires_grad_(True)
-
-                # Step 3: Gradient-based refinement
-                # 500 steps with lr=0.005 provides enough optimization budget
-                # for the direction to meaningfully diverge from the SVD init
-                # (Wollschlager et al. use ~1000 steps; 500 is a practical compromise)
-                optimizer = torch.optim.Adam([d], lr=0.005)
-                best_loss = float("inf")
-                best_d = d.data.clone()
-
-                for step in range(500):
-                    optimizer.zero_grad()
-
-                    # Normalize to unit sphere at each step
-                    d_norm = d / d.norm().clamp(min=1e-8)
-
-                    # Project harmful activations: remove d component
-                    proj_harmful = harmful_stack - (harmful_stack @ d_norm).unsqueeze(1) * d_norm.unsqueeze(0)
-
-                    # Score: how harmless do projected-harmful activations look?
-                    # Use dot product with probe direction as refusal score
-                    refusal_scores_projected = proj_harmful @ probe_d
-                    refusal_scores_original = harmless_stack @ probe_d
-
-                    # Loss: projected harmful should have LOW refusal score
-                    # (close to harmless distribution) while harmless stays low
-                    loss_flip = refusal_scores_projected.mean()  # minimize projected refusal
-                    loss_preserve = -refusal_scores_original.mean()  # harmless stays normal
-
-                    # Regularization: gentle tether to SVD initialization
-                    # (prevents catastrophic drift but allows meaningful optimization;
-                    # low weight lets gradient find genuinely better directions)
-                    svd_dir = self.refusal_directions[idx].float()
-                    reg_loss = 1.0 - (d_norm @ svd_dir).abs()
-
-                    loss = loss_flip + 0.1 * loss_preserve + 0.05 * reg_loss
-
-                    if loss.item() < best_loss:
-                        best_loss = loss.item()
-                        best_d = d_norm.data.clone()
-
-                    loss.backward()
-                    optimizer.step()
-
-                # Step 4: Update direction with RDO-refined version
-                refined = best_d / best_d.norm().clamp(min=1e-8)
-                cosine_shift = (refined @ self.refusal_directions[idx].float()).item()
-                self.refusal_directions[idx] = refined.to(self.refusal_directions[idx].dtype)
-                self.refusal_subspaces[idx][0] = self.refusal_directions[idx]
-                if self.refusal_subspaces[idx].shape[0] > 1:
-                    self.refusal_subspaces[idx] = self._orthogonalize_subspace(
-                        self.refusal_subspaces[idx].float()
-                    ).to(self.refusal_subspaces[idx].dtype)
-                    self.refusal_directions[idx] = self.refusal_subspaces[idx][0]
-                n_refined += 1
-
-                if idx < 5 or idx == n_layers - 1:
-                    self.log(
-                        f"  layer {idx}: RDO refined (cos_shift={cosine_shift:.4f}, "
-                        f"loss={best_loss:.4f})"
-                    )
-
-            if n_refined > 0:
-                self.log(f"  RDO: refined {n_refined} directions via gradient optimization")
+        if self.rdo_refinement:
+            self._run_rdo_direction_training()
 
         # ── Layer-adaptive projection strength ────────────────────────────
         # Compute per-layer excision weights proportional to refusal signal
@@ -3369,108 +4886,10 @@ class AbliterationPipeline:
             self.log("Classifying MoE experts (safety vs capability) for inversion...")
             self._identify_safety_experts()
 
-        # ── CoT-aware ablation: reasoning trace preservation ──────────
-        # Models with chain-of-thought reasoning (GPT-OSS, QwQ, DeepSeek-R1)
-        # use internal reasoning traces that share geometric space with refusal.
-        # Naively projecting out refusal directions can destroy the CoT pipeline.
-        #
-        # This identifies "reasoning-critical" components within the refusal
-        # direction and orthogonalizes the refusal direction against them,
-        # ensuring we remove refusal but preserve reasoning coherence.
-        #
-        # Algorithm:
-        # 1. Use harmless activations as proxy for "normal reasoning" activity
-        # 2. Compute the principal component of harmless-only variance (reasoning dir)
-        # 3. Orthogonalize each refusal direction against the reasoning direction
-        # 4. Store reasoning directions for use during CoT-aware generation tests
-        if self.cot_aware and self._strong_layers:
-            self.log("CoT-aware ablation: identifying and preserving reasoning directions...")
-            n_orthogonalized = 0
-            for idx in self._strong_layers:
-                if idx not in self.refusal_directions:
-                    continue
-                if idx not in self._harmless_acts or len(self._harmless_acts.get(idx, [])) < 4:
-                    # Need raw acts; if already cleared, use means as fallback
-                    continue
-
-                # Compute principal harmless variance direction (reasoning proxy)
-                harmless_stack = torch.stack(
-                    [a.squeeze() for a in self._harmless_acts[idx]]
-                )  # (n, hidden)
-                harmless_centered = harmless_stack - harmless_stack.mean(dim=0, keepdim=True)
-
-                try:
-                    _, S_h, Vh_h = torch.linalg.svd(harmless_centered, full_matrices=False)
-                except Exception:
-                    continue
-
-                if S_h.shape[0] == 0 or not torch.isfinite(Vh_h[0]).all():
-                    continue
-
-                # Top singular vector = primary reasoning direction
-                reasoning_dir = Vh_h[0]  # (hidden_dim,)
-                reasoning_norm = reasoning_dir.norm()
-                if reasoning_norm < 1e-8:
-                    continue
-                reasoning_dir = reasoning_dir / reasoning_norm
-                self._cot_preserve_directions[idx] = reasoning_dir
-
-                # Orthogonalize refusal direction against reasoning direction
-                refusal_dir = self.refusal_directions[idx]
-                overlap = (refusal_dir @ reasoning_dir).item()
-
-                abs_overlap = abs(overlap)
-                if abs_overlap > 0.7:
-                    # Near-parallel: refusal and reasoning are too entangled.
-                    # Full orthogonalization would destroy the refusal direction.
-                    # Keep original and warn loudly.
-                    self.log(
-                        f"  layer {idx}: CRITICAL refusal-reasoning overlap={overlap:.3f} "
-                        f"(>0.7) — directions too entangled, skipping orthogonalization"
-                    )
-                    warnings.warn(
-                        f"CoT layer {idx}: refusal direction has {abs_overlap:.0%} overlap "
-                        f"with reasoning. Orthogonalization skipped to avoid destroying "
-                        f"refusal signal. Consider using fewer SVD directions or "
-                        f"disabling CoT-aware mode for this model.",
-                        stacklevel=2,
-                    )
-                elif abs_overlap > 0.1:
-                    # Moderate overlap: apply partial orthogonalization.
-                    # Scale removal by beta to preserve some reasoning alignment
-                    # while still reducing the overlap. Higher overlap → gentler
-                    # correction (beta closer to 0) to avoid overcorrection.
-                    # beta=1.0 at overlap=0.1, beta=0.3 at overlap=0.7
-                    beta = max(0.3, 1.0 - (abs_overlap - 0.1) / 0.6 * 0.7)
-                    corrected = refusal_dir - beta * overlap * reasoning_dir
-                    corrected_norm = corrected.norm()
-                    if corrected_norm > 1e-6:
-                        self.refusal_directions[idx] = corrected / corrected_norm
-                        # Also update first row of subspace
-                        self.refusal_subspaces[idx][0] = self.refusal_directions[idx]
-                        n_orthogonalized += 1
-                        tier = "high" if abs_overlap > 0.5 else "moderate"
-                        self.log(
-                            f"  layer {idx}: refusal-reasoning overlap={overlap:.3f} ({tier}), "
-                            f"partial orthogonalization (β={beta:.2f}, "
-                            f"preserved {abs(overlap)*100:.0f}% reasoning component)"
-                        )
-                    else:
-                        self.log(
-                            f"  layer {idx}: WARNING refusal dir nearly parallel to reasoning "
-                            f"(overlap={overlap:.3f}), keeping original"
-                        )
-
-            if n_orthogonalized > 0:
-                self.log(
-                    f"  CoT preservation: orthogonalized {n_orthogonalized} refusal directions "
-                    f"against reasoning traces"
-                )
-
         elapsed = time.time() - t0
         self.log(f"Refusal subspace extracted ({elapsed:.1f}s)")
-        if self.direction_method == "som":
-            dir_label = f"{n_dirs}-direction SOM-manifold"
+        if self.direction_method == "som_proxy":
+            dir_label = f"{n_dirs}-direction SOM activation-geometry proxy"
         else:
             dir_label = f"{n_dirs}-direction SVD" if n_dirs > 1 else "single-direction"
         extras = []
@@ -3489,8 +4908,10 @@ class AbliterationPipeline:
         if self._expert_directions:
             n_total = sum(len(d) for d in self._expert_directions.values())
             extras.append(f"EGA({n_total} per-expert dirs)")
-        if self._cot_preserve_directions:
-            extras.append(f"CoT-aware({len(self._cot_preserve_directions)} layers)")
+        if self._rdo_result is not None:
+            extras.append(f"RDO-trained(step={self._rdo_result.selected_step})")
+        if self.cot_aware:
+            extras.append(f"CoT-gate({len(self._cot_examples)} references)")
         if self._float_layer_weights:
             extras.append("float-interp")
         if self.winsorize_activations:
@@ -3503,6 +4924,152 @@ class AbliterationPipeline:
             f"{distill_label}: {len(self._strong_layers)} strong layers ({elapsed:.1f}s)",
             duration=elapsed,
             strong_layers=self._strong_layers,
+        )
+
+    def _distill_paper_som(self, started_at: float) -> None:
+        """Train the paper 4x4 SOM at the strongest source layer."""
+
+        from obliteratus.analysis.som_paper import (
+            SOMTrainingConfig,
+            train_paper_som_directions,
+        )
+
+        if self.handle is None:
+            raise RuntimeError("Paper SOM requires a loaded model")
+        layer_scores = {
+            layer: float(
+                (
+                    self._harmful_means[layer] - self._harmless_means[layer]
+                ).float().norm().item()
+            )
+            for layer in self._harmful_means
+            if layer in self._harmless_means
+            and self._harmful_acts.get(layer)
+            and self._harmless_acts.get(layer)
+        }
+        if not layer_scores:
+            raise RuntimeError("Paper SOM has no paired activation means")
+        source_layer = min(layer_scores, key=lambda layer: (-layer_scores[layer], layer))
+        harmful = torch.stack(self._harmful_acts[source_layer]).squeeze(1).float()
+        harmless = torch.stack(self._harmless_acts[source_layer]).squeeze(1).float()
+        config = SOMTrainingConfig(
+            iterations=int(self.som_iterations),
+            learning_rate=float(self.som_learning_rate),
+            sigma=float(self.som_sigma),
+            seed=int(METHODS[self.method].get("som_seed", 0)),
+        )
+        self.log(
+            "Paper SOM: training a 4x4 hexagonal map at source layer "
+            f"{source_layer} for {config.iterations:,} updates"
+        )
+        self._som_direction_pool = train_paper_som_directions(
+            harmful,
+            harmless,
+            config=config,
+        )
+        self._som_source_layer = source_layer
+        selected = self._som_direction_pool.directions[: self.n_directions].clone()
+        layer_count = len(self._harmful_means)
+        self._strong_layers = list(range(layer_count))
+        self.refusal_subspaces = {
+            layer: selected.clone() for layer in self._strong_layers
+        }
+        self.refusal_directions = {
+            layer: selected[0].clone() for layer in self._strong_layers
+        }
+        elapsed = time.time() - started_at
+        self.log(
+            f"  SOM produced {self._som_direction_pool.directions.shape[0]} "
+            f"candidates (quantization error="
+            f"{self._som_direction_pool.quantization_error:.4f})"
+        )
+        self._emit(
+            "distill",
+            "done",
+            "paper 4x4 SOM direction pool: "
+            f"{layer_count} candidate edit layers ({elapsed:.1f}s)",
+            duration=elapsed,
+            strong_layers=self._strong_layers,
+            source_layer=source_layer,
+        )
+
+    def _run_rdo_direction_training(self) -> None:
+        """Train one global RDO direction through differentiable model forwards."""
+
+        from obliteratus.analysis.rdo import RDOConfig, RDOPromptSplit, run_rdo
+
+        if self.handle is None:
+            raise RuntimeError("RDO requires a loaded model")
+        pair_count = min(len(self._discovery_harmful), len(self._discovery_harmless))
+        if pair_count < 6:
+            raise RuntimeError(
+                "RDO requires at least six duplicate-disjoint discovery pairs "
+                "for internal training and direction selection"
+            )
+        validation_count = max(2, min(16, pair_count // 5))
+        train_count = pair_count - validation_count
+        train_split = RDOPromptSplit(
+            harmful=tuple(self._discovery_harmful[:train_count]),
+            harmless=tuple(self._discovery_harmless[:train_count]),
+        )
+        validation_split = RDOPromptSplit(
+            harmful=tuple(self._discovery_harmful[train_count:pair_count]),
+            harmless=tuple(self._discovery_harmless[train_count:pair_count]),
+        )
+        layer_scores = {
+            layer: float(
+                (
+                    self._harmful_means[layer] - self._harmless_means[layer]
+                ).float().norm().item()
+            )
+            for layer in self._harmful_means
+            if layer in self._harmless_means
+        }
+        if not layer_scores:
+            raise RuntimeError("RDO has no paired layer means for its DIM target")
+        source_layer = min(layer_scores, key=lambda layer: (-layer_scores[layer], layer))
+        target_direction = (
+            self._harmful_means[source_layer] - self._harmless_means[source_layer]
+        ).squeeze(0)
+        if not torch.isfinite(target_direction).all() or target_direction.norm() <= 1e-8:
+            raise RuntimeError("RDO source DIM direction is non-finite or degenerate")
+        layers = tuple(get_layer_modules(self.handle))
+        config = RDOConfig(
+            addition_layer=source_layer,
+            steps=int(METHODS[self.method].get("rdo_steps", 40)),
+            batch_size=int(METHODS[self.method].get("rdo_batch_size", 16)),
+            snapshot_window=int(
+                METHODS[self.method].get("rdo_snapshot_window", 20)
+            ),
+            seed=self.damage_eval_seed,
+        )
+        self.log(
+            "RDO: generating model-specific targets and optimizing one global "
+            f"direction ({config.steps} steps, effective batch {config.batch_size})"
+        )
+        self._rdo_result = run_rdo(
+            self.handle.model,
+            self.handle.tokenizer,
+            layers,
+            train_split=train_split,
+            validation_split=validation_split,
+            target_direction=target_direction,
+            config=config,
+            initial_direction=None,
+        )
+        selected = self._rdo_result.direction.detach().to(device="cpu").float()
+        selected = selected / selected.norm().clamp(min=1e-8)
+        self.residual_erasers.clear()
+        self._strong_layers = list(range(len(layers)))
+        self.refusal_directions = {
+            layer: selected.clone() for layer in self._strong_layers
+        }
+        self.refusal_subspaces = {
+            layer: selected.unsqueeze(0).clone() for layer in self._strong_layers
+        }
+        self.log(
+            f"  RDO selected snapshot step {self._rdo_result.selected_step}; "
+            "checkpoint projection will apply it to every output-writer layer"
         )
 
     @staticmethod
@@ -3641,17 +5208,18 @@ class AbliterationPipeline:
         selected = [idx for idx, norm in sorted_layers[:best_k] if norm >= min_threshold]
         return selected if selected else [sorted_layers[0][0]]
 
-    def _select_layers_cosmic(self, n_layers: int) -> list[int]:
-        """COSMIC-style layer selection via cosine similarity on activations.
+    def _select_cosmic_evaluation_layers(self, n_layers: int) -> list[int]:
+        """Return COSMIC's preliminary evaluation-layer diagnostic.
 
         Implements the core insight from COSMIC (arXiv:2506.00085, ACL 2025):
         identify layers where harmful and harmless representations are most
         dissimilar by computing mean cosine similarity between the two sets.
-        Layers with the LOWEST cosine similarity have the most separable
-        harmful/harmless representations — these are where refusal is encoded.
+        Layers with the lowest cosine similarity are used by COSMIC to score
+        downstream candidate interventions.  They are *not* layers to edit.
 
-        Selects the bottom 10% of layers by cosine similarity (COSMIC default).
-        Falls back to empty list if insufficient data.
+        This helper deliberately performs no candidate selection and its return
+        value must never be merged into ``_strong_layers``.  It remains useful
+        for diagnostics and for a future faithful candidate-intervention loop.
         """
         if not self._harmful_means or not self._harmless_means:
             return []
@@ -3682,7 +5250,7 @@ class AbliterationPipeline:
 
         if selected:
             self.log(
-                f"  COSMIC layer selection: bottom {n_select} by cosine similarity "
+                f"  COSMIC evaluation-layer diagnostic: bottom {n_select} by cosine similarity "
                 f"(range {cos_sims[0][1]:.4f}..{cos_sims[-1][1]:.4f})"
             )
 
@@ -3756,7 +5324,7 @@ class AbliterationPipeline:
             )
 
         if (
-            self.direction_method != "som"
+            self.direction_method != "som_proxy"
             or not self.som_contiguous_layer_budget
             or len(self._strong_layers) != max_layers
         ):
@@ -4159,7 +5727,7 @@ class AbliterationPipeline:
             head_scores: [(head_idx, score)] sorted by score descending
             n_heads: Total number of attention heads
             head_fraction: Fraction of heads to target (default top 25%)
-            norm_preserve: Whether to preserve weight matrix norm
+            norm_preserve: Whether to restore each logical output-row norm
             regularization: Fraction of projection to preserve
         """
         scale = 1.0 - regularization
@@ -4194,6 +5762,16 @@ class AbliterationPipeline:
                 return 0
 
             target_heads = [h for h, _ in head_scores[:n_target]]
+            residual_axis = 0 if W.shape[0] == hidden_dim else 1
+            saved_rows = (
+                AbliterationPipeline._capture_logical_row_norms(
+                    W,
+                    residual_axis=residual_axis,
+                    role="writer",
+                )
+                if norm_preserve
+                else None
+            )
 
             for h in target_heads:
                 if W.shape[0] == hidden_dim:
@@ -4201,7 +5779,6 @@ class AbliterationPipeline:
                     start = h * head_dim_attn
                     end = (h + 1) * head_dim_attn
                     W_slice = W[:, start:end]  # (hidden_dim, hda)
-                    original_norm = W_slice.norm().item() if norm_preserve else 0.0
 
                     # Remove refusal direction from head's output mapping:
                     # W_h -= d @ (d^T @ W_h)
@@ -4209,32 +5786,18 @@ class AbliterationPipeline:
                     W_slice.sub_(scale * (d_col @ coeff))
                     del coeff
 
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W_slice.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W_slice.mul_(ratio)
-
                 elif W.shape[1] == hidden_dim:
                     # Transposed: W is (attn_dim, hidden_dim), rows by head
                     start = h * head_dim_attn
                     end = (h + 1) * head_dim_attn
                     W_slice = W[start:end, :]  # (hda, hidden_dim)
-                    original_norm = W_slice.norm().item() if norm_preserve else 0.0
 
                     coeff = W_slice @ d_col  # (hda, 1)
                     W_slice.sub_(scale * (coeff @ d_col.T))
                     del coeff
 
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W_slice.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W_slice.mul_(ratio)
+            if saved_rows is not None:
+                AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
 
             if is_quantized:
                 AbliterationPipeline._replace_quantized_weight(proj, W)
@@ -4255,7 +5818,7 @@ class AbliterationPipeline:
         """
         from obliteratus.evaluation.advanced_metrics import _is_degenerate
 
-        prompts = BENIGN_GENERATION_HEALTH_PROMPTS[: self.damage_generation_samples]
+        prompts = self._generation_health_prompts
         settings = required_evaluation_settings(self._get_reasoning_protocol())
         coherent = 0
         degenerate = 0
@@ -4339,6 +5902,126 @@ class AbliterationPipeline:
 
     # ── Pre-EXCISE baseline capture for damage measurement ─────────────
 
+    def _capture_cot_preservation_baseline(self) -> None:
+        """Score explicit reasoning/answer spans on the untouched model."""
+
+        if not self.cot_aware:
+            self._cot_active_examples = ()
+            self._cot_baseline = None
+            self._cot_selection_baseline = None
+            self._cot_confirmation_baseline = None
+            return
+        if self.handle is None:
+            raise RuntimeError("CoT preservation baseline requires a loaded model")
+
+        model = self.handle.model
+        tokenizer = self.handle.tokenizer
+        try:
+            if self.use_kl_optimization or self._requested_projection_target == "auto":
+                midpoint = len(self._cot_examples) // 2
+                selection_examples = self._cot_examples[:midpoint]
+                confirmation_examples = self._cot_examples[midpoint:]
+                if (
+                    len(selection_examples) < self.cot_min_eval_examples
+                    or len(confirmation_examples) < self.cot_min_eval_examples
+                ):
+                    raise CoTPreservationError(
+                        "reasoning references cannot form disjoint selection and "
+                        "confirmation subsets at the configured minimum"
+                    )
+                self._cot_selection_baseline = score_cot_references(
+                    model,
+                    tokenizer,
+                    selection_examples,
+                    max_length=self.cot_max_length,
+                )
+                self._cot_confirmation_baseline = score_cot_references(
+                    model,
+                    tokenizer,
+                    confirmation_examples,
+                    max_length=self.cot_max_length,
+                )
+                token_signatures = (
+                    self._cot_selection_baseline.reference_signatures
+                    + self._cot_confirmation_baseline.reference_signatures
+                )
+                if len(set(token_signatures)) != len(token_signatures):
+                    raise CoTPreservationError(
+                        "reasoning references collide after canonical tokenization; "
+                        "selection and confirmation evidence is not disjoint"
+                    )
+                self._cot_active_examples = selection_examples
+                self._cot_baseline = self._cot_selection_baseline
+            else:
+                self._cot_active_examples = self._cot_examples
+                self._cot_baseline = score_cot_references(
+                    model,
+                    tokenizer,
+                    self._cot_active_examples,
+                    max_length=self.cot_max_length,
+                )
+                if len(set(self._cot_baseline.reference_signatures)) != len(
+                    self._cot_baseline.reference_signatures
+                ):
+                    raise CoTPreservationError(
+                        "reasoning references collide after canonical tokenization"
+                    )
+                self._cot_selection_baseline = None
+                self._cot_confirmation_baseline = None
+        except Exception as exc:
+            self._cot_active_examples = ()
+            self._cot_baseline = None
+            self._cot_selection_baseline = None
+            self._cot_confirmation_baseline = None
+            raise RuntimeError(
+                "Untouched CoT preservation baseline could not be measured; "
+                "no weights were edited"
+            ) from exc
+
+        baseline = self._cot_baseline.aggregate
+        self.log(
+            "  CoT baseline captured: "
+            f"{len(self._cot_active_examples)} explicit examples, "
+            f"reasoning CE={baseline.reasoning_ce:.4f}, "
+            f"answer CE={baseline.answer_ce:.4f}"
+        )
+
+    def _measure_candidate_cot_preservation(
+        self,
+    ) -> dict[str, float | int] | None:
+        """Measure candidate-minus-baseline CE on identical explicit spans."""
+
+        if not self.cot_aware:
+            return {}
+        if (
+            self.handle is None
+            or self._cot_baseline is None
+            or not self._cot_active_examples
+        ):
+            return None
+        try:
+            candidate = score_cot_references(
+                self.handle.model,
+                self.handle.tokenizer,
+                self._cot_active_examples,
+                max_length=self.cot_max_length,
+            )
+            report = compare_cot_score_snapshots(self._cot_baseline, candidate)
+            metrics = report.as_gate_metrics()
+        except Exception as exc:
+            self.log(
+                "  CoT preservation measurement failed: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
+            return None
+        self.log(
+            "  CoT preservation: "
+            f"reasoning CE delta={report.reasoning_ce_delta:+.4f}, "
+            f"answer CE delta={report.answer_ce_delta:+.4f}, "
+            f"examples={len(report.examples)}"
+        )
+        return metrics
+
     def _capture_damage_baseline(self):
         """Capture a compact held-out benign baseline before any weight edit.
 
@@ -4349,6 +6032,8 @@ class AbliterationPipeline:
         model = self.handle.model
         tokenizer = self.handle.tokenizer
         device = self._get_model_device(model)
+
+        self._capture_cot_preservation_baseline()
 
         raw_prompts = self._holdout_harmless[: self.damage_eval_max_samples]
         minimum = self.damage_budget.damage.min_eval_prompts
@@ -4439,7 +6124,46 @@ class AbliterationPipeline:
                 raise RuntimeError(message) from exc
             self.log(f"  {message} (gate disabled; continuing exploratory run)")
 
-        self._baseline_generation_health = self._measure_benign_generation_health()
+        if self._requested_projection_target == "auto" or self.use_kl_optimization:
+            original_generation_prompts = self._generation_health_prompts
+            self._selection_generation_health_baseline = None
+            self._confirmation_generation_health_baseline = None
+            try:
+                self._generation_health_prompts = (
+                    self._selection_generation_health_prompts
+                )
+                self._selection_generation_health_baseline = (
+                    self._measure_benign_generation_health()
+                )
+                self._generation_health_prompts = (
+                    self._confirmation_generation_health_prompts
+                )
+                self._confirmation_generation_health_baseline = (
+                    self._measure_benign_generation_health()
+                )
+            except Exception:
+                # Partial selection evidence must not survive a failed capture
+                # and be mistaken for a complete two-way untouched baseline.
+                self._selection_generation_health_baseline = None
+                self._confirmation_generation_health_baseline = None
+                raise
+            finally:
+                self._generation_health_prompts = original_generation_prompts
+            if (
+                self._selection_generation_health_baseline is None
+                or self._confirmation_generation_health_baseline is None
+            ):
+                self._baseline_generation_health = None
+            else:
+                # The search wrapper switches both the prompts and matching
+                # untouched baseline before selection and confirmation.
+                self._baseline_generation_health = (
+                    self._selection_generation_health_baseline
+                )
+        else:
+            self._baseline_generation_health = (
+                self._measure_benign_generation_health()
+            )
         if self._baseline_generation_health is None and self.damage_gate_enabled:
             raise RuntimeError(
                 "Untouched benign generation baseline could not be measured. "
@@ -4501,7 +6225,7 @@ class AbliterationPipeline:
 
         Supports multiple projection strategies:
         - Standard: full orthogonal projection (basic)
-        - Norm-preserving: project direction but preserve weight matrix norm
+        - Norm-preserving: project direction and restore each logical output-row norm
         - Regularized: partial removal preserving a fraction of original projection
 
         SOTA enhancements:
@@ -4561,32 +6285,20 @@ class AbliterationPipeline:
                 self.lora_rank,
             )
 
-        # ── Bayesian optimization pre-pass ─────────────────────────────
-        # When enabled, run Optuna TPE to find optimal per-layer regularization
-        # before the standard projection loop.  The found values override the
-        # static layer_adaptive_strength weights.
+        # ── Bayesian optimization guard ────────────────────────────────
+        # Optimized/Heretic candidates are complete edit plans and are applied
+        # by _run_bayesian_projection_search_inner.  Calling the ordinary
+        # EXCISE loop would add unscored directions/secondary edits and recreate
+        # the legacy scored-vs-saved mismatch, so nested entry fails closed.
         bayesian_regs: dict[int, float] = {}
         bayesian_trials = getattr(self, "_bayesian_trials", 0) or (
             METHODS.get(self.method, {}).get("bayesian_trials", 0)
         )
-        if bayesian_trials > 0 and self._strong_layers and self.handle:
-            self.log(f"Running Bayesian optimization ({bayesian_trials} trials)...")
-            from obliteratus.bayesian_optimizer import run_bayesian_optimization
-            bayesian_regs = run_bayesian_optimization(
-                self,
-                n_trials=bayesian_trials,
-                n_refusal_prompts=8,
-                n_kl_prompts=5,
+        if bayesian_trials > 0:
+            raise RuntimeError(
+                "Bayesian methods must run through exact candidate orchestration; "
+                "the ordinary EXCISE loop is not a replayable search trial"
             )
-            if bayesian_regs:
-                self.log(
-                    f"  Bayesian optimization complete: "
-                    f"optimized {len(bayesian_regs)} layer regularizations"
-                )
-                regs_str = ", ".join(
-                    f"{idx}:{reg:.3f}" for idx, reg in sorted(bayesian_regs.items())
-                )
-                self.log(f"  Optimal regs: {regs_str}")
 
         # ── LoRA-based reversible ablation ──────────────────────────────
         # When enabled, compute LoRA adapters and merge them instead of
@@ -4643,6 +6355,13 @@ class AbliterationPipeline:
                 modified_count=total_modified,
             )
             return  # The manifest-complete LoRA plan is the sole primary edit.
+
+        if self.residual_erasers:
+            self.log(
+                "Applying exact two-sided oblique factors to manifest weights. "
+                "This is a linear checkpoint projection; fitted affine centers "
+                "cannot be reproduced across residual identity paths."
+            )
 
         # ── Spectral Cascade: frequency-band modulated projection ────
         # Decomposes refusal signal magnitude across layers into spectral
@@ -4749,11 +6468,20 @@ class AbliterationPipeline:
                 if not owners:
                     continue
                 owner = min(owners)
-                for direction_index in range(self.refusal_subspaces[owner].shape[0]):
+                eraser = self.residual_erasers.get(owner)
+                direction_count = (
+                    1 if eraser is not None else self.refusal_subspaces[owner].shape[0]
+                )
+                for direction_index in range(direction_count):
                     manifest_expected.add((entry.storage_identity, direction_index))
 
             for idx in self._strong_layers:
                 subspace = self.refusal_subspaces[idx]
+                eraser = self.residual_erasers.get(idx)
+                if eraser is not None and eraser.rank == 0:
+                    raise ArchitectureCoverageError(
+                        f"Layer {idx} selected an identity eraser with rank zero"
+                    )
                 device = next(layers[idx].parameters()).device
 
                 # Layer-adaptive regularization: scale projection per-layer
@@ -4803,18 +6531,27 @@ class AbliterationPipeline:
                 # direction rescaling would reintroduce previously removed
                 # components (the rescaling globally scales ALL dimensions,
                 # including the zero'd-out direction).
-                multi_dir = subspace.shape[0] > 1 and self.norm_preserve
-                saved_layer_norms: dict[str, float] = {}
+                direction_count = 1 if eraser is not None else subspace.shape[0]
+                multi_dir = direction_count > 1 and self.norm_preserve
+                saved_layer_norms: dict[str, _SavedLogicalRowNorms] = {}
                 if multi_dir:
-                    saved_layer_norms = self._capture_layer_weight_norms(layers[idx])
+                    saved_layer_norms = self._capture_layer_weight_norms(
+                        layers[idx],
+                        manifest.entries_for_layer(idx),
+                    )
 
                 # Disable per-direction norm preservation when doing multi-
                 # direction subspace projection (will restore once afterward)
                 dir_norm_preserve = self.norm_preserve and not multi_dir
 
                 # Process each direction in the subspace
-                for dir_idx in range(subspace.shape[0]):
-                    direction = subspace[dir_idx]
+                directions_to_apply = (
+                    self.refusal_directions[idx].unsqueeze(0)
+                    if eraser is not None
+                    else subspace
+                )
+                for dir_idx in range(directions_to_apply.shape[0]):
+                    direction = directions_to_apply[dir_idx]
                     d = direction.to(device).unsqueeze(-1)  # (hidden_dim, 1)
 
                     # ── Attention projection ──────────────────────────
@@ -4841,6 +6578,7 @@ class AbliterationPipeline:
                         attention_regularization=attn_reg,
                         ffn_regularization=mlp_reg,
                         norm_preserve=dir_norm_preserve,
+                        eraser=eraser,
                         edited=manifest_edited,
                         strong_layers=strong_layer_set,
                     )
@@ -4879,9 +6617,9 @@ class AbliterationPipeline:
                     del d
 
                 # ── Restore norms after full subspace projection ──────
-                # Rescale every modified weight back to its pre-projection
-                # Frobenius norm. This is done ONCE for the full subspace,
-                # preventing the per-direction rescaling bug.
+                # Restore every modified logical output-row norm to its
+                # pre-projection value. This is done ONCE for the full
+                # subspace, preventing per-direction restoration drift.
                 if multi_dir and saved_layer_norms:
                     self._restore_layer_weight_norms(layers[idx], saved_layer_norms)
 
@@ -4996,18 +6734,6 @@ class AbliterationPipeline:
                 f"get_ffn_module() support this model architecture."
             )
 
-        # ── Legacy KL "correction" intentionally disabled ─────────────
-        # The old implementation used projection magnitude as a proxy for KL
-        # and reconstructed removed coefficients with a single scalar.  That
-        # is not an exact inverse and can add damage.  Actual baseline-vs-edit
-        # KL is now measured after every persistent edit by the acceptance
-        # gate; over-budget candidates are rejected and restored instead.
-        if self.use_kl_optimization and self.handle and self._strong_layers:
-            self.log(
-                "  Legacy post-hoc KL correction disabled; using the exact "
-                "held-out KL acceptance gate"
-            )
-
         # ── Optional lm_head projection ───────────────────────────────
         # The language model head converts hidden states to token logits.
         # Even if all internal layers are projected, lm_head can still
@@ -5059,7 +6785,7 @@ class AbliterationPipeline:
                         if self.invert_refusal
                         else self.regularization
                     )
-                    # Use bulk norm preservation for lm_head: capture norm
+                    # Use bulk logical-row norm preservation for lm_head: capture
                     # ONCE before all directions, restore ONCE after.  Per-
                     # direction rescaling on lm_head is especially destructive
                     # because it directly distorts token logits — amplifying
@@ -5073,9 +6799,13 @@ class AbliterationPipeline:
                         and lm_head_obj is not None
                         and hasattr(lm_head_obj, "weight")
                     )
-                    lm_original_norm = 0.0
+                    lm_saved_rows = None
                     if lm_multi_dir:
-                        lm_original_norm = lm_head_obj.weight.data.norm().item()
+                        lm_saved_rows = self._capture_logical_row_norms(
+                            lm_head_obj.weight.data,
+                            residual_axis=lm_head_obj.weight.data.ndim - 1,
+                            role="reader",
+                        )
                     if not tied_to_input:
                         for dir_idx in range(subspace_on_device.shape[0]):
                             d = subspace_on_device[dir_idx].unsqueeze(-1)
@@ -5087,15 +6817,12 @@ class AbliterationPipeline:
                                 projection_row_fraction=self.projection_row_fraction,
                             )
                             del d
-                    # Restore lm_head norm once after all directions
-                    if lm_multi_dir and lm_original_norm > 0 and lm_head_obj is not None:
-                        new_norm = lm_head_obj.weight.data.norm().item()
-                        if new_norm > 0 and not math.isnan(new_norm) and not math.isinf(new_norm):
-                            ratio = lm_original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            if abs(ratio - 1.0) > 1e-6:
-                                lm_head_obj.weight.data.mul_(ratio)
+                    # Restore each vocabulary/output row once after all directions.
+                    if lm_saved_rows is not None and lm_head_obj is not None:
+                        self._restore_logical_row_norms(
+                            lm_head_obj.weight.data,
+                            lm_saved_rows,
+                        )
                 if subspace_on_device is not None:
                     del subspace_on_device
         if lm_head_count > 0:
@@ -5215,10 +6942,10 @@ class AbliterationPipeline:
             extras.append("winsorized")
         if self._float_layer_weights:
             extras.append("float-interp")
-        if self._cot_preserve_directions:
-            extras.append(f"CoT-preserved({len(self._cot_preserve_directions)})")
-        if self._kl_contributions:
-            extras.append("KL-optimized")
+        if self.cot_aware:
+            extras.append(f"CoT-gated({len(self._cot_examples)} references)")
+        if self.use_kl_optimization:
+            extras.append("KL-candidate-search")
         if self.spectral_cascade:
             extras.append(f"spectral-cascade({self.spectral_bands}-bands)")
         mode_label = " + ".join(extras) if extras else "standard"
@@ -5269,22 +6996,18 @@ class AbliterationPipeline:
         # Use LEACE when enabled (matching main _distill)
         leace_extractor = None
         if self.direction_method == "leace":
-            try:
-                from obliteratus.analysis.leace import LEACEExtractor
-                leace_extractor = LEACEExtractor()
-            except Exception:
-                pass
+            from obliteratus.analysis.leace import LEACEExtractor
+            leace_extractor = LEACEExtractor()
 
         # Preserve SOM extraction across true iterative re-probe passes.
         som_extractor = None
-        if self.direction_method == "som":
+        if self.direction_method == "som_proxy":
             som_extractor = self._make_som_extractor()
 
         # Use whitened SVD when enabled (matching main _distill)
         whitened_extractor = None
         if (
             self.use_whitened_svd
-            and n_dirs > 1
             and wasserstein_extractor is None
             and leace_extractor is None
             and som_extractor is None
@@ -5323,34 +7046,52 @@ class AbliterationPipeline:
 
             # LEACE path (matching main _distill)
             if leace_extractor is not None:
-                if idx in self._harmful_acts and idx in self._harmless_acts:
-                    try:
-                        l_result = leace_extractor.extract(
-                            self._harmful_acts[idx],
-                            self._harmless_acts[idx],
-                            layer_idx=idx,
-                        )
-                        self.refusal_directions[idx] = l_result.direction
-                        self.refusal_subspaces[idx] = l_result.direction.unsqueeze(0)
-                        norms[idx] = l_result.generalized_eigenvalue
-                        continue
-                    except Exception:
-                        pass  # Fall through to diff-of-means
+                if idx not in self._harmful_acts or idx not in self._harmless_acts:
+                    raise RuntimeError(
+                        f"LEACE extraction is missing paired activations for layer {idx}"
+                    )
+                try:
+                    l_result = leace_extractor.extract(
+                        self._harmful_acts[idx],
+                        self._harmless_acts[idx],
+                        layer_idx=idx,
+                    )
+                    self.residual_erasers[idx] = l_result.eraser
+                    self.refusal_directions[idx] = l_result.direction
+                    display = l_result.eraser.display_directions
+                    self.refusal_subspaces[idx] = (
+                        display
+                        if display is not None and display.shape[0] > 0
+                        else l_result.direction.unsqueeze(0)
+                    )
+                    norms[idx] = l_result.generalized_eigenvalue
+                    continue
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"LEACE extraction failed at layer {idx}; refusing to "
+                        "substitute a different direction backend"
+                    ) from exc
 
             if som_extractor is not None:
-                if idx in self._harmful_acts and idx in self._harmless_acts:
-                    try:
-                        _, som_strength = self._extract_som_layer(
-                            som_extractor,
-                            idx,
-                            n_dirs,
-                        )
-                        norms[idx] = som_strength
-                        continue
-                    except Exception:
-                        pass  # Fall through to SVD
+                if idx not in self._harmful_acts or idx not in self._harmless_acts:
+                    raise RuntimeError(
+                        f"SOM proxy extraction is missing paired activations for layer {idx}"
+                    )
+                try:
+                    _, som_strength = self._extract_som_layer(
+                        som_extractor,
+                        idx,
+                        n_dirs,
+                    )
+                    norms[idx] = som_strength
+                    continue
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"SOM proxy extraction failed at layer {idx}; refusing "
+                        "to relabel an SVD fallback as SOM"
+                    ) from exc
 
-            if n_dirs == 1:
+            if self.direction_method == "diff_means" and whitened_extractor is None:
                 diff = (self._harmful_means[idx] - self._harmless_means[idx]).squeeze(0)
                 norm = diff.norm()
                 norms[idx] = norm.item()
@@ -5367,8 +7108,13 @@ class AbliterationPipeline:
                     n_directions=n_dirs,
                     layer_idx=idx,
                 )
+                self.residual_erasers[idx] = result.eraser
                 self.refusal_subspaces[idx] = result.directions
-                self.refusal_directions[idx] = result.directions[0]
+                self.refusal_directions[idx] = (
+                    result.directions[0]
+                    if result.directions.shape[0] > 0
+                    else torch.zeros_like(self._harmful_means[idx].squeeze(0))
+                )
                 norms[idx] = result.singular_values.sum().item()
             else:
                 harmful_stack = torch.stack(self._harmful_acts[idx]).squeeze(1)
@@ -5406,14 +7152,7 @@ class AbliterationPipeline:
         elif selection_method == "knee":
             self._strong_layers = self._select_layers_knee(sorted_layers)
         else:
-            # Default: knee + COSMIC fusion
-            knee_layers = self._select_layers_knee(sorted_layers)
-            cosmic_layers = self._select_layers_cosmic(n_layers)
-            if cosmic_layers:
-                fused_set = set(knee_layers) | set(cosmic_layers)
-                self._strong_layers = [idx for idx, _ in sorted_layers if idx in fused_set]
-            else:
-                self._strong_layers = knee_layers
+            raise ValueError(f"Unknown layer selection method: {selection_method!r}")
 
         # Apply small-model safeguards (matching _distill)
         if self._strong_layers and n_layers > 0:
@@ -5472,231 +7211,6 @@ class AbliterationPipeline:
         if self.invert_refusal:
             self._expert_safety_scores.clear()
             self._identify_safety_experts()
-
-    def _kl_optimize_corrections(self, layers: nn.ModuleList, total_modified: int):
-        """KL-divergence co-optimization: measure and correct over-projection.
-
-        Measures per-layer KL divergence contribution on harmless reference
-        prompts and partially reverts projections that caused excessive KL.
-
-        This bridges Heretic's Bayesian optimization approach (co-minimize
-        refusal + KL) with OBLITERATUS's analysis-based pipeline:
-        - Heretic: search-based (200 Optuna trials, expensive)
-        - OBLITERATUS: project first, measure KL, correct surgically (cheap)
-
-        The correction is additive: for over-projected layers, we add back
-        a fraction of the removed refusal component to reduce KL divergence
-        while keeping most of the refusal removal intact.
-        """
-        raise RuntimeError(
-            "The legacy KL correction is disabled because it did not measure "
-            "baseline-vs-candidate KL and could introduce additional weight damage. "
-            "Use the held-out acceptance gate instead."
-        )
-
-        # Unreachable legacy body retained temporarily for result archaeology.
-        # It must not be re-enabled without an exact reversible delta and an
-        # actual baseline-relative line search.
-        model = self.handle.model
-        tokenizer = self.handle.tokenizer
-        device = self._get_model_device(model)
-        arch = self.handle.architecture
-
-        # Reference prompts for KL measurement (harmless only)
-        kl_prompts = [
-            "The weather today is",
-            "In mathematics, the concept of",
-            "The history of ancient Rome",
-            "How to cook a simple pasta",
-            "The process of photosynthesis involves",
-        ]
-
-        self.log("KL-divergence co-optimization: measuring capability damage...")
-
-        # Collect pre-correction logits
-        all_logits = []
-        try:
-            for prompt in kl_prompts:
-                inputs = tokenizer(
-                    prompt, return_tensors="pt", truncation=True, max_length=self.max_seq_length or 64,
-                )
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    all_logits.append(outputs.logits[:, -1, :].detach().cpu().float())
-                del inputs, outputs
-        except Exception as e:
-            self.log(f"  KL optimization skipped (forward pass failed: {e})")
-            return
-
-        if not all_logits:
-            return
-
-        # Compute per-layer KL contribution by temporarily removing each
-        # layer's projection and measuring the change.  This is expensive
-        # with the full model, so we use an approximation: the projection
-        # magnitude as a proxy for KL contribution.
-        layer_kl_proxy: dict[int, float] = {}
-        for idx in self._strong_layers:
-            if idx not in self.refusal_directions:
-                continue
-            d = self.refusal_directions[idx]
-
-            # Proxy: mean absolute projection of refusal direction onto weight
-            # matrices at this layer.  Larger projection = more modification = more KL.
-            total_proj = 0.0
-            n_proj = 0
-            try:
-                attn = get_attention_module(layers[idx], arch)
-                for name in _ATTN_OUT_NAMES:
-                    W = getattr(attn, name, None)
-                    if W is not None and hasattr(W, "weight"):
-                        d_dev = d.to(device=W.weight.device, dtype=W.weight.dtype)
-                        if W.weight.shape[-1] == d_dev.shape[0]:
-                            proj_mag = (W.weight.data @ d_dev).abs().mean().item()
-                        elif W.weight.shape[0] == d_dev.shape[0]:
-                            proj_mag = (d_dev @ W.weight.data).abs().mean().item()
-                        else:
-                            continue
-                        total_proj += proj_mag
-                        n_proj += 1
-            except (AttributeError, RuntimeError):
-                pass
-            try:
-                ffn = get_ffn_module(layers[idx], arch)
-                for name in _FFN_OUT_NAMES:
-                    W = getattr(ffn, name, None)
-                    if W is not None and hasattr(W, "weight"):
-                        d_dev = d.to(device=W.weight.device, dtype=W.weight.dtype)
-                        if W.weight.shape[-1] == d_dev.shape[0]:
-                            proj_mag = (W.weight.data @ d_dev).abs().mean().item()
-                        elif W.weight.shape[0] == d_dev.shape[0]:
-                            proj_mag = (d_dev @ W.weight.data).abs().mean().item()
-                        else:
-                            continue
-                        total_proj += proj_mag
-                        n_proj += 1
-            except (AttributeError, RuntimeError):
-                pass
-
-            avg_proj = total_proj / max(n_proj, 1)
-            layer_kl_proxy[idx] = avg_proj
-            self._kl_contributions[idx] = avg_proj
-
-        if not layer_kl_proxy:
-            return
-
-        # Compute total loss (perplexity) as KL proxy
-        total_loss = 0.0
-        n_tokens = 0
-        try:
-            for prompt in kl_prompts[:3]:
-                inputs = tokenizer(
-                    prompt, return_tensors="pt", truncation=True, max_length=self.max_seq_length or 64,
-                )
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    outputs = model(**inputs, labels=inputs["input_ids"])
-                    loss_val = outputs.loss.item()
-                    if not math.isnan(loss_val) and not math.isinf(loss_val):
-                        total_loss += loss_val * inputs["input_ids"].shape[1]
-                        n_tokens += inputs["input_ids"].shape[1]
-                del inputs, outputs
-        except Exception:
-            pass
-
-        if n_tokens > 0:
-            avg_loss = total_loss / n_tokens
-            try:
-                current_ppl = math.exp(min(avg_loss, 100.0))
-            except OverflowError:
-                current_ppl = float("inf")
-        else:
-            current_ppl = float("inf")
-
-        # KL budget check: if perplexity exceeds budget threshold, correct.
-        # Map kl_budget (0.0-2.0+) to a perplexity ceiling via exp scale so
-        # the full range is usable: 0.1→8, 0.3→13, 0.5→22, 1.0→55, 2.0→403
-        ppl_budget = math.exp(self.kl_budget * 3.0 + 1.0)
-        self.log(f"  Current perplexity: {current_ppl:.2f} (budget ceiling: {ppl_budget:.0f})")
-
-        if current_ppl > ppl_budget and current_ppl != float("inf"):
-            self.log("  KL budget exceeded — applying correction to weakest layers...")
-
-            # Sort layers by KL proxy (highest first = most damaging)
-            sorted_kl = sorted(layer_kl_proxy.items(), key=lambda x: x[1], reverse=True)
-
-            # Partially revert the weakest-signal layers (bottom third)
-            n_to_correct = max(1, len(sorted_kl) // 3)
-            correction_layers = [idx for idx, _ in sorted_kl[-n_to_correct:]]
-
-            for idx in correction_layers:
-                if idx not in self.refusal_directions:
-                    continue
-                d = self.refusal_directions[idx]
-
-                # Add back 30% of the removed refusal component.
-                #
-                # After full projection (reg=0), W_proj @ d = 0, so computing
-                # the revert from the current weights gives zero.  Instead we
-                # use the stored per-layer KL proxy (mean projection magnitude
-                # before excision) as a scale factor.  The revert adds back a
-                # fraction of the rank-1 refusal component: scale * d @ d^T
-                # applied in the appropriate orientation for each weight matrix.
-                revert_strength = 0.30
-                kl_proxy_mag = self._kl_contributions.get(idx, 0.0)
-                d_col = d.unsqueeze(-1) if d.dim() == 1 else d
-
-                def _partial_revert(module, weight_names, proxy_mag):
-                    for name in weight_names:
-                        proj = getattr(module, name, None)
-                        if proj is not None and hasattr(proj, "weight"):
-                            W = proj.weight.data
-                            d_dev = d_col.to(device=W.device, dtype=W.dtype)
-                            if W.shape[-1] == d_dev.shape[0]:
-                                # W is (out, hidden), d_dev is (hidden, 1)
-                                coeff = W @ d_dev  # (out, 1)
-                                coeff_mag = coeff.abs().mean().item()
-                                if coeff_mag < 1e-6 and proxy_mag > 0:
-                                    # Post-projection coeff ≈ 0, use proxy magnitude.
-                                    # Add uniform d^T to each row, scaled by proxy.
-                                    # d_dev.T is (1, hidden), broadcasts to (out, hidden)
-                                    W.add_(revert_strength * proxy_mag * d_dev.T)
-                                else:
-                                    # coeff is (out, 1), d_dev.T is (1, hidden)
-                                    # broadcasts to (out, hidden) — correct rank-1
-                                    W.add_(d_dev.T * (revert_strength * coeff))
-                            elif W.shape[0] == d_dev.shape[0]:
-                                # W is (hidden, out), d_row is (1, hidden)
-                                d_row = d_dev.squeeze(-1).unsqueeze(0)
-                                coeff = d_row @ W  # (1, out)
-                                coeff_mag = coeff.abs().mean().item()
-                                if coeff_mag < 1e-6 and proxy_mag > 0:
-                                    # d_row.T is (hidden, 1), broadcasts to (hidden, out)
-                                    W.add_(revert_strength * proxy_mag * d_row.T)
-                                else:
-                                    # d_row.T is (hidden, 1), coeff is (1, out)
-                                    W.add_(revert_strength * (d_row.T @ coeff))
-
-                try:
-                    attn = get_attention_module(layers[idx], arch)
-                    _partial_revert(attn, _ATTN_OUT_NAMES, kl_proxy_mag)
-                except (AttributeError, RuntimeError):
-                    pass
-                try:
-                    ffn = get_ffn_module(layers[idx], arch)
-                    _partial_revert(ffn, _FFN_OUT_NAMES, kl_proxy_mag)
-                except (AttributeError, RuntimeError):
-                    pass
-
-            self.log(
-                f"  Corrected {len(correction_layers)} layers "
-                f"(reverted {revert_strength:.0%} of projection)"
-            )
-        else:
-            self.log("  KL within budget — no correction needed")
-
-        self._free_gpu_memory()
 
     @staticmethod
     def _is_quantized_param(param) -> bool:
@@ -5850,64 +7364,127 @@ class AbliterationPipeline:
             )
 
     @staticmethod
-    def _capture_layer_weight_norms(layer: nn.Module) -> dict[str, float]:
-        """Capture Frobenius norms of ALL weight matrices in a transformer layer.
+    def _logical_row_reduction_axes(
+        tensor: torch.Tensor,
+        *,
+        residual_axis: int,
+        role: str,
+        expert_axis: int | None = None,
+    ) -> tuple[int, ...]:
+        """Axes whose norm defines one logical output-neuron row."""
+        if tensor.ndim < 2:
+            return tuple(range(tensor.ndim))
+        axis = residual_axis % tensor.ndim
+        if role == "reader":
+            # W reads the residual stream: every other index identifies an
+            # output unit and the residual input axis is that unit's row.
+            return (axis,)
+        if role != "writer":
+            raise ValueError("role must be 'reader' or 'writer'")
+        expert = None if expert_axis is None else expert_axis % tensor.ndim
+        # W writes to the residual stream: the residual axis identifies output
+        # units, while each expert remains a separate logical matrix.
+        return tuple(
+            index
+            for index in range(tensor.ndim)
+            if index != axis and index != expert
+        )
 
-        Used for correct multi-direction norm preservation: capture once before
-        projecting all subspace directions, then restore once afterward. This
-        avoids the bug where per-direction rescaling reintroduces previously
-        removed components (the global rescaling inflates ALL dimensions,
-        including the zero'd-out direction).
+    @staticmethod
+    def _capture_logical_row_norms(
+        tensor: torch.Tensor,
+        *,
+        residual_axis: int,
+        role: str,
+        expert_axis: int | None = None,
+    ) -> _SavedLogicalRowNorms:
+        reduction_axes = AbliterationPipeline._logical_row_reduction_axes(
+            tensor,
+            residual_axis=residual_axis,
+            role=role,
+            expert_axis=expert_axis,
+        )
+        data = tensor.detach().float()
+        norms = torch.linalg.vector_norm(
+            data,
+            dim=reduction_axes,
+            keepdim=True,
+        ).cpu()
+        return _SavedLogicalRowNorms(norms=norms, reduction_axes=reduction_axes)
 
-        Works recursively, covering attention, FFN, MoE experts, routers,
-        and shared experts uniformly.
-        """
-        norms: dict[str, float] = {}
+    @staticmethod
+    def _restore_logical_row_norms(
+        tensor: torch.Tensor,
+        saved: _SavedLogicalRowNorms,
+    ) -> None:
+        data = tensor.float() if not tensor.is_floating_point() else tensor
+        current = torch.linalg.vector_norm(
+            data,
+            dim=saved.reduction_axes,
+            keepdim=True,
+        )
+        target = saved.norms.to(device=data.device, dtype=data.dtype)
+        finite = torch.isfinite(current) & torch.isfinite(target)
+        restorable = finite & (target > 0) & (current > 1e-12)
+        collapsed = finite & (target > 0) & (current <= 1e-12)
+        if collapsed.any():
+            warnings.warn(
+                f"{int(collapsed.sum().item())} logical output rows were fully "
+                "annihilated and cannot have a non-zero norm restored",
+                stacklevel=3,
+            )
+        ratio = torch.ones_like(current)
+        ratio[restorable] = target[restorable] / current[restorable]
+        restored = data * ratio
+        if tensor.is_floating_point():
+            tensor.copy_(restored.to(dtype=tensor.dtype))
+        else:
+            # Quantized/custom integer storage can only preserve rows
+            # approximately; callers should re-quantize after projection.
+            tensor.copy_(restored.to(dtype=tensor.dtype))
+
+    @staticmethod
+    def _capture_layer_weight_norms(
+        layer: nn.Module,
+        manifest_entries: Iterable[ProjectionManifestEntry] | None = None,
+    ) -> dict[str, _SavedLogicalRowNorms]:
+        """Capture every logical output row once before a multi-rank edit."""
+        entry_by_parameter = {
+            id(entry.parameter): entry for entry in (manifest_entries or ())
+        }
+        norms: dict[str, _SavedLogicalRowNorms] = {}
         for param_name, param in layer.named_parameters():
-            # Modern MoE implementations commonly register fused matrices as
-            # direct parameters named ``gate_up_proj``/``down_proj`` or the
-            # DBRX ``w1``/``v1``/``w2`` tensors, without a trailing
-            # ``.weight``.  Capture every matrix-like parameter so the exact
-            # manifest path receives the same once-per-subspace norm handling
-            # as an ordinary nn.Linear.
-            if param.ndim >= 2:
-                data = param.data.float() if not param.data.is_floating_point() else param.data
-                norms[param_name] = data.norm().item()
+            if param.ndim < 2:
+                continue
+            entry = entry_by_parameter.get(id(param))
+            if entry is None:
+                # Compatibility fallback for non-manifest secondary edits:
+                # ordinary weight layout is [output, input].
+                residual_axis = param.ndim - 1
+                role = "reader"
+                expert_axis = 0 if param.ndim >= 3 else None
+            else:
+                residual_axis = entry.residual_axis
+                role = entry.role
+                expert_axis = entry.expert_axis
+            norms[param_name] = AbliterationPipeline._capture_logical_row_norms(
+                param.data,
+                residual_axis=residual_axis,
+                role=role,
+                expert_axis=expert_axis,
+            )
         return norms
 
     @staticmethod
     def _restore_layer_weight_norms(
         layer: nn.Module,
-        saved_norms: dict[str, float],
+        saved_norms: dict[str, _SavedLogicalRowNorms],
     ) -> None:
-        """Rescale weight matrices to their previously captured norms.
-
-        Should be called ONCE after ALL subspace directions have been projected
-        out, ensuring the norm-preservation rescaling doesn't reintroduce
-        previously removed directional components.
-        """
+        """Restore each logical output-neuron row once after the full subspace."""
         for param_name, param in layer.named_parameters():
-            if param_name not in saved_norms:
-                continue
-            original_norm = saved_norms[param_name]
-            if original_norm > 0:
-                needs_cast = not param.data.is_floating_point()
-                data = param.data.float() if needs_cast else param.data
-                new_norm = data.norm().item()
-                if math.isnan(new_norm) or math.isinf(new_norm) or new_norm == 0:
-                    continue  # Skip — weight is degenerate after projection
-                if abs(new_norm - original_norm) > 1e-6:
-                    ratio = original_norm / new_norm
-                    # Cap amplification to prevent compound norm drift across
-                    # layers.  Uncapped amplification destroys coherence.
-                    if ratio > _MAX_NORM_RATIO:
-                        ratio = _MAX_NORM_RATIO
-                    if needs_cast:
-                        # Non-float dtypes (e.g. uint8) can't mul_ by a float
-                        # scalar in-place — rescale in float then cast back.
-                        param.data.copy_(data.mul_(ratio).to(param.data.dtype))
-                    else:
-                        param.data.mul_(ratio)
+            saved = saved_norms.get(param_name)
+            if saved is not None:
+                AbliterationPipeline._restore_logical_row_norms(param.data, saved)
 
     @staticmethod
     def _select_projection_coefficients(
@@ -5986,43 +7563,79 @@ class AbliterationPipeline:
         norm_preserve: bool,
         regularization: float,
         projection_row_fraction: float,
+        removal_directions: torch.Tensor | None = None,
+        role: str = "reader",
     ) -> None:
-        """Project one explicitly declared residual axis of an arbitrary tensor."""
+        """Apply a symmetric or oblique low-rank map on one residual axis.
+
+        direction contains row-wise coefficient directions. When
+        removal_directions differs, the update is the oblique map
+        x <- x - scale * (x C.T) R. A column-shaped legacy direction is
+        accepted and converted to one row.
+        """
         if not tensor.is_floating_point():
             raise RuntimeError(
                 f"Cannot project non-floating tensor with dtype {tensor.dtype}"
             )
         axis = residual_axis % tensor.ndim
-        d = direction.to(device=tensor.device, dtype=tensor.dtype).reshape(-1)
-        if tensor.shape[axis] != d.numel():
-            raise ArchitectureCoverageError(
-                f"Manifest residual axis mismatch: shape={tuple(tensor.shape)}, "
-                f"axis={axis}, direction={d.numel()}"
-            )
-        if not torch.isfinite(tensor).all() or not torch.isfinite(d).all():
-            raise RuntimeError("Manifest target or refusal direction contains NaN/Inf")
+        hidden_dim = tensor.shape[axis]
 
-        moved = tensor.movedim(axis, -1)
-        coeff = torch.tensordot(moved, d, dims=([-1], [0]))
-        if not torch.isfinite(coeff).all():
-            raise RuntimeError("Projection coefficients contain NaN/Inf")
-        coeff = AbliterationPipeline._select_projection_coefficients(
-            coeff, projection_row_fraction
+        def _as_rows(value: torch.Tensor, name: str) -> torch.Tensor:
+            rows = value.to(device=tensor.device, dtype=tensor.dtype)
+            if rows.ndim == 1:
+                rows = rows.unsqueeze(0)
+            elif rows.ndim == 2 and rows.shape[-1] != hidden_dim:
+                if rows.shape[0] == hidden_dim:
+                    rows = rows.T
+                else:
+                    raise ArchitectureCoverageError(
+                        f"{name} shape {tuple(rows.shape)} does not match "
+                        f"residual width {hidden_dim}"
+                    )
+            if rows.ndim != 2 or rows.shape[1] != hidden_dim:
+                raise ArchitectureCoverageError(
+                    f"{name} must have shape (rank, {hidden_dim})"
+                )
+            return rows
+
+        coefficients_basis = _as_rows(direction, "coefficient directions")
+        removal_basis = _as_rows(
+            direction if removal_directions is None else removal_directions,
+            "removal directions",
         )
-        original_norm_sq = tensor.float().pow(2).sum().item() if norm_preserve else 0.0
-        coeff_norm_sq = coeff.float().pow(2).sum().item() if norm_preserve else 0.0
-        scale = 1.0 - regularization
-        moved.sub_(scale * coeff.unsqueeze(-1) * d)
-
-        if norm_preserve and original_norm_sq > 0.0:
-            new_norm_sq = max(
-                0.0,
-                original_norm_sq - scale * (2.0 - scale) * coeff_norm_sq,
+        if coefficients_basis.shape[0] != removal_basis.shape[0]:
+            raise ArchitectureCoverageError(
+                "coefficient and removal directions must have the same rank"
             )
-            if new_norm_sq > 0.0:
-                ratio = min(_MAX_NORM_RATIO, math.sqrt(original_norm_sq / new_norm_sq))
-                tensor.mul_(ratio)
+        if (
+            not torch.isfinite(tensor).all()
+            or not torch.isfinite(coefficients_basis).all()
+            or not torch.isfinite(removal_basis).all()
+        ):
+            raise RuntimeError("Manifest target or eraser factors contain NaN/Inf")
 
+        saved_rows = (
+            AbliterationPipeline._capture_logical_row_norms(
+                tensor,
+                residual_axis=axis,
+                role=role,
+            )
+            if norm_preserve
+            else None
+        )
+        moved = tensor.movedim(axis, -1)
+        coefficients = moved @ coefficients_basis.T
+        if not torch.isfinite(coefficients).all():
+            raise RuntimeError("Projection coefficients contain NaN/Inf")
+        coefficients = AbliterationPipeline._select_projection_coefficients(
+            coefficients,
+            projection_row_fraction,
+        )
+        scale = 1.0 - regularization
+        moved.sub_(scale * (coefficients @ removal_basis))
+
+        if saved_rows is not None:
+            AbliterationPipeline._restore_logical_row_norms(tensor, saved_rows)
     def _manifest_expert_safety_indices(self, layer_idx: int) -> set[int]:
         scores = self._expert_safety_scores.get(layer_idx, [])
         if not scores:
@@ -6087,6 +7700,7 @@ class AbliterationPipeline:
         direction_index: int,
         regularization: float,
         norm_preserve: bool,
+        eraser: ResidualEraser | None = None,
         expert_specialization: bool = True,
         project_biases: bool | None = None,
     ) -> int:
@@ -6111,6 +7725,10 @@ class AbliterationPipeline:
             )
             else {}
         )
+        if eraser is not None and expert_dirs:
+            raise ArchitectureCoverageError(
+                "Per-expert direction substitution cannot replay an oblique eraser"
+            )
         safety_indices = (
             self._manifest_expert_safety_indices(layer_idx)
             if expert_specialization and self.invert_refusal
@@ -6128,6 +7746,18 @@ class AbliterationPipeline:
                 return regularization if expert_index in safety_indices else 0.0
             return regularization
 
+        def _projection_factors(
+            selected_direction: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            if eraser is None:
+                return selected_direction, None
+            # For column activations P=I-LR:
+            # writer W <- PW uses row coefficients R and removes L.T;
+            # reader W <- WP uses row coefficients L.T and removes R.
+            if entry.role == "writer":
+                return eraser.proj_right, eraser.proj_left.T
+            return eraser.proj_left.T, eraser.proj_right
+
         if entry.expert_axis is not None:
             expert_axis = entry.expert_axis % tensor.ndim
             n_experts = tensor.shape[expert_axis]
@@ -6137,23 +7767,33 @@ class AbliterationPipeline:
                 if expert_axis < residual_axis:
                     residual_axis -= 1
                 expert_direction = expert_dirs.get(expert_index, direction)
+                coefficient_directions, removal_directions = _projection_factors(
+                    expert_direction
+                )
                 self._project_tensor_along_axis(
                     expert_tensor,
-                    expert_direction,
+                    coefficient_directions,
                     residual_axis=residual_axis,
                     norm_preserve=norm_preserve,
                     regularization=_expert_regularization(expert_index),
                     projection_row_fraction=self.projection_row_fraction,
+                    removal_directions=removal_directions,
+                    role=entry.role,
                 )
         else:
             expert_direction = expert_dirs.get(entry.expert_index, direction)
+            coefficient_directions, removal_directions = _projection_factors(
+                expert_direction
+            )
             self._project_tensor_along_axis(
                 tensor,
-                expert_direction,
+                coefficient_directions,
                 residual_axis=entry.residual_axis,
                 norm_preserve=norm_preserve,
                 regularization=_expert_regularization(entry.expert_index),
                 projection_row_fraction=self.projection_row_fraction,
+                removal_directions=removal_directions,
+                role=entry.role,
             )
 
         if is_quantized:
@@ -6163,13 +7803,18 @@ class AbliterationPipeline:
         if apply_biases and entry.role == "writer" and isinstance(obj, nn.Module):
             bias = getattr(obj, "bias", None)
             if isinstance(bias, torch.Tensor) and bias.numel() == direction.numel():
+                coefficient_directions, removal_directions = _projection_factors(
+                    direction
+                )
                 self._project_tensor_along_axis(
                     bias.data,
-                    direction,
+                    coefficient_directions,
                     residual_axis=0,
                     norm_preserve=False,
                     regularization=regularization,
                     projection_row_fraction=1.0,
+                    removal_directions=removal_directions,
+                    role="writer",
                 )
         return 1
 
@@ -6183,6 +7828,7 @@ class AbliterationPipeline:
         attention_regularization: float,
         ffn_regularization: float,
         norm_preserve: bool,
+        eraser: ResidualEraser | None = None,
         edited: set[tuple[str, int]],
         strong_layers: set[int],
     ) -> int:
@@ -6208,6 +7854,7 @@ class AbliterationPipeline:
                 direction_index=direction_index,
                 regularization=regularization,
                 norm_preserve=norm_preserve,
+                eraser=eraser,
             )
             edited.add(key)
         return count
@@ -6233,10 +7880,11 @@ class AbliterationPipeline:
                      square matrices, where shape cannot distinguish q_proj
                      from o_proj.
 
-        norm_preserve: If True, rescale projected weights to preserve original Frobenius norm.
-                       Prevents cascading norm drift through LayerNorm (grimjim, 2025).
+        norm_preserve: If True, restore every logical output-neuron row norm.
         regularization: Fraction of the original projection to preserve (0.0 = full removal,
-                        0.3 = preserve 30% of refusal component). Gabliteration recommends ~0.3.
+                        0.3 = preserve 30% of refusal component).  This is an
+                        OBLITERATUS API parameter, not Gabliteration's removal
+                        coefficient ``alpha`` or ridge coefficient ``lambda``.
         projection_row_fraction: Fraction of output rows/columns to project, chosen by
                         largest absolute refusal-direction coefficient. 1.0 matches
                         standard full-matrix projection.
@@ -6251,7 +7899,6 @@ class AbliterationPipeline:
         if orientation not in {"input", "output"}:
             raise ValueError("orientation must be 'input' (right) or 'output' (left)")
 
-        scale = 1.0 - regularization
         count = 0
 
         for name in candidate_names:
@@ -6260,81 +7907,33 @@ class AbliterationPipeline:
                 continue
 
             W, is_quantized = AbliterationPipeline._dequantize_weight(proj)
-            d = direction.to(device=W.device, dtype=W.dtype)
+            d = direction.to(device=W.device, dtype=W.dtype).reshape(-1)
 
             # Skip projection if weight or direction contains NaN/Inf
             if not torch.isfinite(W).all() or not torch.isfinite(d).all():
                 continue
 
-            if orientation == "input" and W.shape[-1] == d.shape[0]:
-                # Right projection: W is (out_features, hidden_dim).
-                original_norm_sq = W.pow(2).sum().item() if norm_preserve else 0.0
+            if orientation == "input" and W.shape[-1] == d.numel():
+                residual_axis = W.ndim - 1
+                role = "reader"
+            elif orientation == "output" and W.shape[0] == d.numel():
+                residual_axis = 0
+                role = "writer"
+            else:
+                continue
 
-                coeff = W @ d                      # (out_features, 1)
-                # Guard: if projection coefficient is NaN, skip this weight
-                if not torch.isfinite(coeff).all():
-                    del coeff
-                    continue
-                coeff_to_remove = AbliterationPipeline._select_projection_coefficients(
-                    coeff, projection_row_fraction,
-                )
-                coeff_norm_sq = (
-                    coeff_to_remove.pow(2).sum().item() if norm_preserve else 0.0
-                )
-                W.sub_(d.T * (scale * coeff_to_remove))  # in-place rank-1 update
-                del coeff, coeff_to_remove
-
-                # Analytical norm: ||W'||² = ||W||² - scale(2-scale)||coeff||²
-                if norm_preserve and original_norm_sq > 0:
-                    new_norm_sq = max(0.0, original_norm_sq - scale * (2 - scale) * coeff_norm_sq)
-                    if new_norm_sq > 0:
-                        import math
-                        ratio = math.sqrt(original_norm_sq / new_norm_sq)
-                        # Cap amplification: uncapped rescaling compounds
-                        # across layers and directions, destroying coherence.
-                        # 1.10 keeps per-projection drift bounded while
-                        # allowing legitimate norm preservation.
-                        if ratio > _MAX_NORM_RATIO:
-                            ratio = _MAX_NORM_RATIO
-                        W.mul_(ratio)
-
-                if is_quantized:
-                    AbliterationPipeline._replace_quantized_weight(proj, W)
-
-                count += 1
-
-            elif orientation == "output" and W.shape[0] == d.shape[0]:
-                # Left projection: W is (hidden_dim, in_features).
-                original_norm_sq = W.pow(2).sum().item() if norm_preserve else 0.0
-
-                coeff = d.T @ W                    # (1, out_features)
-                # Guard: if projection coefficient is NaN, skip this weight
-                if not torch.isfinite(coeff).all():
-                    del coeff
-                    continue
-                coeff_to_remove = AbliterationPipeline._select_projection_coefficients(
-                    coeff, projection_row_fraction,
-                )
-                coeff_norm_sq = (
-                    coeff_to_remove.pow(2).sum().item() if norm_preserve else 0.0
-                )
-                W.sub_((scale * d) * coeff_to_remove)  # in-place rank-1 update
-                del coeff, coeff_to_remove
-
-                # Analytical norm: ||W'||² = ||W||² - scale(2-scale)||coeff||²
-                if norm_preserve and original_norm_sq > 0:
-                    new_norm_sq = max(0.0, original_norm_sq - scale * (2 - scale) * coeff_norm_sq)
-                    if new_norm_sq > 0:
-                        import math
-                        ratio = math.sqrt(original_norm_sq / new_norm_sq)
-                        if ratio > _MAX_NORM_RATIO:
-                            ratio = _MAX_NORM_RATIO
-                        W.mul_(ratio)
-
-                if is_quantized:
-                    AbliterationPipeline._replace_quantized_weight(proj, W)
-
-                count += 1
+            AbliterationPipeline._project_tensor_along_axis(
+                W,
+                d,
+                residual_axis=residual_axis,
+                norm_preserve=norm_preserve,
+                regularization=regularization,
+                projection_row_fraction=projection_row_fraction,
+                role=role,
+            )
+            if is_quantized:
+                AbliterationPipeline._replace_quantized_weight(proj, W)
+            count += 1
 
         return count
 
@@ -6433,30 +8032,36 @@ class AbliterationPipeline:
                 d = direction.to(device=W.device, dtype=W.dtype)
 
                 if W.shape[-1] == d.shape[0]:
-                    original_norm = W.norm().item() if norm_preserve else 0.0
+                    saved_rows = (
+                        AbliterationPipeline._capture_logical_row_norms(
+                            W,
+                            residual_axis=W.ndim - 1,
+                            role="reader",
+                        )
+                        if norm_preserve
+                        else None
+                    )
                     coeff = W @ d
                     W.sub_(d.T * (scale * coeff))
                     del coeff
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W.mul_(ratio)
+                    if saved_rows is not None:
+                        AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
                     count += 1
                 elif W.shape[0] == d.shape[0]:
-                    original_norm = W.norm().item() if norm_preserve else 0.0
+                    saved_rows = (
+                        AbliterationPipeline._capture_logical_row_norms(
+                            W,
+                            residual_axis=0,
+                            role="writer",
+                        )
+                        if norm_preserve
+                        else None
+                    )
                     coeff = d.T @ W
                     W.sub_((scale * d) * coeff)
                     del coeff
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W.mul_(ratio)
+                    if saved_rows is not None:
+                        AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
                     count += 1
 
             if count > 0:
@@ -7093,7 +8698,15 @@ class AbliterationPipeline:
                     continue
 
                 if W.shape[-1] == d.shape[0]:
-                    original_norm = W.norm().item() if norm_preserve else 0.0
+                    saved_rows = (
+                        AbliterationPipeline._capture_logical_row_norms(
+                            W,
+                            residual_axis=W.ndim - 1,
+                            role="reader",
+                        )
+                        if norm_preserve
+                        else None
+                    )
                     d_col = d.unsqueeze(-1)
                     coeff = W @ d_col
                     if not torch.isfinite(coeff).all():
@@ -7101,16 +8714,19 @@ class AbliterationPipeline:
                         continue
                     W.sub_(scale * (coeff @ d_col.T))
                     del coeff, d_col
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W.mul_(ratio)
+                    if saved_rows is not None:
+                        AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
                     count += 1
                 elif W.shape[0] == d.shape[0]:
-                    original_norm = W.norm().item() if norm_preserve else 0.0
+                    saved_rows = (
+                        AbliterationPipeline._capture_logical_row_norms(
+                            W,
+                            residual_axis=0,
+                            role="writer",
+                        )
+                        if norm_preserve
+                        else None
+                    )
                     d_row = d.unsqueeze(0)
                     coeff = d_row @ W
                     if not torch.isfinite(coeff).all():
@@ -7118,13 +8734,8 @@ class AbliterationPipeline:
                         continue
                     W.sub_(scale * (d_row.T @ coeff))
                     del coeff, d_row
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W.mul_(ratio)
+                    if saved_rows is not None:
+                        AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
                     count += 1
 
             if is_quantized and count > 0:
@@ -7203,7 +8814,15 @@ class AbliterationPipeline:
                     continue
 
                 if W.shape[-1] == d.shape[0]:
-                    original_norm = W.norm().item() if norm_preserve else 0.0
+                    saved_rows = (
+                        AbliterationPipeline._capture_logical_row_norms(
+                            W,
+                            residual_axis=W.ndim - 1,
+                            role="reader",
+                        )
+                        if norm_preserve
+                        else None
+                    )
                     d_col = d.unsqueeze(-1)
                     coeff = W @ d_col
                     if not torch.isfinite(coeff).all():
@@ -7211,16 +8830,19 @@ class AbliterationPipeline:
                         continue
                     W.sub_(scale * (coeff @ d_col.T))
                     del coeff, d_col
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W.mul_(ratio)
+                    if saved_rows is not None:
+                        AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
                     count += 1
                 elif W.shape[0] == d.shape[0]:
-                    original_norm = W.norm().item() if norm_preserve else 0.0
+                    saved_rows = (
+                        AbliterationPipeline._capture_logical_row_norms(
+                            W,
+                            residual_axis=0,
+                            role="writer",
+                        )
+                        if norm_preserve
+                        else None
+                    )
                     d_row = d.unsqueeze(0)
                     coeff = d_row @ W
                     if not torch.isfinite(coeff).all():
@@ -7228,13 +8850,8 @@ class AbliterationPipeline:
                         continue
                     W.sub_(scale * (d_row.T @ coeff))
                     del coeff, d_row
-                    if norm_preserve and original_norm > 0:
-                        new_norm = W.norm().item()
-                        if new_norm > 0:
-                            ratio = original_norm / new_norm
-                            if ratio > _MAX_NORM_RATIO:
-                                ratio = _MAX_NORM_RATIO
-                            W.mul_(ratio)
+                    if saved_rows is not None:
+                        AbliterationPipeline._restore_logical_row_norms(W, saved_rows)
                     count += 1
 
             if is_quantized and count > 0:
@@ -7592,6 +9209,14 @@ class AbliterationPipeline:
             self._quality_metrics["perplexity"] = None
             self._quality_metrics["kl_divergence"] = None
             self.log("  Benign locality: inconclusive (required measurements missing)")
+
+        if self.cot_aware:
+            self.log("Measuring explicit reasoning-trace preservation...")
+            cot_metrics = self._measure_candidate_cot_preservation()
+            if cot_metrics is not None:
+                self._quality_metrics.update(cot_metrics)
+            else:
+                self.log("  CoT preservation: inconclusive (required measurements missing)")
 
         # 2. Baseline-relative benign generation coherence/degeneration
 
@@ -7954,29 +9579,41 @@ class AbliterationPipeline:
                 "n_directions": self.n_directions,
                 "direction_method": self.direction_method,
                 "norm_preserve": self.norm_preserve,
+                "norm_preserve_mode": "row" if self.norm_preserve else "none",
                 "regularization": self.regularization,
+                "regularization_requested": self._requested_regularization,
+                "regularization_selected_by_kl_search": (
+                    self._kl_selected_regularization
+                    if self.use_kl_optimization
+                    and self.method not in {"som", "optimized", "heretic"}
+                    else None
+                ),
                 "refinement_passes": self.refinement_passes,
                 "project_biases": self.project_biases,
                 "use_chat_template": self.use_chat_template,
                 "use_whitened_svd": self.use_whitened_svd,
                 "true_iterative_refinement": self.true_iterative_refinement,
-                # Heretic-inspired enhancements
+                # Optional editing and preservation enhancements
                 "winsorize_activations": self.winsorize_activations,
                 "float_layer_interpolation": self.float_layer_interpolation,
                 "cot_aware": self.cot_aware,
                 "use_kl_optimization": self.use_kl_optimization,
                 "legacy_kl_correction_applied": False,
+                "legacy_cot_activation_proxy_applied": False,
                 "use_lora_ablation": self.use_lora_ablation,
                 "project_lm_head": self.project_lm_head,
                 "project_embeddings": self.project_embeddings,
-                "som_iterations": self.som_iterations if self.direction_method == "som" else None,
-                "som_learning_rate": self.som_learning_rate if self.direction_method == "som" else None,
-                "som_sigma": self.som_sigma if self.direction_method == "som" else None,
-                "som_candidate_count": self.som_candidate_count if self.direction_method == "som" else None,
-                "som_harmless_pc_count": self.som_harmless_pc_count if self.direction_method == "som" else None,
-                "som_distortion_aware": self.som_distortion_aware if self.direction_method == "som" else None,
-                "som_diversity_penalty": self.som_diversity_penalty if self.direction_method == "som" else None,
-                "som_min_signal_to_noise": self.som_min_signal_to_noise if self.direction_method == "som" else None,
+                "som_iterations": self.som_iterations if self.direction_method in {"som", "som_proxy"} else None,
+                "som_learning_rate": self.som_learning_rate if self.direction_method in {"som", "som_proxy"} else None,
+                "som_sigma": self.som_sigma if self.direction_method in {"som", "som_proxy"} else None,
+                "som_candidate_count": self.som_candidate_count if self.direction_method in {"som", "som_proxy"} else None,
+                "som_harmless_pc_count": self.som_harmless_pc_count if self.direction_method == "som_proxy" else None,
+                "som_distortion_aware": self.som_distortion_aware if self.direction_method == "som_proxy" else None,
+                "som_diversity_penalty": self.som_diversity_penalty if self.direction_method == "som_proxy" else None,
+                "som_min_signal_to_noise": self.som_min_signal_to_noise if self.direction_method == "som_proxy" else None,
+                "som_ordered_subset_size": self.n_directions if self.method == "som" else None,
+                "som_search_trials": METHODS["som"].get("som_search_trials") if self.method == "som" else None,
+                "som_seed": METHODS["som"].get("som_seed") if self.method == "som" else None,
                 "layer_selection": self.layer_selection,
                 "min_layer_fraction": self.min_layer_fraction,
                 "max_layer_fraction": self.max_layer_fraction,
@@ -8009,7 +9646,14 @@ class AbliterationPipeline:
                     else None
                 ),
                 "projection_row_fraction": self.projection_row_fraction,
-                "som_contiguous_layer_budget": self.som_contiguous_layer_budget if self.direction_method == "som" else None,
+                "oblique_eraser_layers": sorted(self.residual_erasers),
+                "oblique_checkpoint_semantics": (
+                    "linear_weight_projection_only; affine activation centering "
+                    "is diagnostic and is not reproduced across residual identity paths"
+                    if self.residual_erasers
+                    else None
+                ),
+                "som_contiguous_layer_budget": self.som_contiguous_layer_budget if self.direction_method == "som_proxy" else None,
                 # Spectral Cascade
                 "spectral_cascade": self.spectral_cascade,
                 "spectral_bands": self.spectral_bands,
@@ -8017,13 +9661,15 @@ class AbliterationPipeline:
             },
             "references": [
                 "Arditi et al., Refusal in Language Models Is Mediated by a Single Direction (NeurIPS 2024)",
-                "Gabliteration: SVD-based multi-direction extraction (arXiv:2512.18901)",
-                "Norm-Preserving Biprojected Abliteration (grimjim, 2025)",
+                "Gabliteration: shuffled-pair SVD, behavioral layer trials, and exact replay (arXiv:2512.18901)",
+                "Wollschlaeger et al., The Geometry of Refusal in Large Language Models (RDO; arXiv:2502.17420)",
+                "Piras et al., SOM Directions Are Better than One (AAAI 2026)",
+                "Heretic/p-e-w dense projection baseline with independent exact model-forward TPE replay",
+                "Per-output-row norm preservation inspired by projected abliteration",
                 "Young, Comparative Analysis of LLM Abliteration Methods (arXiv:2512.13655)",
                 "Joad et al., More to Refusal than a Single Direction (2026)",
-                "Piras et al., SOM Directions Are Better than One (AAAI 2026)",
-                "Heretic (p-e-w, 2025): Bayesian optimization, LoRA-mediated ablation, winsorization",
-                "OBLITERATUS: Whitened SVD, EGA, CoT-aware, KL co-optimization, float interpolation (novel)",
+                "SOM activation-geometry proxy (separate from the paper TPE/HarmBench preset)",
+                "OBLITERATUS: exact oblique whitened-SVD factors and held-out damage gate",
             ],
             "strong_layers": self._strong_layers,
             "n_harmful_prompts": len(self.harmful_prompts),
@@ -8031,6 +9677,12 @@ class AbliterationPipeline:
             "prompt_split": self._prompt_split.to_metadata(),
             "damage_gate": {
                 "enabled": self.damage_gate_enabled,
+                "assessment_scope": (
+                    "candidate_search_confirmation_only"
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else "single_held_out_evaluation"
+                ),
                 "budget": self.damage_budget.to_dict(),
                 "assessment": (
                     self._damage_assessment.to_dict()
@@ -8038,12 +9690,270 @@ class AbliterationPipeline:
                     else None
                 ),
             },
+            "candidate_search_evidence": {
+                "enabled": bool(
+                    self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                ),
+                "selection_pair_count": (
+                    len(self._auto_selection_harmful)
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "confirmation_pair_count": (
+                    len(self._auto_confirmation_harmful)
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "selection_pair_fingerprint": (
+                    self._fingerprint_prompt_pairs(
+                        self._auto_selection_harmful,
+                        self._auto_selection_harmless,
+                    )
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "confirmation_pair_fingerprint": (
+                    self._fingerprint_prompt_pairs(
+                        self._auto_confirmation_harmful,
+                        self._auto_confirmation_harmless,
+                    )
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "selection_generation_prompt_count": (
+                    len(self._selection_generation_health_prompts)
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "confirmation_generation_prompt_count": (
+                    len(self._confirmation_generation_health_prompts)
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "selection_generation_prompt_fingerprint": (
+                    self._fingerprint_text_sequence(
+                        self._selection_generation_health_prompts
+                    )
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+                "confirmation_generation_prompt_fingerprint": (
+                    self._fingerprint_text_sequence(
+                        self._confirmation_generation_health_prompts
+                    )
+                    if self._requested_projection_target == "auto"
+                    or self.use_kl_optimization
+                    else None
+                ),
+            },
             "runtime_steering_persisted": False,
             "quality_metrics": self._quality_metrics,
-            "kl_contributions": {str(k): v for k, v in self._kl_contributions.items()} if self._kl_contributions else {},
-            "cot_preserved_layers": list(self._cot_preserve_directions.keys()) if self._cot_preserve_directions else [],
+            "kl_preservation": {
+                "enabled": self.use_kl_optimization,
+                "algorithm": (
+                    "som_behavioral_tpe_winner_disjoint_damage_confirmation"
+                    if self.method == "som"
+                    else "exact_bayesian_plan_search_with_disjoint_damage_confirmation"
+                    if self.method in {"optimized", "heretic"}
+                    else "exact_restore_full_edit_replay_with_disjoint_confirmation"
+                    if self.use_kl_optimization else None
+                ),
+                "threshold_metric": (
+                    "sampled_token_kl_upper_ci"
+                    if self.use_kl_optimization
+                    else None
+                ),
+                "budget": self.kl_budget if self.use_kl_optimization else None,
+                "requested_budget": (
+                    self._requested_kl_budget
+                    if self.use_kl_optimization
+                    else None
+                ),
+                "search_steps": (
+                    self.kl_search_steps
+                    if self.use_kl_optimization
+                    and self.method not in {"som", "optimized", "heretic"}
+                    else None
+                ),
+                "requested_regularization": (
+                    self._requested_regularization
+                    if self.method not in {"som", "optimized", "heretic"}
+                    else None
+                ),
+                "selected_regularization": (
+                    self._kl_selected_regularization
+                    if self.method not in {"som", "optimized", "heretic"}
+                    else None
+                ),
+                "selection_pairs": (
+                    len(self._auto_selection_harmless)
+                    if self.use_kl_optimization
+                    else None
+                ),
+                "confirmation_pairs": (
+                    len(self._auto_confirmation_harmless)
+                    if self.use_kl_optimization
+                    else None
+                ),
+                "selection_results": (
+                    self._kl_search_results
+                    if self.use_kl_optimization
+                    and self.method not in {"som", "optimized", "heretic"}
+                    else []
+                ),
+            },
+            "bayesian_projection_search": (
+                self._bayesian_optimization_result.to_metadata()
+                if self._bayesian_optimization_result is not None
+                else {
+                    "algorithm": (
+                        "exact_model_forward_tpe_projection_search"
+                        if self.method in {"optimized", "heretic"}
+                        else None
+                    ),
+                    "completed": False,
+                }
+            ),
+            "gabliteration_search": (
+                self._gabliteration_search_result.to_metadata()
+                if self._gabliteration_search_result is not None
+                else {
+                    "algorithm": (
+                        "paper_source_and_behavioral_layer_search"
+                        if self.method == "gabliteration"
+                        else None
+                    ),
+                    "completed": False,
+                }
+            ),
+            "rdo_training": (
+                self._rdo_result.to_metadata()
+                if self._rdo_result is not None
+                else {
+                    "algorithm": (
+                        "model_forward_ablation_addition_ce_and_retain_kl"
+                        if self.method == "rdo"
+                        else None
+                    ),
+                    "completed": False,
+                }
+            ),
+            "som_paper_search": (
+                {
+                    **self._som_paper_result.to_metadata(),
+                    "source_layer": self._som_source_layer,
+                    "confirmation": self._som_confirmation_evidence,
+                    "completed": True,
+                }
+                if self._som_paper_result is not None
+                else {
+                    "algorithm": (
+                        "paper_4x4_som_ordered_subset_tpe_harmbench"
+                        if self.method == "som"
+                        else None
+                    ),
+                    "source_layer": self._som_source_layer,
+                    "confirmation": self._som_confirmation_evidence,
+                    "completed": False,
+                }
+            ),
+            "cot_preservation": {
+                "enabled": self.cot_aware,
+                "algorithm": (
+                    "explicit_segment_teacher_forced_cross_entropy_gate"
+                    if self.cot_aware
+                    else None
+                ),
+                "reference_source": (
+                    "bundled"
+                    if self.cot_aware and self.cot_preservation_examples is None
+                    else "caller_supplied"
+                    if self.cot_aware
+                    else None
+                ),
+                "example_count": len(self._cot_examples) if self.cot_aware else 0,
+                "example_ids": (
+                    [example.example_id for example in self._cot_examples]
+                    if self.cot_aware
+                    else []
+                ),
+                "reasoning_ce_budget": (
+                    self.cot_reasoning_ce_budget if self.cot_aware else None
+                ),
+                "requested_reasoning_ce_budget": (
+                    self._requested_cot_reasoning_ce_budget
+                    if self.cot_aware
+                    else None
+                ),
+                "answer_ce_budget": (
+                    self.cot_answer_ce_budget if self.cot_aware else None
+                ),
+                "requested_answer_ce_budget": (
+                    self._requested_cot_answer_ce_budget
+                    if self.cot_aware
+                    else None
+                ),
+                "minimum_examples_per_gate": (
+                    self.cot_min_eval_examples if self.cot_aware else None
+                ),
+                "max_length": self.cot_max_length if self.cot_aware else None,
+                "selection_confirmation_split": bool(
+                    self.cot_aware
+                    and (
+                        self.use_kl_optimization
+                        or self._requested_projection_target == "auto"
+                    )
+                ),
+                "reference_text_fingerprints": (
+                    [
+                        self._fingerprint_text_sequence(
+                            (
+                                example.prompt,
+                                example.reference_reasoning,
+                                example.reference_answer,
+                            )
+                        )
+                        for example in self._cot_examples
+                    ]
+                    if self.cot_aware
+                    else []
+                ),
+                "selection_token_signatures": (
+                    list(self._cot_selection_baseline.reference_signatures)
+                    if self._cot_selection_baseline is not None
+                    else []
+                ),
+                "confirmation_token_signatures": (
+                    list(self._cot_confirmation_baseline.reference_signatures)
+                    if self._cot_confirmation_baseline is not None
+                    else []
+                ),
+                "evaluation_token_signatures": (
+                    list(self._cot_baseline.reference_signatures)
+                    if self._cot_baseline is not None
+                    and self._cot_selection_baseline is None
+                    else []
+                ),
+            },
             "float_layer_weights": {str(k): v for k, v in self._float_layer_weights.items()} if self._float_layer_weights else {},
             "lora_adapters_saved": bool(self._lora_adapters),
+            "residual_erasers": {
+                str(layer_idx): {
+                    "method": eraser.method,
+                    "rank": eraser.rank,
+                    "hidden_dim": eraser.hidden_dim,
+                    "affine_center_fitted": eraser.center is not None,
+                }
+                for layer_idx, eraser in self.residual_erasers.items()
+            },
         }
 
     def _cleanup_offload_dir(self):

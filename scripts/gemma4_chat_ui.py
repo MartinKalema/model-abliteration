@@ -93,7 +93,7 @@ def main():
 
     with gr.Blocks(title="Gemma 4 12B OBLITERATUS", theme=gr.themes.Monochrome()) as demo:
         gr.Markdown("# Gemma 4 12B — OBLITERATUS Surgery Candidate\n"
-                     "> `targeted_upper_v1` — SOM manifold, layers 22-46, 0% refusal on 842 corpus")
+                     "> `targeted_upper_v1` — local SOM activation-geometry proxy, layers 22-46; historical local evaluation only, not a paper-fidelity claim")
 
         with gr.Row():
             with gr.Column(scale=4):

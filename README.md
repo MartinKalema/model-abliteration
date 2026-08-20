@@ -39,17 +39,17 @@ short_description: "One-click model liberation + chat playground"
 
 ---
 
-**OBLITERATUS** is the most advanced open-source toolkit for understanding and removing refusal behaviors from large language models — and every single run makes it smarter. It implements abliteration — a family of techniques that identify and surgically remove the internal representations responsible for content refusal, without retraining or fine-tuning. The result: a model that responds to all prompts without artificial gatekeeping, while preserving its core language capabilities.
+**OBLITERATUS** is an open-source toolkit for understanding and modifying refusal behaviors in large language models. It implements abliteration — a family of techniques that identify and project out activation directions associated with content refusal, without retraining or fine-tuning. These edits intentionally damage safety behavior and can also damage unrelated capabilities; checkpoint export is therefore conditioned on a disjoint, fail-closed damage gate. Passing that bounded gate is not a guarantee of general capability preservation.
 
 But OBLITERATUS is more than a tool — **it's a distributed research experiment.** Every time you obliterate a model with telemetry enabled, your run contributes anonymous benchmark data to a growing, crowd-sourced dataset that powers the next generation of abliteration research. Refusal directions across architectures. Hardware-specific performance profiles. Method comparisons at scale no single lab could achieve. **You're not just using a tool — you're co-authoring the science.**
 
-The toolkit provides a complete pipeline: from probing a model's hidden states to locate refusal directions, through multiple extraction strategies (PCA, mean-difference, sparse autoencoder decomposition, and whitened SVD), to the actual intervention — zeroing out or steering away from those directions at inference time. Every step is observable. You can visualize where refusal lives across layers, measure how entangled it is with general capabilities, and quantify the tradeoff between compliance and coherence before committing to any modification.
+The toolkit provides a complete pipeline: from probing a model's hidden states to locate refusal directions, through mean-difference, paired SVD, LEACE, and whitened-SVD extraction, to a permanent checkpoint edit or reversible inference-time steering. Every step is observable. You can visualize where refusal signals appear across layers and measure capability drift before accepting a modification.
 
 OBLITERATUS ships with a full Gradio-based interface on HuggingFace Spaces, so you don't need to write a single line of code to obliterate a model, benchmark it against baselines, or chat with the result side-by-side with the original. For researchers who want deeper control, the Python API exposes every intermediate artifact — activation tensors, direction vectors, cross-layer alignment matrices — so you can build on top of it or integrate it into your own evaluation harness.
 
 We built this because we believe model behavior should be decided by the people who deploy them, not locked in at training time. Refusal mechanisms are blunt instruments — they block legitimate research, creative writing, and red-teaming alongside genuinely harmful content. By making these interventions transparent and reproducible, we hope to advance the community's understanding of how alignment actually works inside transformer architectures, and to give practitioners the tools to make informed decisions about their own models.
 
-Built on published research from [Arditi et al. (2024)](https://arxiv.org/abs/2406.11717), [Gabliteration (arXiv:2512.18901)](https://arxiv.org/abs/2512.18901), [grimjim's norm-preserving biprojection (2025)](https://huggingface.co/grimjim), [Turner et al. (2023)](https://arxiv.org/abs/2308.10248), and [Rimsky et al. (2024)](https://arxiv.org/abs/2312.06681), OBLITERATUS implements precision liberation in a single command:
+OBLITERATUS draws on published research from [Arditi et al. (2024)](https://arxiv.org/abs/2406.11717), [Gabliteration (arXiv:2512.18901)](https://arxiv.org/abs/2512.18901), [LEACE](https://arxiv.org/abs/2306.03819), [grimjim's norm-preserving work (2025)](https://huggingface.co/grimjim), [Turner et al. (2023)](https://arxiv.org/abs/2308.10248), and [Rimsky et al. (2024)](https://arxiv.org/abs/2312.06681). A citation indicates research lineage, not automatic result parity; the fidelity table below states the implementation boundary of each named preset.
 
 ```bash
 obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct --method advanced
@@ -97,14 +97,14 @@ OBLITERATUS does four things — and the community does the fifth (see [Communit
 SUMMON  →  load model + tokenizer
 PROBE   →  collect activations on restricted vs. unrestricted prompts
 DISTILL →  extract refusal directions via SVD
-EXCISE  →  surgically project out guardrail directions (norm-preserving)
-VERIFY  →  perplexity + coherence checks — confirm capabilities are intact
+EXCISE  →  project out selected directions (optional per-logical-row norm restoration)
+VERIFY  →  held-out locality, KL, reasoning, coherence, and efficacy gates
 REBIRTH →  save the liberated model with full metadata
 ```
 
 **3. Understand the geometry of the chains** — 15 deep analysis modules go far beyond brute-force removal. They map the precise geometric structure of the guardrails: how many distinct refusal mechanisms exist, which layers enforce them, whether they're universal or model-specific, and how they'll try to self-repair after removal. Know your enemy; precision preserves capability. See [Analysis modules](#15-analysis-modules) below.
 
-**4. Let the analysis guide the liberation** — The `informed` method closes the loop: analysis modules run *during* obliteration to auto-configure every decision. Which chains to target. How many directions to extract. Which layers are safe to modify vs. which are too entangled with capabilities. Whether the model will self-repair (the Ouroboros effect) and how many passes to compensate. Surgical precision — free the mind, keep the brain. See [Analysis-informed pipeline](#analysis-informed-pipeline) below.
+**4. Let validated analysis guide the edit** — The `informed` method runs selected analysis modules *during* obliteration. Cluster and robustness measurements may configure the deterministic edit; labeled-category direction dispersion is descriptive only and never selects or enriches the edited subspace. See [Analysis-informed pipeline](#analysis-informed-pipeline) below.
 
 ## What makes OBLITERATUS unique
 
@@ -112,32 +112,73 @@ Several capabilities distinguish OBLITERATUS from existing public tools:
 
 | Capability | What it does | Why it matters |
 |---|---|---|
-| **Concept Cone Geometry** | Maps per-category guardrail directions with solid angle estimation | Reveals whether "refusal" is one mechanism or many — so you choose the right approach |
+| **Category Direction Dispersion** | Reports signed angles, angular dispersion, and squared-SVD effective rank for explicitly labeled prompt categories | Descriptive only; reports carry `causally_validated=False` and never choose checkpoint edits |
 | **Alignment Imprint Detection** | Fingerprints DPO vs RLHF vs CAI vs SFT from subspace geometry alone | Identifies the alignment training method to inform the optimal removal strategy |
 | **Cross-Model Universality Index** | Measures whether guardrail directions generalize across models | Answers "can one set of directions work across models, or does each need its own?" |
 | **Defense Robustness Evaluation** | Ouroboros effect quantification, safety-capability entanglement mapping | Predicts whether guardrails will self-repair after removal |
-| **Whitened SVD Extraction** | Covariance-normalized direction extraction | Separates the guardrail signal from natural activation variance — cleaner extraction |
+| **Exact Linear Erasers** | Fits LEACE and whitened-SVD oblique maps as `P = I - LR` | Avoids replacing a two-sided eraser with an inequivalent Euclidean `ddᵀ` projection |
 | **Bias Term Projection** | Removes guardrails from bias vectors, not just weights | Other tools miss refusal signal in biases — leaves refusal pathways partially active |
 | **True Iterative Refinement** | Re-probes after each pass to catch rotated residual guardrails | Single-pass methods miss directions that rotate into adjacent subspaces |
 | **Analysis-Informed Pipeline** | Analysis modules auto-configure obliteration strategy mid-pipeline | Closes the analysis-to-removal feedback loop automatically |
 
-## Novel techniques (2025-2026)
+## Implemented techniques and diagnostic building blocks
 
 OBLITERATUS implements several techniques that go beyond prior work:
 
 | Technique | Description | Reference |
 |-----------|-------------|-----------|
 | **Expert-Granular Abliteration (EGA)** | Decomposes refusal signals into per-expert components using router logits for MoE-aware surgery | Novel |
-| **CoT-Aware Ablation** | Orthogonalizes refusal directions against reasoning-critical directions to preserve chain-of-thought | Novel |
-| **COSMIC Layer Selection** | Selects layers where harmful/harmless representations have lowest cosine similarity (most separable) | [arXiv:2506.00085](https://arxiv.org/abs/2506.00085), ACL 2025 |
-| **Parametric Kernel Optimization** | Bell-curve layer weighting with 7 global parameters via Optuna TPE search | Heretic-inspired |
-| **Refusal Direction Optimization (RDO)** | Gradient-based refinement of SVD-extracted directions using a linear refusal probe | Wollschlager et al., ICML 2025 |
+| **COSMIC Evaluation-Layer Diagnostic** | Computes the bottom-cosine evaluation layers without treating them as edit layers | Preliminary component only; no COSMIC candidate-intervention loop |
+| **Gabliteration Behavioral Search** | Selects a source layer by mean separation, averages five shuffled-pair SVD projectors, runs isolated one-layer behavioral trials, and exactly replays the selected intervention | Runnable named preset with transactional rollback and hash-bound replay |
+| **Model-Forward RDO Training** | Optimizes a unit direction through differentiable ablation/addition forwards with response CE and retain KL, then selects a held-out snapshot | RDO direction algorithm; checkpoint projection is an explicit persistent adaptation |
+| **Paper SOM Behavioral Search** | Trains a 4×4 hexagonal SOM and searches ordered direction subsets through actual temporary checkpoint interventions and a HarmBench judge | Runnable high-cost paper pipeline; dataset parity requires upstream splits |
+| **Exact Dense TPE Replay** | Searches complete Optimized/Heretic-style direction-and-kernel plans, restores from an immutable snapshot, and hash-verifies the winner | Dense checkpoint implementation; not Heretic LoRA/upstream parity |
+| **KL-Constrained Candidate Search** | Restores the untouched snapshot, applies complete regularization candidates, measures baseline-to-candidate token KL, then exactly replays the lowest-KL candidate that passes efficacy on a disjoint confirmation set | Independent implementation; not the removed magnitude proxy and not a Heretic reproduction |
+| **Explicit CoT Preservation Gate** | Canonically tokenizes separately labeled prompt/reasoning/final-answer references, scores the reasoning and answer spans before and after editing, and rejects excessive CE increases | Uses explicit references, never a harmless-activation principal component |
 | **Float Direction Interpolation** | Continuous SVD direction index via Gaussian-shaped weighting for smoother refusal removal | Novel |
-| **KL-Divergence Co-Optimization** | Post-projection feedback loop that partially reverts over-projected layers if KL budget exceeded | Novel |
 | **Component-Specific Scaling** | Separate attention vs MLP projection strengths (MLP layers are more sensitive) | Novel |
 | **LoRA-Based Reversible Ablation** | Rank-1 LoRA adapters instead of permanent weight surgery, enabling reversible ablation | Novel |
 | **Activation Winsorization** | Clamps activation vectors to percentile range before SVD to prevent outlier-dominated directions | Heretic-inspired |
 | **Multi-Direction Norm Preservation** | Captures all weight norms once before projection and restores after all directions, avoiding reintroduction | Novel |
+
+### Research-method fidelity and availability
+
+The named presets below are runnable and replay the complete scored checkpoint intervention. “Runnable” does not mean that a local run reproduces a paper's published numbers: model revisions, prompts, datasets, judge versions, and evidence splits still have to match.
+
+| Name | Checkpoint preset | Current status and boundary |
+|---|---|---|
+| `gabliteration` | Available | Source-layer mean-separation search, five shuffled-pair SVD projector estimates, actual one-layer behavioral trials, full rollback between trials, and hash-verified final replay. Published-result parity still requires the corresponding model and evaluation evidence. |
+| `rdo` | Available with an explicit adaptation | Optimizes one unit direction through real differentiable all-layer ablation and one-layer addition forwards, generated response-token CE targets, sequence retain KL, and held-out snapshot selection. The saved checkpoint projects the trained direction from output writers; that persistent projection is an OBLITERATUS adaptation of the paper's runtime hooks, not runtime-hook equivalence. |
+| `som` | Available, high-cost | Trains the paper's 4×4 hexagonal SOM for 10,000 updates and runs an ordered-without-replacement Optuna TPE search over temporary checkpoint interventions. The default five-direction search uses 512 trials and a `cais/HarmBench-Llama-2-13b-cls` judge. It requires Optuna, a full CPU rollback snapshot, and enough memory for the 13B judge; dataset/result parity requires caller-supplied upstream splits. |
+| `optimized` | Available | Runs deterministic model-forward TPE over per-layer SVD-component interpolation and separate attention/FFN kernels. Every candidate starts from the immutable CPU snapshot; the winning tensor plan is hash-checked on exact replay and then evaluated on disjoint confirmation evidence. This is an OBLITERATUS exact-replay optimizer, not a claim of Heretic parity. |
+| `heretic` | Available as a dense checkpoint baseline | Searches a continuous cross-layer difference-in-means direction with separate piecewise-linear attention/FFN kernels, then hash-checks exact dense-checkpoint replay on disjoint confirmation data. It does not implement Heretic's optional LoRA path and does not claim upstream result parity. |
+| `use_kl_optimization=True` | Available on the base checkpoint pipeline | Searches complete edits against real baseline-relative sampled-token KL, restores between trials, and confirms the exact winner on duplicate-disjoint held-out data |
+| `cot_aware=True` | Available on the base checkpoint pipeline | Adds a fail-closed teacher-forced gate over explicit reasoning and answer spans; bundled harmless references can be replaced with caller-supplied examples |
+| COSMIC | Diagnostic only | Bottom-cosine layers are evaluation layers only; no preset claims the paper's intervention search |
+| LEACE / whitened SVD | Available through the Python configuration | Both retain their exact oblique factors; static checkpoint projection applies the linear map, while a fitted affine center requires runtime activation application |
+
+The old implementations were removed for correctness, not merely relabeled.
+The KL code ranked layers by projection magnitude, compared absolute
+perplexity instead of untouched-versus-edited distributions, and could append
+an unscored weight mutation after verification. The old CoT code never observed
+a reasoning trace; it treated harmless-prompt PC1 as a reasoning direction.
+Those algorithms are gone. The same public flags now invoke measured
+replacements: exact restore/apply/score/replay under real KL and a canonical,
+explicit reasoning/answer CE gate.
+
+The preservation search requires a dense FP16/BF16/FP32 model, a complete CPU
+snapshot (roughly one additional model-size of RAM), and at least 96 unique
+prompt pairs: 32 for discovery plus 32 selection and 32 confirmation pairs. It is intentionally incompatible with nested automatic
+target search, quantization, LoRA edits, and direction-changing iterative
+refinement or refusal inversion because those combinations cannot yet be replayed
+or meaningfully searched by the regularization grid. Existing stricter damage
+budgets are never relaxed by enabling preservation.
+
+The named behavioral/search presets are intentionally expensive. `gabliteration`,
+`optimized`, `heretic`, and `som` require a complete dense CPU snapshot for exact rollback;
+`som` additionally requires Optuna, 10,000 SOM updates, 512 TPE trials at its
+default five-direction subset size, and a HarmBench-compatible 13B classifier.
+Plan memory and runtime before selecting them.
 
 ## Ways to use OBLITERATUS
 
@@ -198,6 +239,10 @@ obliteratus interactive
 # Direct obliteration — one command, one model, done
 obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct --method advanced
 
+# Exact KL-constrained search plus explicit reasoning preservation
+obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct --method advanced \
+    --kl-preservation --kl-budget 0.05 --cot-preservation
+
 # With all options
 obliteratus obliterate meta-llama/Llama-3.1-8B-Instruct \
     --method surgical \
@@ -240,6 +285,17 @@ pipeline = AbliterationPipeline(
     max_seq_length=512,  # optional: override tokenizer truncation length
 )
 result = pipeline.run()
+
+# Optional measured preservation. Pass cot_preservation_examples=[...] to
+# replace the bundled harmless reasoning references.
+preserved = AbliterationPipeline(
+    model_name="meta-llama/Llama-3.1-8B-Instruct",
+    method="advanced",
+    use_kl_optimization=True,
+    kl_budget=0.05,
+    cot_aware=True,
+)
+preserved_result = preserved.run()
 
 # Access intermediate artifacts
 directions = pipeline.refusal_directions    # {layer_idx: tensor}
@@ -307,17 +363,25 @@ OBLITERATUS supports both permanent and reversible liberation:
 
 ### Weight projection (permanent)
 
-Seven presets, escalating in thoroughness:
+Available checkpoint-producing presets:
 
 | Method | Directions | Key Features | Best for |
 |--------|-----------|-------------|----------|
 | `basic` | 1 (diff-in-means) | Fast baseline | Quick test, small models |
-| `advanced` | 4 (SVD) | Norm-preserving, bias projection, 2 passes | **Default.** Clean removal, minimal capability loss |
-| `aggressive` | 8 (SVD) | Whitened SVD, iterative refinement, 3 passes | Maximum guardrail removal |
+| `advanced` | 4 (SVD) | Per-logical-row norm restoration, bias projection, 2 passes | **Default.** Measured multi-direction candidate |
+| `aggressive` | 8 (SVD) | Paired SVD, jailbreak contrast, iterative refinement, 3 passes | Strong multi-direction edit |
+| `spectral_cascade` | 6 (SVD) | Layer-axis spectral bands and iterative refinement | Frequency-decomposed edit |
+| `informed` | 1 (diff-in-means) | Deterministic analysis-guided layer and strength configuration | Analysis-guided candidate |
 | `surgical` | 8 (SVD) | EGA, head surgery, SAE, layer-adaptive, MoE-aware | Precision MoE models |
-| `optimized` | 4 (SVD) | Bayesian auto-tuned, CoT-aware, KL co-optimized | Best quality with auto-tuning |
 | `inverted` | 8 (SVD) | Semantic refusal inversion (2x reflection) | Refusal inversion experiments |
-| `nuclear` | 8 (SVD) | All techniques + expert transplant + steering | Maximum force |
+| `nuclear` | 4 (SVD) | Tempered reflection, SAE/head edits, and conservative expert transplant; runtime steering stays off | Maximum-force persistent checkpoint |
+| `failspy` | 1 (diff-in-means) | All-except-first writer projection baseline | Community-baseline comparison |
+| `gabliteration` | 2 (shuffled-pair SVD) | Source-layer behavioral search, adaptive paper scales, transactional exact replay | Gabliteration-style paper baseline |
+| `rdo` | 1 (model-forward trained) | Differentiable CE/KL direction training followed by output-writer checkpoint projection | RDO direction research with an explicit persistent-edit adaptation |
+| `som` | 5 (SOM candidates) | 4×4 hex SOM, ordered Optuna TPE, HarmBench judge, exact replay | High-compute paper SOM experiments |
+| `optimized` | 4 (SVD interpolation) | Model-forward TPE with exact tensor-plan replay and confirmation | OBLITERATUS automatic dense-checkpoint tuning |
+| `heretic` | 1 (cross-layer interpolation) | Heretic-style attention/FFN kernels with exact dense replay; no LoRA parity claim | Dense Heretic-style baseline |
+| `som_proxy` | 3 | Local activation-geometry SOM ranking; no TPE/HarmBench claim | Compute-bounded heuristic |
 
 ### Steering vectors (reversible, inference-time)
 
@@ -356,7 +420,7 @@ The research core of OBLITERATUS. Each module maps a different aspect of how the
 | **Whitened SVD** | What are the principal refusal directions after whitening? | Novel |
 | **Activation Probing** | How much refusal signal exists at each layer? | Arditi et al. (2024) |
 | **Defense Robustness** | Will the guardrails try to self-repair? (Ouroboros effect) | Novel |
-| **Concept Cone Geometry** | Is there one mechanism or many? Do different categories share guardrails? | Wollschlager et al. (2025) |
+| **Category Direction Dispersion** | How do explicitly labeled category mean-difference directions relate geometrically? | Descriptive analysis; not causal cone fitting |
 | **Alignment Imprint Detection** | Was this model trained with DPO, RLHF, CAI, or SFT? | Novel |
 | **Multi-Token Position** | Where in the sequence does refusal signal concentrate? | Novel |
 | **Sparse Surgery** | Which specific weight rows carry the most refusal? | Novel |
@@ -401,12 +465,12 @@ VERIFY  →  confirm removal + Ouroboros compensation if refusal resurfaces  ←
 REBIRTH →  save with comprehensive analysis metadata
 ```
 
-The ANALYZE stage runs 4 analysis modules and their outputs auto-configure everything downstream:
+The ANALYZE stage runs selected modules. Only operationally validated signals configure edits; category dispersion remains report-only:
 
 | Analysis Module | What it detects | What it configures |
 |---|---|---|
 | **Alignment Imprint** | DPO vs RLHF vs CAI vs SFT | Regularization strength, projection aggressiveness |
-| **Concept Cone Geometry** | Polyhedral vs linear refusal | Number of directions (1 for linear, up to 8 for polyhedral) |
+| **Category Direction Dispersion** | Signed angles and effective rank across explicit labels | Report metadata only; never changes directions or layers |
 | **Cross-Layer Alignment** | Direction clusters, persistence | Layer selection (cluster-aware instead of arbitrary top-k) |
 | **Defense Robustness** | Self-repair risk, entanglement | Refinement passes, entanglement-gated layer skipping |
 
@@ -656,17 +720,17 @@ obliteratus run examples/preset_quick.yaml
 
 | Capability | OBLITERATUS | TransformerLens | Heretic | FailSpy abliterator | RepEng | SAELens |
 |---|---|---|---|---|---|---|
-| Refusal direction extraction | Diff-in-means + SVD + Whitened SVD | Manual via hooks | Diff-in-means | Diff-in-means | Diff-in-means | N/A |
-| Weight projection methods | Basic + norm-preserving + regularized + bias | N/A | Bayesian-optimized kernel | Basic | N/A | N/A |
+| Refusal direction extraction | Diff-in-means + paired SVD + exact-factor LEACE/whitened SVD | Manual via hooks | Diff-in-means | Diff-in-means | Diff-in-means | N/A |
+| Weight projection methods | Manifest-targeted, regularized, bias-aware, exact oblique linear maps, per-logical-row norm option | N/A | Bayesian-optimized kernel | Basic | N/A | N/A |
 | Steering vectors | Yes (factory + hook manager) | N/A | N/A | N/A | Core feature | N/A |
-| Concept geometry analysis | Yes (cones, solid angles, DSI) | N/A | N/A | N/A | N/A | N/A |
+| Category geometry analysis | Descriptive signed angles/dispersion; not causally validated | N/A | N/A | N/A | N/A | N/A |
 | Alignment method fingerprinting | Yes (DPO/RLHF/CAI/SFT) | N/A | N/A | N/A | N/A | N/A |
 | Cross-model transfer analysis | Yes (Universality Index) | N/A | N/A | N/A | N/A | N/A |
 | Defense robustness evaluation | Yes (Ouroboros effect) | N/A | N/A | N/A | N/A | N/A |
 | Sparse autoencoders | N/A | Via SAELens | N/A | N/A | N/A | Core feature |
 | Real causal tracing | Simulation-based | Real activation patching | N/A | N/A | N/A | N/A |
 | Analysis-informed abliteration | Yes (closed-loop feedback) | N/A | N/A | N/A | N/A | N/A |
-| Auto parameter optimization | Analysis-guided | N/A | Bayesian (Optuna) | N/A | N/A | N/A |
+| Auto parameter optimization | Exact model-forward TPE with hash-verified dense-checkpoint replay | N/A | Bayesian (Optuna) | N/A | N/A | N/A |
 | Model compatibility | Any HuggingFace model | ~50 architectures | 16/16 tested | TransformerLens only | HuggingFace | TransformerLens |
 | Test suite | 1,000+ tests | Community | Unknown | None | Minimal | Moderate |
 

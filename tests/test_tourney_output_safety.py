@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from obliteratus.abliterate import UNAVAILABLE_METHODS
 from obliteratus.tourney import (
     TOURNEY_OWNER_FILENAME,
     TOURNEY_RUN_SUBDIR,
@@ -152,3 +153,43 @@ def test_candidate_method_cannot_escape_run_directory(tmp_path):
 
     with pytest.raises(TourneyOutputSafetyError, match="safe directory component"):
         runner._candidate_dir(1, "../../outside")
+
+
+@pytest.mark.parametrize("method", sorted(UNAVAILABLE_METHODS))
+def test_unavailable_method_is_rejected_before_output_creation(tmp_path, method):
+    requested = tmp_path / "tourney"
+
+    with pytest.raises(ValueError, match="unavailable"):
+        TourneyRunner(
+            "base/model",
+            methods=[method],
+            output_dir=str(requested),
+        )
+
+    assert not requested.exists()
+
+
+def test_unknown_method_is_rejected_before_output_creation(tmp_path):
+    requested = tmp_path / "tourney"
+
+    with pytest.raises(ValueError, match="not a runnable preset"):
+        TourneyRunner(
+            "base/model",
+            methods=["not-a-method"],
+            output_dir=str(requested),
+        )
+
+    assert not requested.exists()
+
+
+def test_string_method_input_is_rejected_before_output_creation(tmp_path):
+    requested = tmp_path / "tourney"
+
+    with pytest.raises(TypeError, match="provided as a list"):
+        TourneyRunner(
+            "base/model",
+            methods="advanced",
+            output_dir=str(requested),
+        )
+
+    assert not requested.exists()

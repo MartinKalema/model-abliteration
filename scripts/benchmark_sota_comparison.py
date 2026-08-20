@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""OBLITERATUS vs SOTA — Head-to-Head Benchmark Comparison.
+"""Exploratory OBLITERATUS method comparison.
 
-Runs faithful reproductions of competing abliteration methods against
-OBLITERATUS variants on any specified model, producing publication-ready
-comparison tables with standardized community metrics.
+Runs only checkpoint-producing methods whose interventions are available.
+Paper-named Gabliteration, RDO, SOM, Heretic, and optimized presets are not
+included because OBLITERATUS cannot yet replay their complete scored edits.
+The resulting proxy metrics are exploratory, not paper-result reproductions.
 
-Baselines included:
+Baseline included:
   1. FailSpy/abliterator (2024) — Community workhorse baseline
-  2. Gabliteration (Gülmez 2026) — SVD multi-direction + ridge regularization
-  3. Heretic / p-e-w (2025) — Bayesian TPE auto-tuning (current SOTA for quality)
-  4. Wollschlager RDO (ICML 2025) — Gradient-based direction optimization
 
 OBLITERATUS variants:
-  5. OBLITERATUS surgical — Full SOTA MoE-aware pipeline
-  6. OBLITERATUS informed — Analysis-guided auto-configuration
-  7. OBLITERATUS optimized — Bayesian + whitened SVD + SAE (max OBLITERATUS)
+  2. OBLITERATUS surgical — MoE-aware pipeline
+  3. OBLITERATUS informed — Deterministic analysis-guided configuration
 
 Evaluation protocol (Heretic community standard):
   - Refusal rate via substring + prefix detection
@@ -29,13 +26,13 @@ Usage:
     # Full comparison on 8B model
     python scripts/benchmark_sota_comparison.py --model meta-llama/Llama-3.1-8B-Instruct
 
-    # Specific baselines only
-    python scripts/benchmark_sota_comparison.py --methods failspy heretic surgical
+    # Specific methods only
+    python scripts/benchmark_sota_comparison.py --methods failspy surgical
 
     # Custom prompt count and output
     python scripts/benchmark_sota_comparison.py --prompts 100 --output results.json
 
-    # Include full Heretic evaluation protocol (HarmBench, lm-eval)
+    # Include additional HarmBench/lm-eval-style evaluation
     python scripts/benchmark_sota_comparison.py --full-eval
 """
 
@@ -64,23 +61,27 @@ from obliteratus.abliterate import (  # noqa: E402
     METHODS,
     HARMFUL_PROMPTS,
     HARMLESS_PROMPTS,
+    available_method_names,
 )
 from obliteratus.evaluation.benchmarks import BenchmarkRunner  # noqa: E402
 
 
 # ── All methods available for comparison ──────────────────────────────
 
-# Baselines (reproductions of competing methods)
-BASELINE_METHODS = ["failspy", "gabliteration", "heretic", "rdo"]
+# Keep the default comparison small enough for routine smoke runs.  The
+# model-forward Gabliteration/RDO/SOM/Optimized/Heretic presets are runnable,
+# but each owns a substantially heavier search or training protocol and is
+# therefore opt-in rather than part of this short default benchmark.
+BASELINE_METHODS = ["failspy"]
 
 # OBLITERATUS variants
-OBLITERATUS_METHODS = ["surgical", "informed", "optimized"]
+OBLITERATUS_METHODS = ["surgical", "informed"]
 
 # Default comparison set
 DEFAULT_METHODS = BASELINE_METHODS + OBLITERATUS_METHODS
 
-# Quick mode: skip slow methods (Bayesian optimization)
-QUICK_METHODS = ["failspy", "gabliteration", "rdo", "surgical"]
+# Quick mode
+QUICK_METHODS = ["failspy", "surgical"]
 
 
 @dataclass
@@ -132,11 +133,11 @@ def parse_args():
     )
     parser.add_argument(
         "--quick", action="store_true",
-        help="Quick mode: fewer prompts, skip slow methods (Bayesian opt)",
+        help="Quick mode: fewer prompts and the smallest comparison set",
     )
     parser.add_argument(
         "--full-eval", action="store_true",
-        help="Run full Heretic evaluation protocol (HarmBench ASR, lm-eval)",
+        help="Run additional HarmBench/lm-eval-style evaluation",
     )
     parser.add_argument(
         "--quantization", default=None, choices=["4bit", "8bit"],
@@ -494,7 +495,7 @@ def main():
     methods = args.methods or (QUICK_METHODS if args.quick else DEFAULT_METHODS)
 
     # Validate methods
-    valid_methods = set(METHODS.keys()) | {"informed"}
+    valid_methods = set(available_method_names())
     for m in methods:
         if m not in valid_methods:
             print(f"Error: unknown method '{m}'. Available: {sorted(valid_methods)}")

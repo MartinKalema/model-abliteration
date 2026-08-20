@@ -154,13 +154,6 @@ def test_passing_assessment_allows_rebirth_guard(tmp_path):
     pipeline._require_damage_gate_passed()
 
 
-def test_invalid_legacy_kl_correction_cannot_be_called(tmp_path):
-    pipeline = _pipeline(tmp_path)
-
-    with pytest.raises(RuntimeError, match="legacy KL correction is disabled"):
-        pipeline._kl_optimize_corrections(torch.nn.ModuleList(), 0)
-
-
 def test_iterative_verify_cannot_reuse_stale_passing_metrics(tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.handle = ModelHandle(

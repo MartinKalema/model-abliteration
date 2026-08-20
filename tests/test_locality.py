@@ -97,7 +97,7 @@ def test_two_phase_capture_retains_only_compact_cpu_baseline_artifacts():
     assert not hasattr(baseline, "logits")
     assert [prompt.sampled_logits.shape for prompt in baseline.prompts] == [(2, 4), (2, 4)]
     assert all(prompt.sampled_logits.device.type == "cpu" for prompt in baseline.prompts)
-    assert all(prompt.sampled_logits.dtype == torch.float16 for prompt in baseline.prompts)
+    assert all(prompt.sampled_logits.dtype == torch.float32 for prompt in baseline.prompts)
     assert baseline.prompts[0].sampled_positions[-1] == 3
     assert baseline.prompts[1].sampled_positions[-1] == 4
     json.dumps(baseline.metadata_dict(), allow_nan=False)

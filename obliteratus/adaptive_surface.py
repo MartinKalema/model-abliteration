@@ -48,7 +48,7 @@ def _choice(*choices: str) -> Callable[[Any], bool]:
 # output, prompt, callback, checkpoint, or acceptance-policy arguments.
 _ADAPTIVE_OVERRIDE_VALIDATORS: dict[str, Callable[[Any], bool]] = {
     "n_directions": _integer(1, 64),
-    "direction_method": _choice("diff_means", "svd", "leace", "som"),
+    "direction_method": _choice("diff_means", "svd", "leace", "som_proxy"),
     "norm_preserve": _bool,
     "regularization": _number(0.0, 1.0),
     "refinement_passes": _integer(1, 16),
@@ -81,7 +81,7 @@ _ADAPTIVE_OVERRIDE_VALIDATORS: dict[str, Callable[[Any], bool]] = {
     "float_layer_interpolation": _bool,
     "cot_aware": _bool,
     "layer_selection": _choice(
-        "knee_cosmic", "all", "all_except_first", "middle60", "top_k", "knee"
+        "all", "all_except_first", "middle60", "top_k", "knee"
     ),
     "min_layer_fraction": _number(0.0, 1.0),
     "max_layer_fraction": _number(0.0, 1.0),

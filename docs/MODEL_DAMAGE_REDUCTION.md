@@ -1,6 +1,6 @@
 # Model-damage policy for OBLITERATUS
 
-**Updated:** 2026-08-15
+**Updated:** 2026-08-20
 **Goal:** maximize held-out refusal removal subject to hard, predeclared limits on damage to normal model behavior.
 
 ## The short version
@@ -183,10 +183,10 @@ snapshot and evaluated once on a separate 32-pair confirmation set. Failure on
 that set is terminal; the code does not try a runner-up after learning the
 confirmation result.
 
-The target/locality selection and confirmation sets are disjoint. The small,
-fixed benign-generation probe bank is intentionally reused as an invariant
-smoke check; it is not an untouched capability benchmark and must not be
-treated as one.
+The target/locality and benign-generation selection and confirmation sets are
+disjoint. The generation probes remain small smoke tests rather than broad
+capability benchmarks, but a confirmation probe is not reused while choosing
+the candidate.
 
 This mode requires 64 distinct held-out pairs (32 selection and 32
 confirmation), an unquantized FP16/BF16/FP32 model, and roughly one extra
@@ -211,10 +211,38 @@ that cannot meet its memory/evidence requirements.
 - The old “KL correction” is disabled. It used projection magnitude and
   absolute perplexity rather than actual baseline-versus-candidate KL, and its
   approximate add-back could create new damage.
-- The former Bayesian `optimized`/`heretic` path is explicitly unavailable and
-  fails before editing weights: it measured separate attention/MLP kernels but
-  replayed an averaged, different edit. Informed mode continues through its
-  deterministic analysis-guided path with Bayesian tuning off.
+- Its replacement is opt-in exact candidate search: every regularization trial
+  starts from the untouched CPU snapshot, applies the full edit, and must pass
+  measured sampled-token KL plus the ordinary damage/efficacy gate. The winner
+  is restored and replayed once on separate confirmation prompts. Optional CoT
+  preservation separately gates explicit reasoning and answer spans using
+  candidate-minus-baseline teacher-forced cross-entropy.
+- The replacement `optimized`/`heretic` search materializes the complete
+  direction and separate attention/FFN kernel for each model-forward trial.
+  Every trial starts from the immutable full-model CPU snapshot. The selected
+  dense tensor plan is hash-bound, restored, replayed exactly, and evaluated
+  once on disjoint confirmation evidence. This fixes the former averaged-plan
+  replay defect; it does not implement Heretic's optional LoRA path or establish
+  upstream result parity.
+- The named `gabliteration` path performs source-layer selection, five
+  shuffled-pair SVD projector estimates, and actual isolated one-layer
+  generation trials. Blank or degenerate outputs fail behavioral efficacy.
+  Every trial rolls back to byte-equivalent state, and the selected paper-scale
+  intervention is hash-verified on final replay.
+- The named `rdo` path freezes model parameters and trains only a unit direction
+  through differentiable all-layer ablation and one-layer addition forwards.
+  Generated harmful/harmless response-token CE targets and sequence retain KL
+  are scored on disjoint train/validation prompts before a late snapshot is
+  selected. Persisting that direction as an output-writer projection is an
+  explicit OBLITERATUS adaptation of the paper's runtime hooks and still passes
+  the ordinary checkpoint damage gate.
+- The named paper `som` path trains a 4x4 hexagonal map for 10,000 updates and
+  scores ordered direction subsets through actual temporary checkpoint edits,
+  an Optuna TPE search, and a HarmBench-compatible binary judge. Selection and
+  one-shot confirmation evidence are separated, and the winner is hash-bound
+  before replay. The default five-direction search takes 512 trials, needs a
+  full CPU snapshot, and loads the 13B HarmBench classifier; the inexpensive
+  `som_proxy` preset remains a separate non-paper heuristic.
 - Every Informed/Ouroboros persistent pass is checked separately. A failed pass
   is not followed by another edit or saved.
 - Iterative verification clears old metrics, so a failed measurement cannot
@@ -266,8 +294,17 @@ paraphrase clustering also remains future work. Refusal detection is heuristic
 and should be replaced or supplemented with a task-specific evaluator.
 
 Projection-target auto-search has a clean selection/confirmation boundary for
-its target and locality evidence; its fixed benign generation probes are
-shared smoke tests.
+its target, locality, and benign-generation evidence. The generation probes
+are still deliberately small smoke tests, not broad capability certification.
+The same qualification applies to the named search methods. Hash-verified
+replay proves that the selected checkpoint tensors match the scored plan; it
+does not prove broad capability preservation or reproduce a paper's published
+result. Gabliteration and SOM behavioral outcomes depend on the supplied model,
+prompts, judge, and evidence splits. Paper SOM dataset parity specifically
+requires the caller to supply the corresponding upstream train, validation,
+and test splits. RDO checkpoint projection is a persistent adaptation of its
+runtime intervention, and the dense `heretic` path is neither its optional LoRA
+mode nor a claim of upstream parity.
 The higher-level multi-method Auto, Tournament, and adaptive Informed loops
 still reuse their locked gate evidence while choosing iterations or methods;
 their results should therefore be treated as search results until the selected

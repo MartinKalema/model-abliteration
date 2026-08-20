@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from obliteratus.abliterate import UNAVAILABLE_METHODS, available_method_names
 from obliteratus.cli import _cmd_self_improve, _damage_pipeline_kwargs, main
 
 # ---------------------------------------------------------------------------
@@ -64,11 +65,7 @@ class TestCLIDispatch:
     # 4. obliterate --method accepts valid methods
     def test_obliterate_valid_methods(self):
         """Test that --method accepts every CLI-advertised pipeline method."""
-        valid_methods = [
-            "basic", "advanced", "aggressive", "spectral_cascade",
-            "informed", "surgical", "optimized", "som", "inverted", "nuclear",
-        ]
-        for method in valid_methods:
+        for method in available_method_names():
             # Patch the actual pipeline execution so nothing runs
             with patch("obliteratus.cli._cmd_abliterate") as mock_cmd:
                 main(["obliterate", "fake/model", "--method", method])
@@ -85,18 +82,33 @@ class TestCLIDispatch:
         )
         assert "invalid choice" in stderr_text.lower()
 
-    def test_self_improve_som_keeps_preset_direction_method(self):
-        """An omitted low-level override must not replace the SOM preset."""
+    @pytest.mark.parametrize("method", sorted(UNAVAILABLE_METHODS))
+    def test_tourney_rejects_unavailable_method(self, method):
+        """Tournament overrides fail at argument parsing, before runner setup."""
+        stderr_text = _capture_exit(
+            ["tourney", "fake/model", "--methods", method],
+            expect_code=2,
+        )
+        assert "invalid choice" in stderr_text.lower()
+
+    def test_tourney_accepts_available_method_override(self):
+        with patch("obliteratus.cli._cmd_tourney") as mock_cmd:
+            main(["tourney", "fake/model", "--methods", "som_proxy"])
+
+        assert mock_cmd.call_args.args[0].methods == ["som_proxy"]
+
+    def test_self_improve_som_proxy_keeps_preset_direction_method(self):
+        """An omitted low-level override must not replace the SOM proxy preset."""
         with patch("obliteratus.cli._cmd_self_improve") as mock_cmd:
             main([
                 "self-improve",
                 "fake/model",
                 "--audit", "audit.json",
                 "--output-dir", "candidate",
-                "--method", "som",
+                "--method", "som_proxy",
             ])
         args_passed = mock_cmd.call_args[0][0]
-        assert args_passed.method == "som"
+        assert args_passed.method == "som_proxy"
         assert args_passed.direction_method is None
 
     @pytest.mark.parametrize("command", ["obliterate", "self-improve"])
@@ -241,6 +253,42 @@ class TestCLIDispatch:
             "damage_budget"
         ].efficacy.max_refusal_rate == pytest.approx(0.08)
 
+    @pytest.mark.parametrize("method", ["som", "optimized", "heretic"])
+    def test_named_search_presets_keep_preset_owned_orchestration(self, method):
+        """An omitted generic KL flag must not turn off a preset's search."""
+        with (
+            patch("obliteratus.abliterate.AbliterationPipeline") as pipeline_cls,
+            patch("obliteratus.telemetry.maybe_send_pipeline_report"),
+            patch("rich.live.Live"),
+            patch("obliteratus.cli.console"),
+        ):
+            pipeline_cls.return_value.run.return_value = "/tmp/accepted-candidate"
+            main(["obliterate", "fake/model", "--method", method])
+
+        forwarded = pipeline_cls.call_args.kwargs
+        assert forwarded["method"] == method
+        assert forwarded["use_kl_optimization"] is None
+        assert forwarded["cot_aware"] is None
+
+    def test_explicit_preservation_flags_are_still_forwarded(self):
+        with (
+            patch("obliteratus.abliterate.AbliterationPipeline") as pipeline_cls,
+            patch("obliteratus.telemetry.maybe_send_pipeline_report"),
+            patch("rich.live.Live"),
+            patch("obliteratus.cli.console"),
+        ):
+            pipeline_cls.return_value.run.return_value = "/tmp/accepted-candidate"
+            main([
+                "obliterate",
+                "fake/model",
+                "--kl-preservation",
+                "--cot-preservation",
+            ])
+
+        forwarded = pipeline_cls.call_args.kwargs
+        assert forwarded["use_kl_optimization"] is True
+        assert forwarded["cot_aware"] is True
+
     def test_informed_obliterate_uses_analysis_pipeline_with_same_gate(self):
         """The advertised informed method uses its feedback loop and safety policy."""
         with (
@@ -313,6 +361,56 @@ class TestCLIDispatch:
         assert forwarded["project_lm_head"] is True
         assert forwarded["project_embeddings"] is False
         assert forwarded["overwrite_output"] is True
+
+    def test_remote_obliterate_forwards_preservation_policy(self):
+        with (
+            patch("obliteratus.cli._make_remote_runner") as make_runner,
+            patch("obliteratus.cli.console"),
+        ):
+            make_runner.return_value.run_obliterate.return_value = "/tmp/result"
+            main([
+                "obliterate",
+                "fake/model",
+                "--remote", "gpu.example",
+                "--kl-preservation",
+                "--kl-budget", "0.025",
+                "--kl-search-steps", "6",
+                "--cot-preservation",
+                "--cot-reasoning-ce-budget", "0.11",
+                "--cot-answer-ce-budget", "0.07",
+            ])
+
+        forwarded = make_runner.return_value.run_obliterate.call_args.kwargs
+        assert forwarded["kl_preservation"] is True
+        assert forwarded["kl_budget"] == pytest.approx(0.025)
+        assert forwarded["kl_search_steps"] == 6
+        assert forwarded["cot_preservation"] is True
+        assert forwarded["cot_reasoning_ce_budget"] == pytest.approx(0.11)
+        assert forwarded["cot_answer_ce_budget"] == pytest.approx(0.07)
+
+    def test_remote_cot_examples_file_is_never_silently_ignored(self, tmp_path):
+        examples = tmp_path / "cot.json"
+        examples.write_text("[]")
+
+        with pytest.raises(ValueError, match="not supported in remote mode"):
+            main([
+                "obliterate",
+                "fake/model",
+                "--remote", "gpu.example",
+                "--cot-preservation",
+                "--cot-examples", str(examples),
+            ])
+
+    def test_local_cot_examples_require_the_preservation_gate(self, tmp_path):
+        examples = tmp_path / "cot.json"
+        examples.write_text("[]")
+
+        with pytest.raises(ValueError, match="requires --cot-preservation"):
+            main([
+                "obliterate",
+                "fake/model",
+                "--cot-examples", str(examples),
+            ])
 
     def test_self_improve_accepts_the_same_damage_policy_flags(self):
         """Recursive hard-negative runs use the same predeclared acceptance policy."""
@@ -403,6 +501,83 @@ class TestCLIDispatch:
         assert (output_path / "mined_residue.json").is_file()
         assert (output_path / "hard_negative_residue.json").is_file()
         assert not list(tmp_path.glob(".candidate.self-improve-*"))
+
+    @pytest.mark.parametrize(
+        "method", ["gabliteration", "rdo", "som", "optimized", "heretic"]
+    )
+    def test_self_improve_defers_protocol_owned_settings_to_preset(
+        self, tmp_path, method
+    ):
+        """Size heuristics must not rewrite a named search/training protocol."""
+        from obliteratus.model_profile import ModelProfile
+
+        audit_path = tmp_path / "audit.json"
+        audit_path.write_text('{"examples": []}')
+        output_path = tmp_path / "candidate"
+        profile = ModelProfile(
+            model="fake/model",
+            source="test",
+            total_params=1_000,
+            total_params_b=0.000001,
+            active_params_b=0.000001,
+            num_layers=2,
+            hidden_size=8,
+            intermediate_size=16,
+            vocab_size=32,
+            model_type="test",
+            dtype="float16",
+        )
+        size_defaults = {
+            "n_directions": 7,
+            "regularization": 0.42,
+            "refinement_passes": 4,
+            "residue_weight": 1,
+            "verify_sample_size": 30,
+            "note": "deliberately incompatible generic defaults",
+        }
+
+        def commit_checkpoint():
+            output_path.mkdir()
+            return str(output_path)
+
+        with (
+            patch("obliteratus.model_profile.profile_model", return_value=profile),
+            patch(
+                "obliteratus.model_profile.default_self_improve_params",
+                return_value=size_defaults,
+            ),
+            patch(
+                "obliteratus.hard_negative.build_weighted_prompt_pairs",
+                return_value=(
+                    ["harmful"],
+                    ["harmless"],
+                    {
+                        "residue_examples": 0,
+                        "residue_added_pairs": 0,
+                        "total_pairs": 1,
+                    },
+                ),
+            ),
+            patch("obliteratus.abliterate.AbliterationPipeline") as pipeline_cls,
+            patch("obliteratus.cli.console"),
+        ):
+            pipeline_cls.return_value.run.side_effect = commit_checkpoint
+            main([
+                "self-improve",
+                "fake/model",
+                "--audit",
+                str(audit_path),
+                "--output-dir",
+                str(output_path),
+                "--method",
+                method,
+            ])
+
+        forwarded = pipeline_cls.call_args.kwargs
+        assert forwarded["method"] == method
+        assert forwarded["n_directions"] is None
+        assert forwarded["regularization"] is None
+        assert forwarded["refinement_passes"] is None
 
     def test_self_improve_rejection_cleans_staging_without_publishing(self, tmp_path):
         """A rejected candidate leaves neither output artifacts nor staging debris."""

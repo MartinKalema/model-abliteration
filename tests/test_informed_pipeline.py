@@ -178,14 +178,15 @@ class TestConfigurationDerivation:
             setattr(p._insights, k, v)
         return p
 
-    def test_polyhedral_cone_more_directions(self):
+    def test_descriptive_dispersion_never_increases_edit_rank(self):
         p = self._make_pipeline_with_insights(
             cone_is_polyhedral=True,
             cone_dimensionality=3.5,
         )
         p._derive_configuration()
-        # Polyhedral with dim 3.5 → n_dirs = max(4, min(8, int(3.5*2))) = 7
-        assert p.n_directions == 7
+        assert p.n_directions == 1
+        assert p.direction_method == "diff_means"
+        assert p.use_whitened_svd is False
 
     def test_linear_cone_uses_single_difference_of_means(self):
         p = self._make_pipeline_with_insights(
@@ -298,14 +299,14 @@ class TestConfigurationDerivation:
         p._derive_configuration()
         assert p._insights.use_sparse_surgery is False
 
-    def test_whitened_svd_for_multi_direction(self):
+    def test_descriptive_dispersion_never_enables_whitened_svd(self):
         p = self._make_pipeline_with_insights(
             cone_is_polyhedral=True,
             cone_dimensionality=2.5,
         )
         p._derive_configuration()
-        assert p.n_directions > 1
-        assert p.use_whitened_svd is True
+        assert p.n_directions == 1
+        assert p.use_whitened_svd is False
 
     def test_no_whitened_svd_for_single_direction(self):
         p = self._make_pipeline_with_insights(
@@ -327,7 +328,8 @@ class TestFormatInsights:
         text = InformedAbliterationPipeline.format_insights(insights)
         assert "Analysis-Informed Pipeline" in text
         assert "UNKNOWN" in text  # detected method
-        assert "LINEAR" in text  # cone type
+        assert "descriptive only" in text
+        assert "Causally validated: no" in text
 
     def test_format_polyhedral(self):
         insights = AnalysisInsights(
@@ -339,7 +341,7 @@ class TestFormatInsights:
         )
         text = InformedAbliterationPipeline.format_insights(insights)
         assert "DPO" in text
-        assert "POLYHEDRAL" in text
+        assert "Causally validated: no" in text
         assert "3.50" in text
 
     def test_format_includes_derived_config(self, insights):

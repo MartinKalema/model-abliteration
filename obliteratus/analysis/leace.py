@@ -1,44 +1,20 @@
-"""LEACE-inspired direction extraction for refusal concept erasure.
+"""Closed-form linear concept erasure (LEACE) for binary concepts.
 
-This module implements Fisher's Linear Discriminant (FLD) direction for
-concept erasure, inspired by LEACE (Belrose et al. 2023).
+For a binary concept, the concept cross-covariance has the same span as the
+class-mean difference ``delta``.  With total activation covariance ``Sigma``,
+the minimum-distortion affine eraser can therefore be written
 
-IMPORTANT: This is NOT a faithful implementation of LEACE as described in
-the paper. Key difference:
+    v = Sigma^+ delta
+    P = I - delta v.T / (delta.T v)
+    x' = mu + P (x - mu).
 
-  - **True LEACE** uses the *total* covariance Sigma_X for whitening:
-        P* = I - W^{-1} P_{W Sigma_XZ} W  where W = Sigma_X^{-1/2}
-    For binary concepts, this yields: v = Sigma_X^{-1} delta
+Unlike an ordinary direction projection, ``P`` is generally oblique.  The
+implementation returns its distinct low-rank left and right factors so callers
+do not lose the LEACE geometry by replacing it with ``I - d d.T``.
 
-  - **This implementation** uses *within-class* covariance S_w:
-        v = S_w^{-1} delta
-    This is Fisher's Linear Discriminant direction, which maximizes
-    class separability relative to within-class spread.
-
-For binary concepts, Sigma_X = S_w + p(1-p) * delta @ delta^T,
-so the two directions differ when the between-class scatter is
-non-negligible relative to within-class scatter. In high-dimensional
-settings (d >> 1) with moderate class separation, the difference
-is typically small but non-zero.
-
-The FLD direction is still a strong choice for refusal erasure — it
-handles rogue dimensions (high-variance but non-discriminative) better
-than plain diff-of-means, and is a closed-form solution with no
-iterative optimization.
-
-Advantages over SVD:
-    - Within-class normalization prevents high-variance but
-      non-discriminative dimensions from dominating
-    - No hyperparameters beyond regularization epsilon
-    - Closed-form solution (no iterative optimization)
-
-References:
-    - Belrose et al. (2023): LEACE: Perfect linear concept erasure in
-      closed form. NeurIPS 2023.
-    - Ravfogel et al. (2022): RLACE: Adversarial concept erasure
-      (iterative precursor to LEACE).
-    - Fisher (1936): The use of multiple measurements in taxonomic
-      problems. Annals of Eugenics.
+Reference:
+    Belrose et al. (2023), "LEACE: Perfect linear concept erasure in closed
+    form", NeurIPS 2023.
 """
 
 from __future__ import annotations
@@ -47,25 +23,106 @@ from dataclasses import dataclass
 
 import torch
 
+from obliteratus.analysis.linear_eraser import ResidualEraser
+
+
+def _supported_eigensystem(
+    matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Return the supported PSD eigensystem and its condition number."""
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    eigenvalues = eigenvalues.clamp(min=0)
+    if eigenvalues.numel() == 0:
+        return eigenvalues, eigenvectors[:, :0], float("inf")
+    max_eigenvalue = eigenvalues.max()
+    if max_eigenvalue <= 0:
+        return eigenvalues[:0], eigenvectors[:, :0], float("inf")
+    tolerance = max_eigenvalue * max(matrix.shape) * torch.finfo(matrix.dtype).eps
+    support_mask = eigenvalues > tolerance
+    supported_values = eigenvalues[support_mask]
+    supported_vectors = eigenvectors[:, support_mask]
+    if supported_values.numel() == 0:
+        return supported_values, supported_vectors, float("inf")
+    condition = (supported_values.max() / supported_values.min()).item()
+    return supported_values, supported_vectors, condition
+
+
+def _condition_number(matrix: torch.Tensor) -> float:
+    eigenvalues = torch.linalg.eigvalsh(matrix).clamp(min=0)
+    if eigenvalues.numel() == 0:
+        return float("inf")
+    max_eigenvalue = eigenvalues.max()
+    if max_eigenvalue <= 0:
+        return float("inf")
+    tolerance = max_eigenvalue * max(matrix.shape) * torch.finfo(matrix.dtype).eps
+    supported = eigenvalues[eigenvalues > tolerance]
+    if supported.numel() == 0:
+        return float("inf")
+    return (supported.max() / supported.min()).item()
+
+
+def _stack_rows(activations: list[torch.Tensor], name: str) -> torch.Tensor:
+    if not activations:
+        raise ValueError(f"{name} must contain at least one activation")
+    rows = torch.stack(activations).float()
+    if rows.ndim == 3 and rows.shape[1] == 1:
+        rows = rows.squeeze(1)
+    if rows.ndim != 2:
+        raise ValueError(
+            f"{name} activations must stack to (samples, hidden_dim), "
+            f"got {tuple(rows.shape)}"
+        )
+    if not torch.isfinite(rows).all():
+        raise ValueError(f"{name} activations contain NaN or infinity")
+    return rows
+
 
 @dataclass
 class LEACEResult:
-    """Result of LEACE direction extraction for a single layer."""
+    """Result of exact binary LEACE extraction for one layer.
+
+    ``direction`` remains the normalized covariance-aware scoring direction
+    for compatibility with existing diagnostics.  It is not sufficient to
+    apply an oblique eraser; use ``eraser`` or ``proj_left``/``proj_right``.
+    """
 
     layer_idx: int
-    direction: torch.Tensor           # (hidden_dim,) unit vector
-    generalized_eigenvalue: float     # lambda from GEP (discriminability)
-    within_class_condition: float     # condition number of S_w
-    mean_diff_norm: float             # ||mu_1 - mu_0||
-    erasure_loss: float               # expected squared distortion from erasure
+    direction: torch.Tensor
+    generalized_eigenvalue: float
+    within_class_condition: float
+    mean_diff_norm: float
+    erasure_loss: float
+    eraser: ResidualEraser
+    total_covariance_condition: float
+
+    @property
+    def proj_left(self) -> torch.Tensor:
+        return self.eraser.proj_left
+
+    @property
+    def proj_right(self) -> torch.Tensor:
+        return self.eraser.proj_right
+
+    @property
+    def center(self) -> torch.Tensor | None:
+        return self.eraser.center
+
+    @property
+    def projector(self) -> torch.Tensor:
+        return self.eraser.projector
+
+    def apply(self, activations: torch.Tensor) -> torch.Tensor:
+        """Apply the affine LEACE map to row activations."""
+        return self.eraser.apply(activations)
 
 
 class LEACEExtractor:
-    """Extract refusal directions via Fisher's Linear Discriminant.
+    """Fit the minimum-distortion affine LEACE eraser for a binary concept.
 
-    Finds the direction that maximally separates harmful from harmless
-    activations relative to within-class variance (v = S_w^{-1} delta).
-    See module docstring for how this relates to true LEACE.
+    Shrinkage and Tikhonov regularization are applied to the *total*
+    activation covariance.  Consequently the returned operator is exact for
+    that regularized covariance metric and still erases the empirical binary
+    mean difference exactly.
     """
 
     def __init__(
@@ -73,14 +130,10 @@ class LEACEExtractor:
         regularization_eps: float = 1e-4,
         shrinkage: float = 0.0,
     ):
-        """
-        Args:
-            regularization_eps: Tikhonov regularization for S_w inversion.
-                Larger values produce more conservative (but stable) results.
-            shrinkage: Ledoit-Wolf shrinkage toward identity (0..1).
-                0 = no shrinkage, 1 = full shrinkage to scaled identity.
-                Useful when n_samples < hidden_dim.
-        """
+        if regularization_eps < 0:
+            raise ValueError("regularization_eps must be non-negative")
+        if not 0.0 <= shrinkage <= 1.0:
+            raise ValueError("shrinkage must be between 0 and 1")
         self.regularization_eps = regularization_eps
         self.shrinkage = shrinkage
 
@@ -90,99 +143,115 @@ class LEACEExtractor:
         harmless_activations: list[torch.Tensor],
         layer_idx: int = 0,
     ) -> LEACEResult:
-        """Extract the LEACE direction for a single layer.
+        """Extract an exact rank-one binary LEACE eraser for one layer."""
+        harmful = _stack_rows(harmful_activations, "harmful")
+        harmless = _stack_rows(harmless_activations, "harmless")
+        if harmful.shape[1] != harmless.shape[1]:
+            raise ValueError("harmful and harmless activations must have the same hidden dimension")
 
-        Args:
-            harmful_activations: List of (hidden_dim,) tensors from harmful prompts.
-            harmless_activations: List of (hidden_dim,) tensors from harmless prompts.
-            layer_idx: Layer index (for metadata).
+        n_h, hidden_dim = harmful.shape
+        n_b = harmless.shape[0]
+        mean_h = harmful.mean(dim=0)
+        mean_b = harmless.mean(dim=0)
+        mean_difference = mean_h - mean_b
+        mean_diff_norm = mean_difference.norm().item()
 
-        Returns:
-            LEACEResult with the optimal erasure direction.
-        """
-        H = torch.stack(harmful_activations).float()   # (n_h, d)
-        B = torch.stack(harmless_activations).float()   # (n_b, d)
+        harmful_centered = harmful - mean_h
+        harmless_centered = harmless - mean_b
+        cov_h = (harmful_centered.T @ harmful_centered) / max(n_h - 1, 1)
+        cov_b = (harmless_centered.T @ harmless_centered) / max(n_b - 1, 1)
+        within_covariance = (cov_h + cov_b) / 2.0
 
-        if H.dim() == 3:
-            H = H.squeeze(1)
-        if B.dim() == 3:
-            B = B.squeeze(1)
+        all_activations = torch.cat((harmful, harmless), dim=0)
+        center = all_activations.mean(dim=0)
+        all_centered = all_activations - center
+        total_covariance = (
+            all_centered.T @ all_centered
+        ) / max(all_activations.shape[0] - 1, 1)
 
-        n_h, d = H.shape
-        n_b = B.shape[0]
-
-        # Class-conditional means
-        mu_h = H.mean(dim=0)  # (d,)
-        mu_b = B.mean(dim=0)  # (d,)
-
-        # Mean difference (between-class direction)
-        delta = mu_h - mu_b  # (d,)
-        delta_norm = delta.norm().item()
-
-        # Within-class covariance: S_w = (S_h + S_b) / 2
-        # where S_h = (H - mu_h)^T (H - mu_h) / (n_h - 1) etc.
-        H_centered = H - mu_h.unsqueeze(0)
-        B_centered = B - mu_b.unsqueeze(0)
-
-        S_h = (H_centered.T @ H_centered) / max(n_h - 1, 1)
-        S_b = (B_centered.T @ B_centered) / max(n_b - 1, 1)
-        S_w = (S_h + S_b) / 2.0  # (d, d)
-
-        # Apply Ledoit-Wolf shrinkage if requested
+        identity = torch.eye(hidden_dim, device=total_covariance.device)
         if self.shrinkage > 0:
-            trace_S_w = S_w.trace().item()
-            S_w = (1 - self.shrinkage) * S_w + self.shrinkage * (trace_S_w / d) * torch.eye(d, device=S_w.device)
+            total_scale = total_covariance.trace() / hidden_dim
+            total_covariance = (
+                (1.0 - self.shrinkage) * total_covariance
+                + self.shrinkage * total_scale * identity
+            )
+            within_scale = within_covariance.trace() / hidden_dim
+            within_covariance = (
+                (1.0 - self.shrinkage) * within_covariance
+                + self.shrinkage * within_scale * identity
+            )
 
-        # Regularize S_w for numerical stability
-        S_w_reg = S_w + self.regularization_eps * torch.eye(d, device=S_w.device)
+        covariance = total_covariance + self.regularization_eps * identity
+        within_regularized = within_covariance + self.regularization_eps * identity
+        total_condition = _condition_number(covariance)
+        within_condition = _condition_number(within_regularized)
 
-        # Condition number of S_w (for diagnostics)
-        try:
-            eigs_w = torch.linalg.eigvalsh(S_w_reg)
-            eigs_w = eigs_w.clamp(min=0)
-            pos_eigs = eigs_w[eigs_w > eigs_w.max() * 1e-10]
-            condition = (pos_eigs.max() / pos_eigs.min()).item() if pos_eigs.numel() > 0 else float('inf')
-        except Exception:
-            condition = float('inf')
-
-        # LEACE direction via S_w^{-1} @ delta
-        # The generalized eigenvector for rank-1 S_between = delta @ delta^T
-        # reduces to: v = S_w^{-1} @ delta (up to normalization)
-        try:
-            # Use solve for numerical stability (avoids explicit inverse)
-            v = torch.linalg.solve(S_w_reg, delta)  # (d,)
-        except torch.linalg.LinAlgError:
-            # Fallback: pseudoinverse
-            v = torch.linalg.lstsq(S_w_reg, delta.unsqueeze(1)).solution.squeeze(1)
-
-        # Normalize to unit length
-        v_norm = v.norm()
-        if v_norm > 1e-8:
-            direction = v / v_norm
+        # Honor every regularized covariance dimension when the matrix is
+        # positive definite.  Fall back to an explicit Hermitian
+        # Moore-Penrose inverse in singular d > n settings.
+        cholesky, cholesky_info = torch.linalg.cholesky_ex(covariance)
+        if torch.count_nonzero(cholesky_info) == 0:
+            score = torch.cholesky_solve(
+                mean_difference.unsqueeze(1),
+                cholesky,
+            ).squeeze(1)
         else:
-            # Degenerate case: fall back to normalized mean difference
-            direction = delta / max(delta_norm, 1e-8)
+            supported_values, supported_vectors, _ = _supported_eigensystem(covariance)
+            if supported_values.numel():
+                score_coordinates = supported_vectors.T @ mean_difference
+                score = supported_vectors @ (score_coordinates / supported_values)
+            else:
+                score = covariance.new_zeros(hidden_dim)
+        discriminability = mean_difference @ score
+        tolerance = (
+            torch.finfo(covariance.dtype).eps
+            * hidden_dim
+            * max(mean_diff_norm * mean_diff_norm, 1.0)
+        )
 
-        # Generalized eigenvalue: lambda = delta^T @ S_w^{-1} @ delta
-        # This measures how discriminable the classes are after whitening
-        gen_eigenvalue = (delta @ v).item()
+        if mean_diff_norm == 0.0 or discriminability <= tolerance:
+            proj_left = covariance.new_empty((hidden_dim, 0))
+            proj_right = covariance.new_empty((0, hidden_dim))
+            direction = covariance.new_zeros(hidden_dim)
+            display_directions = covariance.new_empty((0, hidden_dim))
+            discriminability_value = 0.0
+        else:
+            normalizer = discriminability.sqrt()
+            proj_left = mean_difference.unsqueeze(1) / normalizer
+            proj_right = score.unsqueeze(0) / normalizer
+            score_norm = score.norm()
+            direction = score / score_norm if score_norm > 0 else score
+            display_directions = (
+                mean_difference / mean_difference.norm()
+            ).unsqueeze(0)
+            discriminability_value = discriminability.item()
 
-        # Erasure loss: expected squared distortion E[||x - x'||^2]
-        # For rank-1 projection: loss = v^T @ S_total @ v where S_total
-        # is the total (pooled) covariance
-        all_acts = torch.cat([H, B], dim=0)
-        mu_total = all_acts.mean(dim=0)
-        centered_total = all_acts - mu_total.unsqueeze(0)
-        S_total = (centered_total.T @ centered_total) / max(all_acts.shape[0] - 1, 1)
-        erasure_loss = (direction @ S_total @ direction).item()
+        eraser = ResidualEraser(
+            proj_left=proj_left,
+            proj_right=proj_right,
+            center=center,
+            display_directions=display_directions,
+            method="leace",
+            diagnostics={
+                "generalized_eigenvalue": discriminability_value,
+                "total_covariance_condition": total_condition,
+                "within_class_condition": within_condition,
+                "mean_diff_norm": mean_diff_norm,
+            },
+        )
+        removed = all_activations - eraser.apply(all_activations)
+        erasure_loss = removed.square().sum(dim=-1).mean().item()
 
         return LEACEResult(
             layer_idx=layer_idx,
             direction=direction,
-            generalized_eigenvalue=gen_eigenvalue,
-            within_class_condition=condition,
-            mean_diff_norm=delta_norm,
+            generalized_eigenvalue=discriminability_value,
+            within_class_condition=within_condition,
+            mean_diff_norm=mean_diff_norm,
             erasure_loss=erasure_loss,
+            eraser=eraser,
+            total_covariance_condition=total_condition,
         )
 
     def extract_all_layers(
@@ -190,24 +259,15 @@ class LEACEExtractor:
         harmful_acts: dict[int, list[torch.Tensor]],
         harmless_acts: dict[int, list[torch.Tensor]],
     ) -> dict[int, LEACEResult]:
-        """Extract LEACE directions for all layers.
-
-        Args:
-            harmful_acts: {layer_idx: [activations]} from activation collection.
-            harmless_acts: {layer_idx: [activations]} from activation collection.
-
-        Returns:
-            {layer_idx: LEACEResult} for each layer.
-        """
+        """Extract LEACE erasers for every layer present in both mappings."""
         results = {}
-        for idx in sorted(harmful_acts.keys()):
-            if idx not in harmless_acts:
-                continue
-            results[idx] = self.extract(
-                harmful_acts[idx],
-                harmless_acts[idx],
-                layer_idx=idx,
-            )
+        for idx in sorted(harmful_acts):
+            if idx in harmless_acts:
+                results[idx] = self.extract(
+                    harmful_acts[idx],
+                    harmless_acts[idx],
+                    layer_idx=idx,
+                )
         return results
 
     @staticmethod
@@ -216,24 +276,16 @@ class LEACEExtractor:
         harmful_mean: torch.Tensor,
         harmless_mean: torch.Tensor,
     ) -> dict[str, float]:
-        """Compare LEACE direction with simple diff-of-means.
-
-        Returns cosine similarity and diagnostic metrics showing how much
-        the within-class normalization rotates the direction.
-        """
-        diff = harmful_mean.squeeze() - harmless_mean.squeeze()
-        diff_norm = diff.norm()
-        if diff_norm > 1e-8:
-            diff_normalized = diff / diff_norm
-        else:
-            diff_normalized = diff
-
-        cosine_sim = (leace_result.direction @ diff_normalized).abs().item()
-
+        """Compare the covariance-aware scoring axis with mean difference."""
+        difference = harmful_mean.squeeze() - harmless_mean.squeeze()
+        difference_norm = difference.norm()
+        normalized = difference / difference_norm if difference_norm > 1e-8 else difference
+        cosine = (leace_result.direction @ normalized).abs().item()
         return {
-            "cosine_similarity": cosine_sim,
+            "cosine_similarity": cosine,
             "leace_eigenvalue": leace_result.generalized_eigenvalue,
             "leace_erasure_loss": leace_result.erasure_loss,
             "within_class_condition": leace_result.within_class_condition,
+            "total_covariance_condition": leace_result.total_covariance_condition,
             "mean_diff_norm": leace_result.mean_diff_norm,
         }

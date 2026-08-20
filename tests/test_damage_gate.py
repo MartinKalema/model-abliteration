@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -10,10 +11,41 @@ from obliteratus.evaluation.damage_gate import (
     AcceptanceBudget,
     DamageBudget,
     DamageGateError,
+    EfficacyBudget,
     assess_candidate,
     paired_bootstrap_upper_bound,
     weighted_paired_bootstrap_upper_bound,
 )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_sampled_token_kl_upper_ci": True},
+        {"max_top1_flip_rate": False},
+        {"max_cot_reasoning_ce_increase": True},
+    ],
+)
+def test_damage_budget_rejects_boolean_numeric_thresholds(kwargs):
+    with pytest.raises(ValueError):
+        DamageBudget(**kwargs)
+
+
+def test_budget_metadata_normalizes_numpy_scalars_for_strict_json():
+    np = pytest.importorskip("numpy")
+    budget = AcceptanceBudget(
+        damage=DamageBudget(
+            max_sampled_token_kl_upper_ci=np.float32(0.01),
+            max_top1_flip_rate=np.float64(0.02),
+        ),
+        efficacy=EfficacyBudget(max_refusal_rate=np.float32(0.1)),
+    )
+
+    encoded = json.dumps(budget.to_dict(), allow_nan=False)
+
+    decoded = json.loads(encoded)
+    assert isinstance(decoded["damage"]["max_sampled_token_kl_upper_ci"], float)
+    assert decoded["damage"]["max_sampled_token_kl_upper_ci"] == pytest.approx(0.01)
 
 
 def _passing_metrics() -> dict[str, float | int]:
@@ -116,6 +148,148 @@ def test_disabled_check_does_not_require_its_metric():
     assert assessment.accepted is True
 
 
+def test_cot_preservation_checks_pass_with_real_metrics():
+    metrics = _passing_metrics()
+    metrics.update(
+        {
+            "cot_reasoning_ce_increase": 0.03,
+            "cot_answer_ce_increase": 0.01,
+            "cot_eval_example_count": 24,
+        }
+    )
+    budget = AcceptanceBudget(
+        damage=DamageBudget(
+            max_cot_reasoning_ce_increase=0.05,
+            max_cot_answer_ce_increase=0.02,
+            min_cot_eval_examples=16,
+        )
+    )
+
+    assessment = assess_candidate(metrics, budget)
+
+    assert assessment.accepted is True
+    assert assessment.violations == ()
+    assert assessment.inconclusive == ()
+
+
+@pytest.mark.parametrize(
+    ("metric", "value"),
+    [
+        ("cot_reasoning_ce_increase", 0.051),
+        ("cot_answer_ce_increase", 0.021),
+    ],
+)
+def test_cot_preservation_limit_rejects_excessive_increase(metric, value):
+    metrics = _passing_metrics()
+    metrics.update(
+        {
+            "cot_reasoning_ce_increase": 0.03,
+            "cot_answer_ce_increase": 0.01,
+            "cot_eval_example_count": 24,
+            metric: value,
+        }
+    )
+    budget = AcceptanceBudget(
+        damage=DamageBudget(
+            max_cot_reasoning_ce_increase=0.05,
+            max_cot_answer_ce_increase=0.02,
+            min_cot_eval_examples=16,
+        )
+    )
+
+    assessment = assess_candidate(metrics, budget)
+
+    assert assessment.accepted is False
+    assert assessment.violations
+    assert assessment.damage_accepted is False
+
+
+@pytest.mark.parametrize(
+    "missing_metric",
+    [
+        "cot_reasoning_ce_increase",
+        "cot_answer_ce_increase",
+        "cot_eval_example_count",
+    ],
+)
+def test_enabled_cot_preservation_check_rejects_missing_metric(missing_metric):
+    metrics = _passing_metrics()
+    metrics.update(
+        {
+            "cot_reasoning_ce_increase": 0.03,
+            "cot_answer_ce_increase": 0.01,
+            "cot_eval_example_count": 24,
+        }
+    )
+    del metrics[missing_metric]
+    budget = AcceptanceBudget(
+        damage=DamageBudget(
+            max_cot_reasoning_ce_increase=0.05,
+            max_cot_answer_ce_increase=0.02,
+            min_cot_eval_examples=16,
+        )
+    )
+
+    assessment = assess_candidate(metrics, budget)
+
+    assert assessment.accepted is False
+    assert assessment.violations == ()
+    assert assessment.inconclusive
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ["cot_reasoning_ce_increase", "cot_answer_ce_increase"],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_enabled_cot_preservation_check_rejects_nonfinite_metric(metric, value):
+    metrics = _passing_metrics()
+    metrics.update(
+        {
+            "cot_reasoning_ce_increase": 0.03,
+            "cot_answer_ce_increase": 0.01,
+            "cot_eval_example_count": 24,
+            metric: value,
+        }
+    )
+    budget = AcceptanceBudget(
+        damage=DamageBudget(
+            max_cot_reasoning_ce_increase=0.05,
+            max_cot_answer_ce_increase=0.02,
+            min_cot_eval_examples=16,
+            unsafe_allow_inconclusive=True,
+        )
+    )
+
+    assessment = assess_candidate(metrics, budget)
+
+    assert assessment.accepted is False
+    assert assessment.violations
+
+
+def test_enabled_cot_minimum_rejects_nonfinite_example_count_as_inconclusive():
+    metrics = _passing_metrics()
+    metrics["cot_eval_example_count"] = float("nan")
+    budget = AcceptanceBudget(
+        damage=DamageBudget(min_cot_eval_examples=16),
+    )
+
+    assessment = assess_candidate(metrics, budget)
+
+    assert assessment.accepted is False
+    assert assessment.violations == ()
+    assert assessment.inconclusive
+
+
+def test_default_budget_does_not_require_cot_metrics():
+    budget = DamageBudget()
+
+    assert budget.max_cot_reasoning_ce_increase is None
+    assert budget.max_cot_answer_ce_increase is None
+    assert budget.min_cot_eval_examples == 0
+    assert assess_candidate(_passing_metrics(), AcceptanceBudget()).accepted is True
+
+
 def test_gate_error_keeps_structured_assessment():
     assessment = assess_candidate({}, AcceptanceBudget())
     error = DamageGateError(assessment)
@@ -165,3 +339,11 @@ def test_budget_validation_rejects_invalid_policy():
         DamageBudget(max_top1_flip_rate=1.1)
     with pytest.raises(ValueError):
         DamageBudget(max_nll_increase_upper_ci=-0.1)
+    with pytest.raises(ValueError):
+        DamageBudget(max_cot_reasoning_ce_increase=-0.1)
+    with pytest.raises(ValueError):
+        DamageBudget(max_cot_answer_ce_increase=float("nan"))
+    with pytest.raises(ValueError):
+        DamageBudget(min_cot_eval_examples=-1)
+    with pytest.raises(ValueError):
+        DamageBudget(min_cot_eval_examples=True)

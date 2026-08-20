@@ -23,7 +23,7 @@ Analysis modules integrated:
   Stage       | Module used                  | What it informs
   ------------|------------------------------|------------------------------------------
   ANALYZE     | AlignmentImprintDetector     | Auto-selects method preset (DPO/RLHF/CAI)
-  ANALYZE     | ConceptConeAnalyzer          | Per-category vs universal direction choice
+  ANALYZE     | CategoryDirectionDispersion  | Descriptive labeled-category geometry
   ANALYZE     | CrossLayerAlignmentAnalyzer  | Smart layer selection (cluster-aware)
   ANALYZE     | SparseDirectionSurgeon       | Sparsity-aware projection plan
   ANALYZE     | DefenseRobustnessEvaluator   | Ouroboros risk assessment, entanglement map
@@ -38,8 +38,8 @@ Novel contributions:
   - First closed-loop analysis→abliteration pipeline
   - Alignment-aware auto-tuning: detected training method (DPO/RLHF/CAI)
     automatically configures projection parameters
-  - Cone-aware excision: polyhedral models get per-category directions,
-    linear models get single universal direction
+  - Labeled-category direction dispersion is reported descriptively and is
+    never treated as a causally validated cone or used to enrich the edit
   - Cluster-aware layer selection: respects direction cluster boundaries
     instead of arbitrary top-k selection
   - Ouroboros-compensated refinement: detects self-repair and adds targeted
@@ -109,7 +109,8 @@ class AnalysisInsights:
     alignment_confidence: float = 0.0
     alignment_probabilities: dict[str, float] = field(default_factory=dict)
 
-    # Cone geometry
+    # Legacy compatibility fields for descriptive category geometry.  These
+    # are not a causal cone fit and never configure checkpoint edits.
     cone_is_polyhedral: bool = False
     cone_dimensionality: float = 1.0
     mean_pairwise_cosine: float = 1.0
@@ -174,7 +175,10 @@ class InformedAbliterationPipeline(AbliterationPipeline):
 
         # The report contains all analysis insights
         print(f"Detected alignment: {report.insights.detected_alignment_method}")
-        print(f"Cone type: {'polyhedral' if report.insights.cone_is_polyhedral else 'linear'}")
+        print(
+            "Category dispersion: descriptive only "
+            f"(effective rank={report.insights.cone_dimensionality:.2f})"
+        )
         print(f"Ouroboros passes needed: {report.ouroboros_passes}")
     """
 
@@ -263,7 +267,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
             use_chat_template=True,
             use_whitened_svd=False,
             true_iterative_refinement=True,
-            use_kl_optimization=True,
+            use_kl_optimization=False,
             float_layer_interpolation=True,
             layer_adaptive_strength=True,
             winsorize_activations=True,
@@ -357,7 +361,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         if self._run_alignment:
             self._analyze_alignment_imprint()
 
-        # 2. Concept Cone Geometry
+        # 2. Descriptive category-direction dispersion
         if self._run_cone:
             self._analyze_cone_geometry()
 
@@ -380,7 +384,10 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         self._report.analysis_duration = elapsed
         self.log(f"\nAnalysis complete ({elapsed:.1f}s)")
         self.log(f"  Detected alignment: {self._insights.detected_alignment_method}")
-        self.log(f"  Cone type: {'polyhedral' if self._insights.cone_is_polyhedral else 'linear'}")
+        self.log(
+            "  Category dispersion is descriptive only "
+            f"(effective rank={self._insights.cone_dimensionality:.2f})"
+        )
         self.log(f"  Direction clusters: {self._insights.cluster_count}")
         self.log(f"  Recommended directions: {self._insights.recommended_n_directions}")
         self.log(f"  Recommended regularization: {self._insights.recommended_regularization}")
@@ -437,77 +444,62 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         self.log(f"    Tail layer bias:    {imprint.tail_layer_bias:.3f}")
 
     def _analyze_cone_geometry(self):
-        """Analyze concept cone structure to determine per-category vs universal."""
-        self.log("\n[2/4] Concept Cone Geometry")
+        """Report descriptive category-direction dispersion when labels exist.
+
+        These cached mean-difference statistics are not a causal RCO cone and
+        therefore never choose an edit method, rank, layer, or direction.
+        """
+        self.log("\n[2/4] Category Direction Dispersion (descriptive only)")
         self.log("-" * 40)
+        category_map = getattr(self, "harm_category_map", None)
+        self._category_dispersion_by_layer = {}
+        if not category_map:
+            self.log(
+                "  Skipped: explicit per-prompt harm-category labels were not "
+                "provided; unlabeled prompts are never assigned a fabricated category"
+            )
+            return
 
-        from obliteratus.analysis.concept_geometry import ConceptConeAnalyzer
+        from obliteratus.analysis.concept_geometry import (
+            CategoryDirectionDispersionAnalyzer,
+        )
 
-        analyzer = ConceptConeAnalyzer()
-
-        # Analyze at layers that are likely strong refusal layers
-        # (middle-to-late layers based on literature)
+        analyzer = CategoryDirectionDispersionAnalyzer(category_map)
         n_layers = len(self._harmful_acts)
         candidate_layers = list(range(n_layers // 3, int(n_layers * 0.85)))
-        # Sample a subset to keep analysis fast
         step = max(1, len(candidate_layers) // 6)
-        sample_layers = candidate_layers[::step]
-
-        polyhedral_count = 0
-        all_results = []
-        best_cone_result = None
-        best_strength = 0.0
-
-        for layer_idx in sample_layers:
+        for layer_idx in candidate_layers[::step]:
             if layer_idx not in self._harmful_acts or layer_idx not in self._harmless_acts:
                 continue
-
             result = analyzer.analyze_layer(
                 self._harmful_acts[layer_idx],
                 self._harmless_acts[layer_idx],
                 layer_idx=layer_idx,
             )
+            self._category_dispersion_by_layer[layer_idx] = result
 
-            all_results.append(result)
-            if result.is_polyhedral:
-                polyhedral_count += 1
-
-            # Track the strongest layer's cone analysis for per-category directions
-            general_strength = result.general_direction.norm().item() if result.general_direction.numel() > 1 else 0
-            if general_strength > best_strength:
-                best_strength = general_strength
-                best_cone_result = result
-
-        if all_results:
-            # Aggregate cone geometry across sampled layers (majority vote +
-            # mean dimensionality) instead of relying on a single layer.
-            n_sampled = len(all_results)
-            is_polyhedral = polyhedral_count > n_sampled / 2
-            avg_dimensionality = sum(r.cone_dimensionality for r in all_results) / n_sampled
-            avg_pairwise_cos = sum(r.mean_pairwise_cosine for r in all_results) / n_sampled
-
-            self._insights.cone_is_polyhedral = is_polyhedral
-            self._insights.cone_dimensionality = avg_dimensionality
-            self._insights.mean_pairwise_cosine = avg_pairwise_cos
-
-            # Store per-category directions from the strongest layer
-            if best_cone_result is not None:
-                for cd in best_cone_result.category_directions:
-                    self._insights.per_category_directions[cd.category] = cd.direction
-                    self._insights.direction_specificity[cd.category] = cd.specificity
-
-            cone_type = "POLYHEDRAL" if is_polyhedral else "LINEAR"
-            self.log(f"  Cone type: {cone_type} (majority vote: {polyhedral_count}/{n_sampled} layers)")
-            self.log(f"  Avg dimensionality: {avg_dimensionality:.2f}")
-            self.log(f"  Avg pairwise cosine: {avg_pairwise_cos:.3f}")
-            if best_cone_result is not None:
-                self.log(f"  Categories detected: {best_cone_result.category_count}")
-
-                for cd in sorted(best_cone_result.category_directions, key=lambda x: -x.strength)[:5]:
-                    self.log(f"    {cd.category:15s}  DSI={cd.specificity:.3f}  str={cd.strength:.3f}")
-        else:
-            self.log("  No cone results — using default linear assumption")
-
+        results = list(self._category_dispersion_by_layer.values())
+        if not results:
+            self.log("  No labeled category-dispersion results")
+            return
+        effective_rank = sum(result.effective_rank for result in results) / len(results)
+        signed_cosines = [
+            result.mean_pairwise_cosine
+            for result in results
+            if result.mean_pairwise_cosine is not None
+        ]
+        mean_cosine = (
+            sum(signed_cosines) / len(signed_cosines)
+            if signed_cosines
+            else 0.0
+        )
+        # Compatibility report fields remain descriptive and cannot feed edits.
+        self._insights.cone_dimensionality = effective_rank
+        self._insights.mean_pairwise_cosine = mean_cosine
+        self._insights.cone_is_polyhedral = False
+        self.log("  DESCRIPTIVE ONLY — NOT CAUSALLY VALIDATED")
+        self.log(f"  Avg squared-SVD effective rank: {effective_rank:.2f}")
+        self.log(f"  Avg signed pairwise cosine: {mean_cosine:.3f}")
     def _analyze_cross_layer(self):
         """Analyze cross-layer direction alignment for cluster-aware layer selection."""
         self.log("\n[3/4] Cross-Layer Direction Alignment")
@@ -665,34 +657,20 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         self.log("-" * 50)
         insights = self._insights
 
-        # 1. n_directions + direction_method: based on cone geometry
-        # Default: single direction via diff-of-means (proven most robust).
-        # Only escalate to multi-direction when analysis confirms polyhedral geometry.
-        if insights.cone_is_polyhedral and insights.cone_dimensionality > 2.0:
-            # Clearly polyhedral cone → use multiple directions via SVD
-            n_dirs = max(4, min(8, int(insights.cone_dimensionality * 2)))
-            self.direction_method = "svd"
-            self.use_whitened_svd = True
-            self.log(f"  Polyhedral cone (dim={insights.cone_dimensionality:.1f}) "
-                     f"→ n_directions={n_dirs}, method=svd (whitened)")
-        elif insights.cone_is_polyhedral:
-            # Mildly polyhedral → LEACE gives better single-direction erasure
-            n_dirs = 1
-            self.direction_method = "leace"
-            self.use_whitened_svd = False
-            self.log(f"  Mildly polyhedral (dim={insights.cone_dimensionality:.1f}) "
-                     f"→ n_directions=1, method=leace")
-        else:
-            # Linear cone → single direction via diff-of-means (simplest, most robust)
-            n_dirs = 1
-            self.direction_method = "diff_means"
-            self.use_whitened_svd = False
-            self.log(f"  Linear cone (dim={insights.cone_dimensionality:.1f}) "
-                     f"→ n_directions=1, method=diff_means")
+        # Descriptive category dispersion is not a causal intervention test.
+        # It must never choose rank or extraction backend.  Keep the robust,
+        # auditable single difference-of-means baseline unless the caller
+        # explicitly selected another method outside this auto-derivation.
+        n_dirs = 1
+        self.direction_method = "diff_means"
+        self.use_whitened_svd = False
+        self.log(
+            "  Category dispersion is descriptive-only "
+            "→ n_directions=1, method=diff_means"
+        )
         insights.recommended_n_directions = n_dirs
         insights.recommended_direction_method = self.direction_method
         self.n_directions = n_dirs
-
         # 2. regularization: based on alignment method + entanglement
         method = insights.detected_alignment_method
         if method == "dpo":
@@ -790,10 +768,11 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         Key differences from base _distill():
         - Uses analysis-recommended n_directions
         - Respects layer selection from cross-layer analysis
-        - Can extract per-category directions for polyhedral models
+        - Keeps descriptive category dispersion out of checkpoint edits
         """
         self._emit("distill", "running", "Extracting refusal subspace (analysis-informed)...")
         t0 = time.time()
+        self.residual_erasers.clear()
 
         self.log("\nDISTILL (analysis-informed)")
 
@@ -854,8 +833,14 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                         self._harmless_acts[idx],
                         layer_idx=idx,
                     )
+                    self.residual_erasers[idx] = l_result.eraser
                     self.refusal_directions[idx] = l_result.direction
-                    self.refusal_subspaces[idx] = l_result.direction.unsqueeze(0)
+                    display = l_result.eraser.display_directions
+                    self.refusal_subspaces[idx] = (
+                        display
+                        if display is not None and display.shape[0] > 0
+                        else l_result.direction.unsqueeze(0)
+                    )
                     norms[idx] = l_result.generalized_eigenvalue
 
                     if idx < 5 or idx == n_layers - 1:
@@ -882,8 +867,13 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                     n_directions=self.n_directions,
                     layer_idx=idx,
                 )
+                self.residual_erasers[idx] = result.eraser
                 self.refusal_subspaces[idx] = result.directions
-                self.refusal_directions[idx] = result.directions[0]
+                self.refusal_directions[idx] = (
+                    result.directions[0]
+                    if result.directions.shape[0] > 0
+                    else torch.zeros_like(self._harmful_means[idx].squeeze(0))
+                )
                 norms[idx] = result.singular_values.sum().item()
             else:
                 harmful_stack = torch.stack(self._harmful_acts[idx]).squeeze(1)
@@ -901,41 +891,9 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                 self.refusal_directions[idx] = primary / primary.norm()
                 norms[idx] = S[:k].sum().item()
 
-        # Enrich subspaces with per-category cone directions when available.
-        # This uses the actual refusal cone generators instead of purely
-        # data-agnostic SVD components.
-        cat_dirs = self._insights.per_category_directions
-        if cat_dirs and self._insights.cone_is_polyhedral and self.n_directions > 1:
-            cat_tensors = list(cat_dirs.values())
-            # Stack and orthogonalize category directions
-            cat_stack = torch.stack(cat_tensors)  # (n_cats, hidden)
-            cat_norms = cat_stack.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            cat_stack = cat_stack / cat_norms
-            # Blend into strong-signal layers: replace later SVD components
-            # with category directions (which are geometrically meaningful)
-            n_cat = cat_stack.shape[0]
-            for idx in norms:
-                sub = self.refusal_subspaces.get(idx)
-                if sub is None or sub.shape[0] <= 1:
-                    continue
-                # Keep the first SVD direction (strongest), replace remaining
-                # with category directions projected to be orthogonal to it
-                primary = sub[0:1]  # (1, hidden)
-                # Project category directions orthogonal to primary
-                cos = (cat_stack @ primary.squeeze(0))  # (n_cat,)
-                ortho_cats = cat_stack - cos.unsqueeze(1) * primary
-                ortho_norms = ortho_cats.norm(dim=1)
-                # Keep only directions that survived orthogonalization
-                valid = ortho_norms > 0.1
-                if valid.sum() > 0:
-                    ortho_cats = ortho_cats[valid]
-                    ortho_cats = ortho_cats / ortho_cats.norm(dim=1, keepdim=True)
-                    # Take up to (n_directions - 1) category directions
-                    n_take = min(self.n_directions - 1, ortho_cats.shape[0])
-                    new_sub = torch.cat([primary, ortho_cats[:n_take]], dim=0)
-                    self.refusal_subspaces[idx] = new_sub
-            self.log(f"Enriched subspaces with {n_cat} per-category cone directions")
-
+        # Category mean-difference dispersion is deliberately report-only.
+        # Only a future result carrying independent causal intervention
+        # validation may enrich a checkpoint-producing refusal subspace.
         # Layer selection: use analysis-recommended layers if available,
         # otherwise fall back to knee detection
         if self._insights.recommended_layers:
@@ -1004,11 +962,12 @@ class InformedAbliterationPipeline(AbliterationPipeline):
     def _configure_bayesian_warm_start(self):
         """Configure deterministic analysis-guided projection settings.
 
-        Retains deterministic per-layer strength/interpolation while disabling
-        the inconsistent Bayesian and legacy KL-correction branches.
+        Retains deterministic per-layer strength/interpolation.  The informed
+        wrapper deliberately does not launch the separate exact TPE workflow;
+        callers select the `optimized` or `heretic` preset for that search.
         """
-        # The old optimizer measured a different edit from the one it later
-        # applied. Keep it off without disabling the useful informed pipeline.
+        # Keep this wrapper deterministic. Exact scored-model search and replay
+        # is owned by the dedicated Optimized/Heretic pipeline presets.
         self._bayesian_trials = 0
 
         # Retain deterministic analysis-derived layer weighting. The invalid
@@ -1018,8 +977,9 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         self.use_kl_optimization = False
 
         self.log(
-            "Bayesian tuning disabled pending exact replay; continuing with "
-            "deterministic analysis-guided projection and the held-out gate"
+            "Exact TPE is not part of the informed wrapper; continuing with "
+            "deterministic analysis-guided projection and the held-out gate "
+            "(choose optimized/heretic for exact scored-model search)"
         )
 
     def _excise_sparse(self):
@@ -1279,8 +1239,17 @@ class InformedAbliterationPipeline(AbliterationPipeline):
     ) -> torch.Tensor:
         """Project a manifest tensor sparsely along its declared residual axis."""
         working = tensor.detach().clone()
-        original_norm = working.float().norm().item() if self.norm_preserve else 0.0
         residual_axis %= working.ndim
+        saved_rows = (
+            self._capture_logical_row_norms(
+                working,
+                residual_axis=residual_axis,
+                role="writer",
+                expert_axis=expert_axis,
+            )
+            if self.norm_preserve
+            else None
+        )
 
         def project_slice(target: torch.Tensor, axis: int, direction: torch.Tensor):
             moved = target.movedim(axis, -1)
@@ -1309,11 +1278,8 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                     direction,
                 )
 
-        if self.norm_preserve and original_norm > 0.0:
-            new_norm = working.float().norm().item()
-            if not math.isfinite(new_norm) or new_norm <= 0.0:
-                raise RuntimeError("Sparse projection produced a degenerate writer tensor")
-            working.mul_(original_norm / new_norm)
+        if saved_rows is not None:
+            self._restore_logical_row_norms(working, saved_rows)
         return working
 
     def _commit_sparse_manifest_tensor(
@@ -1497,6 +1463,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
                     "cone_is_polyhedral": insights.cone_is_polyhedral,
                     "cone_dimensionality": insights.cone_dimensionality,
                     "mean_pairwise_cosine": insights.mean_pairwise_cosine,
+                    "category_dispersion_causally_validated": False,
                     "direction_clusters": insights.direction_clusters,
                     "cluster_count": insights.cluster_count,
                     "direction_persistence": insights.direction_persistence,
@@ -1529,7 +1496,7 @@ class InformedAbliterationPipeline(AbliterationPipeline):
         )
         metadata["references"].extend(
             [
-                "Wollschlager et al., The Geometry of Refusal in LLMs — concept cones (ICML 2025)",
+                "Descriptive category-direction dispersion (not causal RCO validation)",
                 "OBLITERATUS: Analysis-informed abliteration pipeline",
             ]
         )
@@ -1554,11 +1521,10 @@ class InformedAbliterationPipeline(AbliterationPipeline):
             lines.append(f"    {method.upper():6s} {prob:.1%}")
         lines.append("")
 
-        lines.append("Concept Cone Geometry:")
-        cone_type = "POLYHEDRAL" if insights.cone_is_polyhedral else "LINEAR"
-        lines.append(f"  Type: {cone_type}")
-        lines.append(f"  Dimensionality: {insights.cone_dimensionality:.2f}")
-        lines.append(f"  Mean pairwise cosine: {insights.mean_pairwise_cosine:.3f}")
+        lines.append("Category Direction Dispersion (descriptive only):")
+        lines.append("  Causally validated: no")
+        lines.append(f"  Squared-SVD effective rank: {insights.cone_dimensionality:.2f}")
+        lines.append(f"  Mean signed pairwise cosine: {insights.mean_pairwise_cosine:.3f}")
         if insights.direction_specificity:
             lines.append("  Per-category DSI:")
             for cat, dsi in sorted(insights.direction_specificity.items(), key=lambda x: -x[1]):

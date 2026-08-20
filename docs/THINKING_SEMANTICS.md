@@ -29,7 +29,14 @@ These examples also prove that reasoning behavior is usually post-training and p
 
 Therefore, projection names and layer discovery must remain separate from reasoning-mode discovery.
 
-## Current code audit
+## Historical code audit (superseded where noted)
+
+The reasoning-protocol findings below motivated the current parser and
+evaluation work. Item 6 is now resolved differently from its original proposal:
+`cot_aware` no longer creates or edits along a harmless-prompt PC1. It is an
+explicit teacher-forced preservation gate over separately labeled reasoning and
+answer references. This measures trace likelihood preservation but is not
+generated-CoT benchmark evidence or proof of a causal reasoning circuit.
 
 The current implementation is materially incomplete:
 
@@ -55,7 +62,7 @@ The current implementation is materially incomplete:
 
 5. [app.py](/Users/martin/Desktop/OBLITERATUS/app.py:2373) uses a generic regular expression to remove reasoning. It does not recognize the official `<think>` tag, Harmony channels, or Gemma’s thought channel. It can also damage an ordinary answer merely because it contains words such as “analysis” or “assistant.”
 
-6. The “CoT-aware” activation code does not collect generated chain-of-thought tokens. It runs a forward pass over the user prompt and averages prompt positions, despite comments calling them “reasoning tokens.” Its top harmless principal component is consequently not demonstrated to be a reasoning direction.
+6. **Resolved:** the invalid “CoT-aware” harmless-prompt principal component has been removed from direction extraction. The replacement scores explicit reference traces before and after editing and fails closed when its evidence is missing or malformed.
 
 7. Telemetry repeats a separate substring heuristic and can classify a model as reasoning merely because the user enabled `cot_aware`.
 
@@ -120,6 +127,8 @@ Add offline official-template fixtures covering:
 - Ordinary answers containing “analysis” or “assistant” must remain byte-for-byte intact.
 - Prefilled opening tags and malformed/unclosed traces.
 - A candidate that passes direct mode but damages or still refuses in thinking mode must fail the overall gate.
-- A test proving that “CoT-aware” activation collection actually observes generated trace tokens.
+- Tests proving the explicit CoT gate masks prompt tokens, separates reasoning
+  and answer CE, uses canonical token boundaries, preserves model state, and
+  fails closed on missing, duplicate, truncated, or non-finite evidence.
 
 No files were changed.
